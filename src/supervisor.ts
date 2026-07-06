@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 import { usageTotal } from "./protocol.ts";
 import { Session } from "./session.ts";
-import { ensureWorkspace } from "./workspace.ts";
+import { ensureWorkspace, syncNotes } from "./workspace.ts";
 
 const CONTINUE = "continue";
 
@@ -91,6 +91,13 @@ export async function supervise(cfg: Config): Promise<void> {
 
     await session.stop();
     if (recycle) {
+      // Safety net: persist notes to foreman-state before we drop the context, even if the
+      // agent didn't push during its checkpoint turn.
+      try {
+        syncNotes(cfg, "checkpoint before context recycle");
+      } catch (e) {
+        console.log(`[supervisor] notes sync on recycle failed: ${e}`);
+      }
       console.log("[supervisor] relaunching fresh (context recycled)");
       continue;
     }

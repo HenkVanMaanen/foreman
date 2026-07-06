@@ -12,6 +12,10 @@ export interface Config {
   softMark: number; // fraction of window → nudge to checkpoint
   hardMark: number; // fraction of window → force checkpoint + restart
   notesDir: string;
+  // Git remote for the agent's durable notes (the foreman-state repo). When set, the
+  // harness clones it into notesDir on cold start and pulls on restart; the agent pushes
+  // via `notes-sync`. Empty = notes are local-only.
+  stateRepo: string;
   stateDir: string;
   worktreesDir: string;
   secretsPassphrase: string;
@@ -39,6 +43,7 @@ export function loadConfig(): Config {
     softMark: num("FOREMAN_SOFT_MARK", 0.6),
     hardMark: num("FOREMAN_HARD_MARK", 0.8),
     notesDir: str("FOREMAN_NOTES_DIR", "notes"),
+    stateRepo: str("FOREMAN_STATE_REPO", ""),
     stateDir: str("FOREMAN_STATE_DIR", "state"),
     worktreesDir: str("FOREMAN_WORKTREES_DIR", "worktrees"),
     secretsPassphrase: str("FOREMAN_SECRETS_PASSPHRASE", ""),
