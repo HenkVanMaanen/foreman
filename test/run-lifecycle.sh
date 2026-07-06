@@ -9,6 +9,14 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WS="$(mktemp -d)"
 trap 'rm -rf "$WS"' EXIT
 
+# Pin every FOREMAN_* path into the temp workspace so the suite is hermetic
+# regardless of ambient env. On the foreman box these are exported as absolute
+# real-repo paths, which (config defaults being relative) would otherwise leak
+# in and split state/notes between the real repo and $WS → spurious failures.
+export FOREMAN_STATE_DIR="$WS/state" FOREMAN_NOTES_DIR="$WS/notes" \
+       FOREMAN_WORKTREES_DIR="$WS/worktrees" FOREMAN_AGE_IDENTITY="$WS/state/age-identity.txt"
+unset FOREMAN_STATE_REPO FOREMAN_CLAUDE_EXTRA_ARGS FOREMAN_AGE_RECIPIENT
+
 export FOREMAN_CLAUDE_BIN="$HERE/test/mock-claude.ts"
 export FOREMAN_BOOTSTRAP_PROMPT="$HERE/prompts/bootstrap.md"
 export FOREMAN_CONTEXT_WINDOW=1000 MOCK_STEP=300
