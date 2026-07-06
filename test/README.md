@@ -33,5 +33,6 @@ The only leg the mock can't cover is the real human round-trip. To try it end-to
 
 1. Create a bot with **@BotFather** → get `TELEGRAM_BOT_TOKEN`; DM the bot once and get your
    `TELEGRAM_CHAT_ID` (e.g. via `https://api.telegram.org/bot<token>/getUpdates`).
-2. `cp .env.example .env` and fill those in (plus `FOREMAN_SECRETS_PASSPHRASE`).
+2. `cp .env.example .env` and fill those in. (Secrets use `age`; the harness auto-generates an
+   identity at `FOREMAN_AGE_IDENTITY` on first boot — nothing to set by hand.)
 3. `./keeper.sh` — with empty notes, foreman will page you on Telegram asking what to work on.

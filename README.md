@@ -53,7 +53,7 @@ bun install                  # dev deps (types)
 npm test                     # verify the supervisor lifecycle (mock claude, no network)
 
 claude login                 # subscription auth so headless runs don't hit metered API
-cp .env.example .env         # Telegram/Mattermost creds, context marks, secrets passphrase
+cp .env.example .env         # Telegram/Mattermost creds, context marks, age secrets identity
 ./keeper.sh                  # dumb keeper → runs the harness → spawns the foreman agent
 ```
 
@@ -71,7 +71,7 @@ treated as errors) followed by a **maximally strict `tsc`** (`strict` + `noUnche
 It auto-runs everywhere it matters:
 - **pre-commit** — `.githooks/pre-commit` runs `bun run check` (hook path is set by the
   `prepare` script on `bun install`). A commit that doesn't pass is blocked.
-- **CI** — `.github/workflows/ci.yml` runs `bun run check` + `bun test` on every push/PR.
+- **CI** — `.github/workflows/ci.yml` runs `bun run check` + `bun run test` on every push/PR.
 - **agent self-edits** — `harness-sync` runs `bun run check` before it will push a harness
   change to `main`, so foreman can't publish code that doesn't lint or type-check.
 
@@ -84,11 +84,12 @@ bun run format    # biome autofix (format + organize imports + safe lint fixes)
 
 ```
 keeper.sh                  dumb outer keeper (never changes); respawns the harness
-src/foreman.ts             entrypoint + CLI (supervise | secret set | run)
+src/foreman.ts             entrypoint + CLI (supervise | dashboard | secret set | run)
 src/supervisor.ts          agent lifecycle + context watchdog (checkpoint & recycle)
 src/session.ts             owns one claude -p stream-json subprocess
 src/protocol.ts            stream-json event/usage types
 src/secrets.ts             encrypted store; capture-via-pipe + inject-by-env
+src/dashboard.ts           read-only observability dashboard (serves /api/state)
 src/config.ts              minimal env/flag config
 prompts/bootstrap.md       the agent's constitution (re-seeded on every (re)launch)
 agent-workspace-seed/      starter notes the agent extends and then owns
