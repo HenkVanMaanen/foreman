@@ -30,6 +30,15 @@ export async function ensureWorkspace(cfg: Config, home: string): Promise<Record
   await mkdir(cfg.stateDir, { recursive: true });
   await mkdir(cfg.worktreesDir, { recursive: true });
 
+  // Secret store root of trust: an age identity. Generate one on cold start if absent so a
+  // fresh box self-provisions (secrets are re-captured from a human, so a new key is fine).
+  const ageIdentity = resolve(cfg.ageIdentityFile);
+  if (!cfg.ageRecipient && !existsSync(ageIdentity)) {
+    const r = Bun.spawnSync(["age-keygen", "-o", ageIdentity], { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode === 0) await chmod(ageIdentity, 0o600);
+    else console.log(`[workspace] age-keygen failed: ${r.stderr.toString().trim()}`);
+  }
+
   const notes = resolve(cfg.notesDir);
 
   // Notes: prefer the durable foreman-state repo (clone on cold start, pull on restart) so
@@ -87,6 +96,10 @@ export async function ensureWorkspace(cfg: Config, home: string): Promise<Record
     FOREMAN_HOME: home,
     FOREMAN_NOTES_DIR: notes,
     FOREMAN_STATE_REPO: cfg.stateRepo,
+    // Absolute so the agent's `foreman run --secret` resolves the same store from any cwd
+    // (e.g. inside a worktree), not a `state/` relative to wherever it was invoked.
+    FOREMAN_STATE_DIR: resolve(cfg.stateDir),
+    FOREMAN_AGE_IDENTITY: ageIdentity,
     PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
   };
 }

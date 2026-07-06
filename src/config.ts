@@ -18,7 +18,11 @@ export interface Config {
   stateRepo: string;
   stateDir: string;
   worktreesDir: string;
-  secretsPassphrase: string;
+  // Secret store (age). The private identity decrypts; the harness generates one at this
+  // path on cold start if absent. ageRecipient (public key) is optional — if empty it is
+  // derived from the identity, so capture stays non-interactive.
+  ageIdentityFile: string;
+  ageRecipient: string;
   bootstrapPromptPath: string;
 }
 
@@ -35,6 +39,7 @@ function str(name: string, fallback: string): string {
 }
 
 export function loadConfig(): Config {
+  const stateDir = str("FOREMAN_STATE_DIR", "state");
   return {
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
@@ -44,9 +49,10 @@ export function loadConfig(): Config {
     hardMark: num("FOREMAN_HARD_MARK", 0.8),
     notesDir: str("FOREMAN_NOTES_DIR", "notes"),
     stateRepo: str("FOREMAN_STATE_REPO", ""),
-    stateDir: str("FOREMAN_STATE_DIR", "state"),
+    stateDir,
     worktreesDir: str("FOREMAN_WORKTREES_DIR", "worktrees"),
-    secretsPassphrase: str("FOREMAN_SECRETS_PASSPHRASE", ""),
+    ageIdentityFile: str("FOREMAN_AGE_IDENTITY", `${stateDir}/age-identity.txt`),
+    ageRecipient: str("FOREMAN_AGE_RECIPIENT", ""),
     bootstrapPromptPath: str("FOREMAN_BOOTSTRAP_PROMPT", "prompts/bootstrap.md"),
   };
 }

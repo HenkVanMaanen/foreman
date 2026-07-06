@@ -5,15 +5,12 @@ import type { Config } from "./config.ts";
 import { type StreamEvent, userMessage } from "./protocol.ts";
 
 export interface StartOptions {
-  /** claude session id to restore (from a prior snapshot); empty for a fresh session. */
-  resumeId?: string;
   /** extra env for the subprocess (e.g. channel creds passed through to the agent). */
   env?: Record<string, string>;
 }
 
 export class Session {
   private proc: Subprocess<"pipe", "pipe", "inherit"> | undefined;
-  private sessionId = "";
 
   constructor(private cfg: Config) {}
 
@@ -31,7 +28,6 @@ export class Session {
     ];
     if (this.cfg.skipPermissions) args.push("--dangerously-skip-permissions");
     args.push(...this.cfg.claudeExtraArgs);
-    if (opts.resumeId) args.push("--resume", opts.resumeId);
 
     this.proc = Bun.spawn([this.cfg.claudeBin, ...args], {
       stdin: "pipe",
@@ -39,11 +35,6 @@ export class Session {
       stderr: "inherit",
       env: { ...process.env, ...(opts.env ?? {}) },
     });
-  }
-
-  /** Session id, once learned from a system/result frame (for --resume). */
-  get id(): string {
-    return this.sessionId;
   }
 
   /** Send a user turn to the subprocess. */
@@ -76,8 +67,7 @@ export class Session {
 
   private parse(line: string): StreamEvent | undefined {
     try {
-      const obj = JSON.parse(line) as Partial<StreamEvent> & { session_id?: string };
-      if (obj.session_id) this.sessionId = obj.session_id;
+      const obj = JSON.parse(line) as Partial<StreamEvent>;
       return { type: obj.type ?? "system", ...obj, raw: obj } as StreamEvent;
     } catch {
       return undefined; // skip malformed lines

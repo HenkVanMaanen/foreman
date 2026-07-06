@@ -3,33 +3,20 @@
 //   - `foreman secret set NAME`   : reads the value from STDIN, encrypts, stores.
 //   - `foreman run --secret NAME -- cmd` : decrypts, injects into the child env only, execs.
 //
+// Encryption is delegated to `age` (https://age-encryption.org) — a small, audited,
+// single-purpose tool. We use recipient (X25519) mode, not passphrase mode, on purpose:
+//   - encrypting (`secret set`) needs only the PUBLIC recipient, so capture stays fully
+//     non-interactive and pipe-friendly (`wait-reply --raw | foreman secret set X`);
+//   - decrypting (`run --secret`) needs the private identity file — the one root secret.
+//
 // The agent references secrets by NAME. A value only ever lives in: this store (encrypted
 // at rest), a pipe during capture, and a child process's env during use — never in the
 // model's transcript, notes, or logs.
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { chmod, mkdir } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
-
-interface SealedSecret {
-  salt: string; // base64
-  iv: string; // base64
-  ct: string; // base64
-}
-
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-const b64 = (b: ArrayBuffer | Uint8Array) =>
-  Buffer.from(b instanceof Uint8Array ? b : new Uint8Array(b)).toString("base64");
-const unb64 = (s: string) => new Uint8Array(Buffer.from(s, "base64"));
-
-// Coerce any Uint8Array into a plain ArrayBuffer-backed view so Web Crypto's
-// BufferSource typing (which excludes SharedArrayBuffer) is satisfied.
-const ab = (u: Uint8Array): ArrayBuffer => {
-  const out = new ArrayBuffer(u.byteLength);
-  new Uint8Array(out).set(u);
-  return out;
-};
 
 export class SecretsStore {
   private dir: string;
@@ -42,55 +29,60 @@ export class SecretsStore {
     if (!/^[A-Z][A-Z0-9_]*$/.test(name)) {
       throw new Error(`invalid secret name: ${name} (use UPPER_SNAKE_CASE)`);
     }
-    return join(this.dir, `${name}.json`);
+    return join(this.dir, `${name}.age`);
   }
 
-  private async deriveKey(salt: Uint8Array): Promise<CryptoKey> {
-    if (!this.cfg.secretsPassphrase) {
-      throw new Error("FOREMAN_SECRETS_PASSPHRASE is not set; cannot use the secret store");
+  /** The public recipient to encrypt to: explicit if configured, else derived from the identity. */
+  private recipient(): string {
+    if (this.cfg.ageRecipient) return this.cfg.ageRecipient;
+    const id = resolve(this.cfg.ageIdentityFile);
+    if (!existsSync(id)) {
+      throw new Error(
+        `age identity not found at ${id}; set FOREMAN_AGE_IDENTITY or let the harness generate one`,
+      );
     }
-    const base = await crypto.subtle.importKey(
-      "raw",
-      ab(enc.encode(this.cfg.secretsPassphrase)),
-      "PBKDF2",
-      false,
-      ["deriveKey"],
-    );
-    return crypto.subtle.deriveKey(
-      { name: "PBKDF2", salt: ab(salt), iterations: 200_000, hash: "SHA-256" },
-      base,
-      { name: "AES-GCM", length: 256 },
-      false,
-      ["encrypt", "decrypt"],
-    );
+    const r = Bun.spawnSync(["age-keygen", "-y", id], { stdout: "pipe", stderr: "pipe" });
+    if (r.exitCode !== 0) {
+      throw new Error(`age-keygen -y failed: ${r.stderr.toString().trim()}`);
+    }
+    return r.stdout.toString().trim();
   }
 
-  /** Encrypt and persist a secret value. */
+  /** Encrypt and persist a secret value (armored age ciphertext). */
   async set(name: string, value: string): Promise<void> {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await this.deriveKey(salt);
-    const ct = await crypto.subtle.encrypt(
-      { name: "AES-GCM", iv: ab(iv) },
-      key,
-      ab(enc.encode(value)),
-    );
-    const sealed: SealedSecret = { salt: b64(salt), iv: b64(iv), ct: b64(ct) };
-    await writeFile(this.path(name), JSON.stringify(sealed), { mode: 0o600 });
+    const dest = this.path(name);
+    const proc = Bun.spawn(["age", "-a", "-r", this.recipient(), "-o", dest], {
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    proc.stdin.write(value);
+    await proc.stdin.end();
+    const code = await proc.exited;
+    if (code !== 0) {
+      throw new Error(`age encrypt failed for ${name}: ${await readStderr(proc)}`);
+    }
+    await chmod(dest, 0o600);
   }
 
   /** Decrypt a secret value. Callers must never print the result. */
   async get(name: string): Promise<string> {
-    const sealed = JSON.parse(await readFile(this.path(name), "utf8")) as SealedSecret;
-    const key = await this.deriveKey(unb64(sealed.salt));
-    const pt = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: ab(unb64(sealed.iv)) },
-      key,
-      ab(unb64(sealed.ct)),
-    );
-    return dec.decode(pt);
+    const src = this.path(name);
+    if (!existsSync(src)) throw new Error(`no such secret: ${name}`);
+    const id = resolve(this.cfg.ageIdentityFile);
+    if (!existsSync(id)) throw new Error(`age identity not found at ${id}; cannot decrypt ${name}`);
+    const proc = Bun.spawn(["age", "-d", "-i", id, src], { stdout: "pipe", stderr: "pipe" });
+    const value = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    if (code !== 0) throw new Error(`age decrypt failed for ${name}: ${await readStderr(proc)}`);
+    return value;
   }
+}
+
+async function readStderr(proc: { stderr: ReadableStream<Uint8Array> | number }): Promise<string> {
+  if (typeof proc.stderr === "number") return "";
+  return (await new Response(proc.stderr).text()).trim();
 }
 
 /** `foreman secret set NAME` — read the value from stdin (pipe), store it, print only a confirmation. */

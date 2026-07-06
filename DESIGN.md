@@ -154,10 +154,17 @@ its task notes and can be re-spawned with `--resume`.
 
 ## 7. Secrets
 
-- Encrypted store (libsodium/age; key from OS keyring or a passphrase at startup).
-- **Capture without exposure:** the agent pipes a human's reply straight into the store —
-  `wait-reply --raw | foreman secret set GITLAB_TOKEN` — so the value transits a pipe and
-  only a confirmation ("stored") reaches the agent's context.
+- Encrypted store backed by **`age`** (X25519 recipient mode). The harness generates the
+  identity (the one root secret) on cold start if absent, so a fresh box self-provisions;
+  point `FOREMAN_AGE_IDENTITY` at an existing key to reuse it. Recipient mode is chosen on
+  purpose: **encrypting needs only the public recipient**, so capture stays non-interactive
+  (a passphrase prompt would hang the piped `secret set`); only decryption touches the
+  private identity.
+- **Getting secrets in, hands-off:** you never run a command. When the agent needs a
+  credential it lacks, it pages you in chat (`ask-human`); you reply with the value in the
+  thread, and its `wait-reply <id> --raw | foreman secret set GITLAB_TOKEN` pipes the reply
+  **straight into the store** — the value transits a pipe (chat → `age` → file) and only a
+  confirmation ("stored") reaches the agent's context.
 - **Use without exposure:** `foreman run --secret GITLAB_TOKEN -- glab issue list` decrypts,
   sets the env var **for that child process only**, and execs — the value never appears in
   the agent's stdout/transcript.

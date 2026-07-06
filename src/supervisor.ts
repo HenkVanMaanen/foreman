@@ -40,7 +40,6 @@ export async function supervise(cfg: Config): Promise<void> {
       "MATTERMOST_BASE_URL",
       "MATTERMOST_BOT_TOKEN",
       "MATTERMOST_CHANNEL_ID",
-      "FOREMAN_SECRETS_PASSPHRASE",
     ]),
     ...workspaceEnv,
   };
