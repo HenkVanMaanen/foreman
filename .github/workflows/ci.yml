@@ -14,4 +14,4 @@ jobs:
       - name: Strict gate (Biome + tsc)
         run: bun run check
       - name: Lifecycle tests
-        run: bun test
+        run: bun run test
