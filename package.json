@@ -8,9 +8,14 @@
     "start": "bun run src/foreman.ts supervise",
     "dev": "bun --watch run src/foreman.ts supervise",
     "typecheck": "tsc --noEmit",
-    "test": "bash test/run-lifecycle.sh"
+    "lint": "biome check --error-on-warnings",
+    "format": "biome check --write",
+    "check": "biome check --error-on-warnings && tsc --noEmit",
+    "test": "bash test/run-lifecycle.sh",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.2",
     "@types/bun": "latest",
     "typescript": "^5.6.0"
   }

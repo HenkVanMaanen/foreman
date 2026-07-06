@@ -24,7 +24,7 @@ const life = (existsSync(livesFile) ? Number(readFileSync(livesFile, "utf8")) : 
 writeFileSync(livesFile, String(life));
 
 function emit(obj: unknown): void {
-  process.stdout.write(JSON.stringify(obj) + "\n");
+  process.stdout.write(`${JSON.stringify(obj)}\n`);
 }
 
 emit({ type: "system", subtype: "init", session_id: `mock-life-${life}` });
@@ -36,8 +36,7 @@ let buf = "";
 
 for await (const chunk of Bun.stdin.stream()) {
   buf += dec.decode(chunk, { stream: true });
-  let nl: number;
-  while ((nl = buf.indexOf("\n")) >= 0) {
+  for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
     const line = buf.slice(0, nl).trim();
     buf = buf.slice(nl + 1);
     if (!line) continue;

@@ -61,6 +61,25 @@ On first boot with empty notes, foreman seeds its workspace (`notes/`, `bin/`) a
 on Telegram/Mattermost asking what to work on. Answer, and it self-configures. See
 [`test/README.md`](./test/README.md) for the live cold-start walkthrough.
 
+## Quality gate (strict, fast, auto-run)
+
+One command — `bun run check` — is the whole gate: **Biome** (Rust-based lint + format, warnings
+treated as errors) followed by a **maximally strict `tsc`** (`strict` + `noUnchecked*`,
+`exactOptionalPropertyTypes`, `noUnused*`, `noImplicitReturns`, …). Minimal config: one
+`biome.json`, the flags in `tsconfig.json`.
+
+It auto-runs everywhere it matters:
+- **pre-commit** — `.githooks/pre-commit` runs `bun run check` (hook path is set by the
+  `prepare` script on `bun install`). A commit that doesn't pass is blocked.
+- **CI** — `.github/workflows/ci.yml` runs `bun run check` + `bun test` on every push/PR.
+- **agent self-edits** — `harness-sync` runs `bun run check` before it will push a harness
+  change to `main`, so foreman can't publish code that doesn't lint or type-check.
+
+```sh
+bun run check     # biome (lint+format, warn=error) + strict tsc
+bun run format    # biome autofix (format + organize imports + safe lint fixes)
+```
+
 ## Layout
 
 ```

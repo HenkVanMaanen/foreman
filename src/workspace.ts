@@ -26,10 +26,7 @@ function git(args: string[]): { ok: boolean; stdout: string } {
 // Reference scripts the agent adopts (and may refine). Seeded into bin/ on cold start.
 const BIN_SCRIPTS = ["ask-human", "wait-reply", "notes-sync", "harness-sync"] as const;
 
-export async function ensureWorkspace(
-  cfg: Config,
-  home: string,
-): Promise<Record<string, string>> {
+export async function ensureWorkspace(cfg: Config, home: string): Promise<Record<string, string>> {
   await mkdir(cfg.stateDir, { recursive: true });
   await mkdir(cfg.worktreesDir, { recursive: true });
 
@@ -77,16 +74,20 @@ export async function ensureWorkspace(
   }
   const shim = join(binDir, "foreman");
   if (!existsSync(shim)) {
-    await writeFile(shim, `#!/usr/bin/env bash\nexec bun run "$FOREMAN_HOME/src/foreman.ts" "$@"\n`, {
-      mode: 0o755,
-    });
+    await writeFile(
+      shim,
+      `#!/usr/bin/env bash\nexec bun run "$FOREMAN_HOME/src/foreman.ts" "$@"\n`,
+      {
+        mode: 0o755,
+      },
+    );
   }
 
   return {
     FOREMAN_HOME: home,
     FOREMAN_NOTES_DIR: notes,
     FOREMAN_STATE_REPO: cfg.stateRepo,
-    PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    PATH: `${binDir}:${process.env["PATH"] ?? ""}`,
   };
 }
 

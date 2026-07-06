@@ -71,7 +71,11 @@ export class SecretsStore {
     const salt = crypto.getRandomValues(new Uint8Array(16));
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const key = await this.deriveKey(salt);
-    const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: ab(iv) }, key, ab(enc.encode(value)));
+    const ct = await crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: ab(iv) },
+      key,
+      ab(enc.encode(value)),
+    );
     const sealed: SealedSecret = { salt: b64(salt), iv: b64(iv), ct: b64(ct) };
     await writeFile(this.path(name), JSON.stringify(sealed), { mode: 0o600 });
   }
@@ -98,11 +102,7 @@ export async function secretSetFromStdin(cfg: Config, name: string): Promise<voi
 }
 
 /** `foreman run --secret NAME[,NAME] -- cmd args…` — inject into child env only, exec, forward stdio. */
-export async function runWithSecrets(
-  cfg: Config,
-  names: string[],
-  cmd: string[],
-): Promise<number> {
+export async function runWithSecrets(cfg: Config, names: string[], cmd: string[]): Promise<number> {
   const store = new SecretsStore(cfg);
   const injected: Record<string, string> = {};
   for (const name of names) injected[name] = await store.get(name);

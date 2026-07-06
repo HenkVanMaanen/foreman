@@ -17,10 +17,10 @@ if [ ! -d .git ]; then
   exit 1
 fi
 
-# Gate: never push a harness that doesn't type-check.
-if [ -f package.json ] && grep -q '"typecheck"' package.json; then
-  echo "harness-sync: running typecheck…"
-  bun run typecheck || { echo "harness-sync: typecheck FAILED — not pushing" >&2; exit 1; }
+# Gate: never push a harness that fails the strict check (Biome lint/format + tsc).
+if [ -f package.json ] && grep -q '"check"' package.json; then
+  echo "harness-sync: running strict check (biome + tsc)…"
+  bun run check || { echo "harness-sync: check FAILED — not pushing" >&2; exit 1; }
 fi
 
 git add -A

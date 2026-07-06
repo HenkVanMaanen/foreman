@@ -54,8 +54,15 @@ function parseRun(args: string[]): { names: string[]; command: string[] } {
       i++;
       break;
     }
-    if (a === "--secret" && args[i + 1]) {
-      names.push(...args[++i]!.split(",").map((s) => s.trim()).filter(Boolean));
+    const next = args[i + 1];
+    if (a === "--secret" && next) {
+      i++;
+      names.push(
+        ...next
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+      );
     } else {
       // unknown token before `--`: treat as malformed
       return { names, command: [] };

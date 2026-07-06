@@ -12,7 +12,7 @@ export interface StartOptions {
 }
 
 export class Session {
-  private proc?: Subprocess<"pipe", "pipe", "inherit">;
+  private proc: Subprocess<"pipe", "pipe", "inherit"> | undefined;
   private sessionId = "";
 
   constructor(private cfg: Config) {}
@@ -50,7 +50,7 @@ export class Session {
   async send(text: string): Promise<void> {
     if (!this.proc) throw new Error("session not started");
     const writer = this.proc.stdin;
-    writer.write(userMessage(text) + "\n");
+    writer.write(`${userMessage(text)}\n`);
     await writer.flush();
   }
 
@@ -61,13 +61,15 @@ export class Session {
     let buf = "";
     for await (const chunk of this.proc.stdout) {
       buf += decoder.decode(chunk, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
+      let nl = buf.indexOf("\n");
+      while (nl >= 0) {
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
-        if (!line) continue;
-        const ev = this.parse(line);
-        if (ev) yield ev;
+        if (line) {
+          const ev = this.parse(line);
+          if (ev) yield ev;
+        }
+        nl = buf.indexOf("\n");
       }
     }
   }
