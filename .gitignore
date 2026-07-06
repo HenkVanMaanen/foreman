@@ -1,0 +1,16 @@
+# foreman runtime state — never commit
+.env
+/state/
+/worktrees/
+/notes/
+*.secrets
+*.secrets.age
+secrets.key
+
+# bun / node
+node_modules/
+bun.lockb
+*.log
+
+# build output
+dist/
