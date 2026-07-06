@@ -4,6 +4,10 @@
 
 export interface Config {
   claudeBin: string;
+  claudeExtraArgs: string[];
+  // Autonomous agents run tools without interactive approval; the human-in-the-loop is
+  // ask-human, not per-tool prompts. Adds --dangerously-skip-permissions when true.
+  skipPermissions: boolean;
   contextWindow: number;
   softMark: number; // fraction of window → nudge to checkpoint
   hardMark: number; // fraction of window → force checkpoint + restart
@@ -29,6 +33,8 @@ function str(name: string, fallback: string): string {
 export function loadConfig(): Config {
   return {
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
+    claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
+    skipPermissions: str("FOREMAN_SKIP_PERMISSIONS", "1") !== "0",
     contextWindow: num("FOREMAN_CONTEXT_WINDOW", 200_000),
     softMark: num("FOREMAN_SOFT_MARK", 0.6),
     hardMark: num("FOREMAN_HARD_MARK", 0.8),

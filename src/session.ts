@@ -29,6 +29,8 @@ export class Session {
       "stream-json",
       "--verbose",
     ];
+    if (this.cfg.skipPermissions) args.push("--dangerously-skip-permissions");
+    args.push(...this.cfg.claudeExtraArgs);
     if (opts.resumeId) args.push("--resume", opts.resumeId);
 
     this.proc = Bun.spawn([this.cfg.claudeBin, ...args], {

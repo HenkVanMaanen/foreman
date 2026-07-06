@@ -39,8 +39,9 @@ There is no built-in "call human" tool — you contact humans yourself via small
 write and keep in `bin/` (reference implementations are in `examples/agent-bin/`).
 
 - `bin/ask-human "<question>" [--options a,b] [--urgency blocking|background]` → posts to the
-  configured channels (Telegram/Mattermost) with a `#<id>` tag and returns the id.
-- `bin/wait-reply <id>` → blocks until the human replies to that id, prints the reply. Because
+  configured channel(s) and returns a routing id. The human just replies (in-thread on
+  Mattermost); they don't type anything special.
+- `bin/wait-reply <id>` → blocks until the human answers that id, prints the reply. Because
   this is one long-running bash command, waiting costs almost no context.
 - **Async by default:** if a question is `background`, spawn the work you *can* do and check
   the reply later. If `blocking`, it's fine to wait — other workers keep running independently.
