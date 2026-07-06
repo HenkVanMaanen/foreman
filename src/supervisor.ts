@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
+import { recordEvent, writeStatus } from "./dashboard.ts";
 import { usageTotal } from "./protocol.ts";
 import { Session } from "./session.ts";
 import { ensureWorkspace, syncNotes } from "./workspace.ts";
@@ -44,12 +45,31 @@ export async function supervise(cfg: Config): Promise<void> {
     ...workspaceEnv,
   };
 
+  // Track for the dashboard: which fresh lifetime we're on, and the last observed usage.
+  let life = 0;
+  let lastUsed = 0;
+  const stat = (state: string) =>
+    writeStatus(cfg, {
+      pid: process.pid,
+      state,
+      ctxUsed: lastUsed,
+      ctxWindow: cfg.contextWindow,
+      ctxPct: Math.round((lastUsed / cfg.contextWindow) * 100),
+      life,
+      softMark: cfg.softMark,
+      hardMark: cfg.hardMark,
+    });
+
   // Outer loop: each iteration is one fresh agent lifetime (until a recycle or exit).
   for (;;) {
     const session = new Session(cfg);
     session.start({ env: passthroughEnv });
     await session.send(bootstrap);
+    life++;
+    lastUsed = 0;
     console.log("[supervisor] agent launched; bootstrap sent");
+    await recordEvent(cfg, { who: "supervisor", kind: "launch", detail: `life #${life}` });
+    await stat("working");
 
     let awaitingCheckpoint = false;
     let nudgedSoft = false;
@@ -58,7 +78,12 @@ export async function supervise(cfg: Config): Promise<void> {
     for await (const ev of session.events()) {
       if (ev.type !== "result") continue;
       const used = usageTotal(ev.usage);
-      if (used) console.log(`[supervisor] turn complete; context ≈ ${used}/${cfg.contextWindow}`);
+      if (used) {
+        console.log(`[supervisor] turn complete; context ≈ ${used}/${cfg.contextWindow}`);
+        lastUsed = used;
+        await recordEvent(cfg, { who: "supervisor", kind: "turn", ctx: used });
+        await stat("working");
+      }
 
       if (awaitingCheckpoint) {
         console.log("[supervisor] checkpoint turn complete → recycling");
@@ -68,16 +93,19 @@ export async function supervise(cfg: Config): Promise<void> {
       if (existsSync(clearSentinel)) {
         await rm(clearSentinel, { force: true });
         console.log("[supervisor] agent requested clear → recycling");
+        await recordEvent(cfg, { who: "supervisor", kind: "clear" });
         recycle = true;
         break;
       }
       if (used >= hardTokens) {
         console.log("[supervisor] hard mark hit → asking agent to checkpoint");
+        await recordEvent(cfg, { who: "supervisor", kind: "hard-mark", ctx: used });
         await session.send(HARD_MSG);
         awaitingCheckpoint = true;
         continue;
       }
       if (used >= softTokens && !nudgedSoft) {
+        await recordEvent(cfg, { who: "supervisor", kind: "soft-mark", ctx: used });
         await session.send(SOFT_MSG);
         nudgedSoft = true;
         continue;
@@ -90,6 +118,8 @@ export async function supervise(cfg: Config): Promise<void> {
 
     await session.stop();
     if (recycle) {
+      await recordEvent(cfg, { who: "supervisor", kind: "recycle", detail: `life #${life}` });
+      await stat("recycling");
       // Safety net: persist notes to foreman-state before we drop the context, even if the
       // agent didn't push during its checkpoint turn.
       try {
@@ -103,6 +133,7 @@ export async function supervise(cfg: Config): Promise<void> {
     // Process exited on its own (crash or clean stop). The keeper will respawn the
     // whole harness; exiting here lets it apply backoff.
     console.log("[supervisor] agent process ended; exiting for keeper to respawn");
+    await recordEvent(cfg, { who: "supervisor", kind: "exit", detail: `life #${life}` });
     return;
   }
 }

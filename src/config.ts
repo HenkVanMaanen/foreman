@@ -24,6 +24,8 @@ export interface Config {
   ageIdentityFile: string;
   ageRecipient: string;
   bootstrapPromptPath: string;
+  // Read-only observability dashboard (bound to 127.0.0.1).
+  dashboardPort: number;
 }
 
 function num(name: string, fallback: number): number {
@@ -54,5 +56,6 @@ export function loadConfig(): Config {
     ageIdentityFile: str("FOREMAN_AGE_IDENTITY", `${stateDir}/age-identity.txt`),
     ageRecipient: str("FOREMAN_AGE_RECIPIENT", ""),
     bootstrapPromptPath: str("FOREMAN_BOOTSTRAP_PROMPT", "prompts/bootstrap.md"),
+    dashboardPort: num("FOREMAN_DASHBOARD_PORT", 7878),
   };
 }

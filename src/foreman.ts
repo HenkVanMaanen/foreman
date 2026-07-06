@@ -2,12 +2,14 @@
 // foreman — entrypoint and CLI.
 //
 //   foreman supervise                         run the agent supervisor (default)
+//   foreman dashboard                          serve the read-only observability dashboard
 //   foreman secret set NAME                    read a value from stdin, store it encrypted
 //   foreman run --secret NAME[,NAME] -- cmd…   run cmd with the named secret(s) injected as env
 //
 // Designed to be spawned by keeper.sh, which restarts it on exit.
 
 import { loadConfig } from "./config.ts";
+import { runDashboard } from "./dashboard.ts";
 import { runWithSecrets, secretSetFromStdin } from "./secrets.ts";
 import { supervise } from "./supervisor.ts";
 
@@ -18,6 +20,10 @@ async function main(argv: string[]): Promise<number> {
   switch (cmd ?? "supervise") {
     case "supervise":
       await supervise(cfg);
+      return 0;
+
+    case "dashboard":
+      await runDashboard(cfg); // blocks until killed
       return 0;
 
     case "secret": {
@@ -40,7 +46,7 @@ async function main(argv: string[]): Promise<number> {
 
     default:
       console.error(`unknown command: ${cmd}`);
-      console.error("commands: supervise | secret set NAME | run --secret NAME -- cmd");
+      console.error("commands: supervise | dashboard | secret set NAME | run --secret NAME -- cmd");
       return 2;
   }
 }

@@ -107,7 +107,8 @@ some JSON parsing convenience, and we keep full control.
 | `supervisor.ts` | Spawn the agent, stream events, run the **context watchdog** (checkpoint + recycle), watch the clear sentinel, relaunch fresh. |
 | `session.ts` | Own one `claude -p` stream-json subprocess: spawn, send user turns, emit events. |
 | `protocol.ts` | stream-json event/usage types. |
-| `secrets.ts` | Encrypted store; `secret set` (stdin capture) + `run --secret` (env injection). |
+| `secrets.ts` | `age`-backed store; `secret set` (stdin capture) + `run --secret` (env injection). |
+| `dashboard.ts` | Read-only observability: persist orchestrator status/events + serve the localhost dashboard (`foreman dashboard`). |
 | `config.ts` | Minimal config from env/flags (paths, marks, channel creds passthrough). |
 
 Everything the *agent* needs at runtime lives outside `src/`: `prompts/bootstrap.md`
@@ -191,7 +192,11 @@ its task notes and can be re-spawned with `--resume`.
 the keeper; the bootstrap prompt; a starter notes seed; reference `ask-human`/`wait-reply`
 scripts for Telegram + Mattermost that the agent adopts.
 
-**Later:** email + Signal reference scripts; a web dashboard; richer log scrubbing; metrics.
+**Later:** email + Signal reference scripts; richer log scrubbing; metrics. The read-only
+observability dashboard (`foreman dashboard`) ships the **harness-observable** tier now
+(alive/working/quiet/recycling/dead via pid liveness + heartbeat, live context %, activity
+feed, notes/tasks worker list); the **agent-reported** states (idle vs waiting-on-human,
+rate-limited) are deferred until a real run shows how they manifest.
 
 ## 10. Open questions / risks
 
