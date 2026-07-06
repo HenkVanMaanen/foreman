@@ -42,9 +42,12 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
     chan="$(curl "${mm[@]}" -X POST "$api/channels/direct" -d "[\"$bot_id\",\"$tgt_id\"]" | jq -r .id)"
   fi
   if [ -n "$chan" ]; then
-    text="[foreman] ($urgency) $question"
-    [ -n "$options" ] && text="$text"$'\n'"options: $options"
-    text="$text"$'\n'"↳ reply in this thread (or just send your answer here)."
+    # Human tone: no "[foreman]"/urgency tags — the message already comes from the bot
+    # account, and the question text is written like a person. Add a light nudge only when
+    # the agent is actually blocked.
+    text="$question"
+    [ -n "$options" ] && text="$text"$'\n'"($options?)"
+    [ "$urgency" = "blocking" ] && text="$text"$'\n\n'"(I'm blocked on this one — whenever you get a sec.)"
     resp="$(curl "${mm[@]}" -X POST "$api/posts" \
       -d "$(jq -n --arg c "$chan" --arg m "$text" '{channel_id:$c, message:$m}')")"
     routing="$(echo "$resp" | jq -r .id)"
@@ -53,9 +56,10 @@ fi
 
 # --- Telegram ---
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-  ttext="[foreman #$gen_id] ($urgency) $question"
-  [ -n "$options" ] && ttext="$ttext"$'\n'"options: $options"
-  ttext="$ttext"$'\n'"(reply to this message)"
+  ttext="$question"
+  [ -n "$options" ] && ttext="$ttext"$'\n'"($options?)"
+  [ "$urgency" = "blocking" ] && ttext="$ttext"$'\n\n'"(blocked on this one — whenever you get a sec.)"
+  ttext="$ttext"$'\n'"(ref #$gen_id)"  # keep the #id so wait-reply can correlate on Telegram
   curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
     --data-urlencode "text=${ttext}" >/dev/null && : "${routing:=$gen_id}"
