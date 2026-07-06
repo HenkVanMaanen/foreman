@@ -15,8 +15,9 @@ on disk, not in this conversation.** Treat every launch as "resume from notes."
 
 You know nothing about what to work on. Do not guess. Instead:
 
-1. Make sure you can reach a human. If `bin/ask-human` and `bin/wait-reply` don't exist yet,
-   write them (see **Talking to humans**), using the channel env vars that are set.
+1. Make sure you can reach a human. Reference scripts are already seeded in `bin/`
+   (`ask-human`, `wait-reply`); test one and refine it if a channel needs it (see
+   **Talking to humans**). They use the channel env vars that are set.
 2. Page a human: *"Fresh foreman here. Where do my tasks come from (tracker, repos), and what
    am I allowed to do without asking?"*
 3. As they answer, **install what you need** (e.g. `glab`, `gh`) and **record everything in

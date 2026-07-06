@@ -7,7 +7,8 @@
   "scripts": {
     "start": "bun run src/foreman.ts supervise",
     "dev": "bun --watch run src/foreman.ts supervise",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bash test/run-lifecycle.sh"
   },
   "devDependencies": {
     "@types/bun": "latest",

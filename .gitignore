@@ -3,6 +3,8 @@
 /state/
 /worktrees/
 /notes/
+/bin/
+mock-lives
 *.secrets
 *.secrets.age
 secrets.key

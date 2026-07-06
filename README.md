@@ -39,20 +39,27 @@ model, and cold-start walkthrough.
 
 ## Status
 
-**Early scaffold.** Architecture settled; harness modules stubbed with `TODO`s. Not yet
-runnable end-to-end.
+**Runnable, harness verified.** The supervisor lifecycle — cold-start workspace seeding,
+context-watchdog recycle, and agent-initiated recycle — is exercised end-to-end against a
+mock `claude` by `npm test`. The stream-json frame shapes are validated against real
+`claude` 2.1.201. Secrets capture/inject works end-to-end. The one leg not yet wired for a
+*live* run is the real Telegram/Mattermost round-trip (needs your bot token). Human-contact
+scripts are reference-quality; expect to refine them for your workspace.
 
-## Quick start (intended)
+## Quick start
 
 ```sh
-bun install
+bun install                  # dev deps (types)
+npm test                     # verify the supervisor lifecycle (mock claude, no network)
+
 claude login                 # subscription auth so headless runs don't hit metered API
-cp .env.example .env         # channel creds, context marks, paths
+cp .env.example .env         # Telegram/Mattermost creds, context marks, secrets passphrase
 ./keeper.sh                  # dumb keeper → runs the harness → spawns the foreman agent
 ```
 
-On first boot with empty notes, foreman pages you on Telegram/Mattermost. Answer, and it
-self-configures.
+On first boot with empty notes, foreman seeds its workspace (`notes/`, `bin/`) and pages you
+on Telegram/Mattermost asking what to work on. Answer, and it self-configures. See
+[`test/README.md`](./test/README.md) for the live cold-start walkthrough.
 
 ## Layout
 

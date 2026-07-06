@@ -5,10 +5,11 @@
 
 import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 import { usageTotal } from "./protocol.ts";
 import { Session } from "./session.ts";
+import { ensureWorkspace } from "./workspace.ts";
 
 const CONTINUE = "continue";
 
@@ -27,14 +28,22 @@ export async function supervise(cfg: Config): Promise<void> {
   const hardTokens = Math.floor(cfg.contextWindow * cfg.hardMark);
   const softTokens = Math.floor(cfg.contextWindow * cfg.softMark);
 
-  // Channel creds are passed through so the agent's own scripts can use them.
-  const passthroughEnv = pickEnv([
-    "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_CHAT_ID",
-    "MATTERMOST_BASE_URL",
-    "MATTERMOST_BOT_TOKEN",
-    "MATTERMOST_CHANNEL_ID",
-  ]);
+  // Seed/verify the agent workspace (notes, bin/, state, worktrees) before launch.
+  const home = resolve(import.meta.dir, "..");
+  const workspaceEnv = await ensureWorkspace(cfg, home);
+
+  // Env for the agent: workspace (PATH + FOREMAN_HOME) + channel creds its scripts use.
+  const passthroughEnv = {
+    ...pickEnv([
+      "TELEGRAM_BOT_TOKEN",
+      "TELEGRAM_CHAT_ID",
+      "MATTERMOST_BASE_URL",
+      "MATTERMOST_BOT_TOKEN",
+      "MATTERMOST_CHANNEL_ID",
+      "FOREMAN_SECRETS_PASSPHRASE",
+    ]),
+    ...workspaceEnv,
+  };
 
   // Outer loop: each iteration is one fresh agent lifetime (until a recycle or exit).
   for (;;) {
