@@ -51,7 +51,7 @@ async function main(argv: string[]): Promise<number> {
   }
 }
 
-function parseRun(args: string[]): { names: string[]; command: string[] } {
+export function parseRun(args: string[]): { names: string[]; command: string[] } {
   const names: string[] = [];
   let i = 0;
   for (; i < args.length; i++) {
@@ -77,4 +77,8 @@ function parseRun(args: string[]): { names: string[]; command: string[] } {
   return { names, command: args.slice(i) };
 }
 
-process.exit(await main(process.argv.slice(2)));
+// Only run the CLI when executed directly (`bun src/foreman.ts …`), not when imported by a
+// test that pulls in a pure helper like parseRun.
+if (import.meta.main) {
+  process.exit(await main(process.argv.slice(2)));
+}
