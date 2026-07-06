@@ -105,15 +105,21 @@ function healthOf(status: Status | null): Health {
 }
 
 async function tailEvents(cfg: Config, n: number): Promise<ForemanEvent[]> {
+  let lines: string[];
   try {
-    const lines = (await readFile(eventsPath(cfg), "utf8")).split("\n").filter(Boolean);
-    return lines
-      .slice(-n)
-      .map((l): ForemanEvent => JSON.parse(l))
-      .reverse();
+    lines = (await readFile(eventsPath(cfg), "utf8")).split("\n").filter(Boolean);
   } catch {
     return [];
   }
+  const out: ForemanEvent[] = [];
+  for (const l of lines.slice(-n)) {
+    try {
+      out.push(JSON.parse(l) as ForemanEvent);
+    } catch {
+      // Skip a malformed/interleaved line — one bad line must not blank the whole feed.
+    }
+  }
+  return out.reverse();
 }
 
 async function readWorkers(cfg: Config): Promise<Worker[]> {
