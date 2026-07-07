@@ -7,6 +7,7 @@ import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
 import { usageTotal, userMessage } from "../src/protocol.ts";
 import { secretFileName } from "../src/secrets.ts";
+import { isStalled, startWatchdog } from "../src/watchdog.ts";
 
 describe("usageTotal", () => {
   test("undefined usage is zero", () => {
@@ -124,5 +125,78 @@ describe("secretFileName", () => {
     ["hyphen", "MY-KEY"],
   ])("rejects %s", (_label, name) => {
     expect(() => secretFileName(name)).toThrow(/invalid secret name/);
+  });
+});
+
+describe("isStalled", () => {
+  test("not stalled below the timeout", () => {
+    expect(isStalled(1000, 1000 + 999, 1000)).toBe(false);
+  });
+
+  test("stalled at exactly the timeout", () => {
+    expect(isStalled(1000, 1000 + 1000, 1000)).toBe(true);
+  });
+
+  test("stalled past the timeout", () => {
+    expect(isStalled(1000, 5000, 1000)).toBe(true);
+  });
+
+  test("zero timeout disables (never stalls)", () => {
+    expect(isStalled(0, 1_000_000, 0)).toBe(false);
+  });
+
+  test("negative timeout disables (never stalls)", () => {
+    expect(isStalled(0, 1_000_000, -1)).toBe(false);
+  });
+});
+
+describe("startWatchdog", () => {
+  // A hand-driven clock lets us test the timer logic without real time. checkMs is small so
+  // Bun's fake-free interval fires quickly; we advance `clock` to cross the timeout.
+  function harness(timeoutMs: number) {
+    let clock = 0;
+    const stalls: number[] = [];
+    const wd = startWatchdog({
+      timeoutMs,
+      checkMs: 1,
+      now: () => clock,
+      onStall: (idle) => stalls.push(idle),
+    });
+    return { wd, stalls, tick: (ms: number) => (clock += ms) };
+  }
+
+  test("fires onStall once after the timeout elapses with no touch", async () => {
+    const { wd, stalls, tick } = harness(100);
+    tick(150);
+    await new Promise((r) => setTimeout(r, 10)); // let the interval run
+    wd.stop();
+    expect(stalls.length).toBe(1);
+    expect(stalls[0]).toBe(150);
+  });
+
+  test("touch() resets the idle clock and prevents a stall", async () => {
+    const { wd, stalls, tick } = harness(100);
+    tick(80);
+    wd.touch(); // idle back to 0 at clock=80
+    tick(80); // only 80 since touch
+    await new Promise((r) => setTimeout(r, 10));
+    wd.stop();
+    expect(stalls.length).toBe(0);
+  });
+
+  test("does not fire twice", async () => {
+    const { wd, stalls, tick } = harness(100);
+    tick(500);
+    await new Promise((r) => setTimeout(r, 15)); // several check intervals
+    wd.stop();
+    expect(stalls.length).toBe(1);
+  });
+
+  test("timeout of 0 disables the watchdog", async () => {
+    const { wd, stalls, tick } = harness(0);
+    tick(1_000_000);
+    await new Promise((r) => setTimeout(r, 10));
+    wd.stop();
+    expect(stalls.length).toBe(0);
   });
 });
