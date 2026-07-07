@@ -27,7 +27,8 @@ assert_grep() { grep -q "$1" "$2" || fail "expected to see: $1"; }
 
 echo "### scenario 1: context watchdog recycle ###"
 rm -rf "$WS"/{state,notes,bin,worktrees}
-timeout 30 bun run "$HERE/src/foreman.ts" supervise >"$WS/s1.log" 2>&1 || fail "supervisor errored"
+timeout 30 bun run "$HERE/src/foreman.ts" supervise >"$WS/s1.log" 2>&1 \
+  || { cat "$WS/s1.log"; fail "supervisor errored"; }
 cat "$WS/s1.log"
 assert_grep "agent launched; bootstrap sent" "$WS/s1.log"
 assert_grep "hard mark hit" "$WS/s1.log"
@@ -41,7 +42,8 @@ echo "  scenario 1 OK"
 
 echo "### scenario 2: agent-initiated clear-request recycle ###"
 rm -rf "$WS"/{state,notes,bin,worktrees}
-MOCK_MODE=clear timeout 30 bun run "$HERE/src/foreman.ts" supervise >"$WS/s2.log" 2>&1 || fail "supervisor errored"
+MOCK_MODE=clear timeout 30 bun run "$HERE/src/foreman.ts" supervise >"$WS/s2.log" 2>&1 \
+  || { cat "$WS/s2.log"; fail "supervisor errored"; }
 cat "$WS/s2.log"
 assert_grep "agent requested clear → recycling" "$WS/s2.log"
 assert_grep "relaunching fresh" "$WS/s2.log"
