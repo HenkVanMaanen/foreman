@@ -1,11 +1,16 @@
 # foreman tests
 
-## Lifecycle test (no real Claude, no network)
+## Tests (no real Claude, no network)
 
 ```sh
 bun install          # dev deps (types)
-npm test             # or: bash test/run-lifecycle.sh
+npm test             # unit tests (bun test) + lifecycle (bash test/run-lifecycle.sh)
 ```
+
+`npm test` runs two layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers `*.test.ts`)
+followed by the lifecycle suite below.
+
+## Lifecycle test
 
 `run-lifecycle.sh` drives the **real supervisor** against `mock-claude.ts` — a fake
 `claude -p` that speaks the stream-json protocol — from a fresh temp workspace. It verifies:
