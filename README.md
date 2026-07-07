@@ -50,7 +50,7 @@ scripts are reference-quality; expect to refine them for your workspace.
 
 ```sh
 bun install                  # dev deps (types)
-npm test                     # verify the supervisor lifecycle (mock claude, no network)
+npm test                     # unit tests + supervisor lifecycle (mock claude, no network)
 
 claude login                 # subscription auth so headless runs don't hit metered API
 cp .env.example .env         # Telegram/Mattermost creds, context marks, age secrets identity

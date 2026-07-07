@@ -18,6 +18,16 @@ import { chmod, mkdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 
+/** Validate a caller-supplied secret NAME and derive its on-disk filename. The guard keeps a
+ *  name from escaping the secrets dir (no `/`, `..`, etc.) — anything but UPPER_SNAKE_CASE is
+ *  rejected. Exported as a pure function so it can be unit-tested without a store/filesystem. */
+export function secretFileName(name: string): string {
+  if (!/^[A-Z][A-Z0-9_]*$/.test(name)) {
+    throw new Error(`invalid secret name: ${name} (use UPPER_SNAKE_CASE)`);
+  }
+  return `${name}.age`;
+}
+
 export class SecretsStore {
   private dir: string;
 
@@ -26,10 +36,7 @@ export class SecretsStore {
   }
 
   private path(name: string): string {
-    if (!/^[A-Z][A-Z0-9_]*$/.test(name)) {
-      throw new Error(`invalid secret name: ${name} (use UPPER_SNAKE_CASE)`);
-    }
-    return join(this.dir, `${name}.age`);
+    return join(this.dir, secretFileName(name));
   }
 
   /** The public recipient to encrypt to: explicit if configured, else derived from the identity. */

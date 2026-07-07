@@ -146,7 +146,7 @@ async function readWorkers(cfg: Config): Promise<Worker[]> {
 
 /** Best-effort worker status hint from its notes file: an explicit `status:` line wins,
  *  else a light keyword heuristic. Purely derived — not an authoritative state. */
-function parseStatus(md: string): string {
+export function parseStatus(md: string): string {
   const m = md.match(/^\s*status\s*[:=]\s*(.+)$/im);
   if (m?.[1]) return m[1].trim().toLowerCase();
   if (/\b(done|complete|completed|merged|finished)\b/i.test(md)) return "done";
