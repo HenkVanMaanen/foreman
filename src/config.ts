@@ -11,6 +11,12 @@ export interface Config {
   contextWindow: number;
   softMark: number; // fraction of window → nudge to checkpoint
   hardMark: number; // fraction of window → force checkpoint + restart
+  // Watchdog: force-exit (so keeper respawns) if the supervisor makes no progress for this
+  // long. Must exceed the longest legitimate quiet gap — the agent parking on a foreground
+  // wait-reply or a long tool call (both capped near 600s) — so the default leaves generous
+  // margin; 0 disables. checkMs is how often the stall test runs.
+  watchdogTimeoutMs: number;
+  watchdogCheckMs: number;
   notesDir: string;
   // Git remote for the agent's durable notes (the foreman-state repo). When set, the
   // harness clones it into notesDir on cold start and pulls on restart; the agent pushes
@@ -49,6 +55,8 @@ export function loadConfig(): Config {
     contextWindow: num("FOREMAN_CONTEXT_WINDOW", 200_000),
     softMark: num("FOREMAN_SOFT_MARK", 0.6),
     hardMark: num("FOREMAN_HARD_MARK", 0.8),
+    watchdogTimeoutMs: num("FOREMAN_WATCHDOG_TIMEOUT_MS", 1_200_000), // 20 min; 0 disables
+    watchdogCheckMs: num("FOREMAN_WATCHDOG_CHECK_MS", 30_000),
     notesDir: str("FOREMAN_NOTES_DIR", "notes"),
     stateRepo: str("FOREMAN_STATE_REPO", ""),
     stateDir,

@@ -10,6 +10,7 @@ import type { Config } from "./config.ts";
 import { recordEvent, writeStatus } from "./dashboard.ts";
 import { usageTotal } from "./protocol.ts";
 import { Session } from "./session.ts";
+import { startWatchdog } from "./watchdog.ts";
 import { ensureWorkspace, syncNotes } from "./workspace.ts";
 
 const CONTINUE = "continue";
@@ -60,11 +61,39 @@ export async function supervise(cfg: Config): Promise<void> {
       hardMark: cfg.hardMark,
     });
 
+  // Watchdog: if the supervisor makes no progress for watchdogTimeoutMs (no stream event,
+  // send, or loop turn), force-exit so keeper respawns a fresh harness. touch() below marks
+  // progress; the only legitimately quiet window is waiting for the next stream event, which
+  // is bounded by the agent's longest single tool call (~600s), well under the default 20min.
+  const watchdog = startWatchdog({
+    timeoutMs: cfg.watchdogTimeoutMs,
+    checkMs: cfg.watchdogCheckMs,
+    onStall: (idleMs) => {
+      const idleS = Math.round(idleMs / 1000);
+      // stderr is inherited → this line lands in the supervisor log as the durable diagnostic.
+      console.error(
+        `[watchdog] no supervisor progress for ${idleS}s ` +
+          `(timeout ${Math.round(cfg.watchdogTimeoutMs / 1000)}s) — exiting for keeper to respawn`,
+      );
+      // Surface the bounce on the dashboard too, but never let the write delay the exit — the
+      // wedge itself may be I/O, so cap the flush at 1s then force-exit regardless.
+      const trace = Promise.allSettled([
+        recordEvent(cfg, { who: "supervisor", kind: "watchdog", detail: `idle ${idleS}s` }),
+        stat("wedged"),
+      ]);
+      const cap = new Promise((r) => setTimeout(r, 1000));
+      // keeper respawns with backoff; durable state is in notes/, so the bounce loses nothing.
+      Promise.race([trace, cap]).finally(() => process.exit(70));
+    },
+  });
+
   // Outer loop: each iteration is one fresh agent lifetime (until a recycle or exit).
   for (;;) {
+    watchdog.touch();
     const session = new Session(cfg);
     session.start({ env: passthroughEnv });
     await session.send(bootstrap);
+    watchdog.touch();
     life++;
     lastUsed = 0;
     console.log("[supervisor] agent launched; bootstrap sent");
@@ -76,6 +105,7 @@ export async function supervise(cfg: Config): Promise<void> {
     let recycle = false;
 
     for await (const ev of session.events()) {
+      watchdog.touch(); // any frame (thinking, tool use, result) is a sign of life
       if (ev.type !== "result") continue;
       const used = usageTotal(ev.usage);
       if (used) {
