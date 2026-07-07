@@ -34,9 +34,21 @@ export async function ensureWorkspace(cfg: Config, home: string): Promise<Record
   // fresh box self-provisions (secrets are re-captured from a human, so a new key is fine).
   const ageIdentity = resolve(cfg.ageIdentityFile);
   if (!cfg.ageRecipient && !existsSync(ageIdentity)) {
-    const r = Bun.spawnSync(["age-keygen", "-o", ageIdentity], { stdout: "pipe", stderr: "pipe" });
-    if (r.exitCode === 0) await chmod(ageIdentity, 0o600);
-    else console.log(`[workspace] age-keygen failed: ${r.stderr.toString().trim()}`);
+    // Bun.spawnSync THROWS (ENOENT) when the binary is absent rather than returning a
+    // non-zero exit, so wrap the whole call: on a box without `age` installed (e.g. CI),
+    // cold-start must degrade gracefully — the identity is re-provisioned when a secret is
+    // first captured — not crash the supervisor before the agent ever launches.
+    try {
+      const r = Bun.spawnSync(["age-keygen", "-o", ageIdentity], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (r.exitCode === 0) await chmod(ageIdentity, 0o600);
+      else console.log(`[workspace] age-keygen failed: ${r.stderr.toString().trim()}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.log(`[workspace] age-keygen unavailable, skipping identity: ${msg}`);
+    }
   }
 
   const notes = resolve(cfg.notesDir);
