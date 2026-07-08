@@ -34,13 +34,26 @@ routing=""
 # --- Mattermost ---
 if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
   api="${MATTERMOST_BASE_URL%/}/api/v4"
-  mm=(-fsS -H "Authorization: Bearer ${MATTERMOST_BOT_TOKEN}" -H "Content-Type: application/json")
+  # Keep the bot token out of argv (else visible via ps / /proc/<pid>/cmdline while a request
+  # is in flight): write the Authorization header to a 0600 temp file and have curl read it
+  # with -H @file. Cleaned up on exit. (curl >= 7.55 for -H @file.)
+  auth_hdr="$(mktemp "${TMPDIR:-/tmp}/mm-auth.XXXXXX")"
+  chmod 600 "$auth_hdr"
+  trap 'rm -f "$auth_hdr"' EXIT
+  printf 'Authorization: Bearer %s\n' "$MATTERMOST_BOT_TOKEN" > "$auth_hdr"
+  mm=(-fsS -H @"$auth_hdr" -H "Content-Type: application/json")
   chan="${MATTERMOST_CHANNEL_ID:-}"
+  # Setup/post calls are guarded (|| true) so a transient Mattermost failure degrades to the
+  # next configured channel (Telegram, below) instead of aborting the whole script under
+  # `set -e` — matching the header's "any channel that is configured is used".
   if [ -z "$chan" ] && [ -n "${MATTERMOST_TARGET_USER:-}" ]; then
-    bot_id="$(curl "${mm[@]}" "$api/users/me" | jq -r .id)"
-    tgt_id="$(curl "${mm[@]}" "$api/users/username/${MATTERMOST_TARGET_USER}" | jq -r .id)"
-    chan="$(curl "${mm[@]}" -X POST "$api/channels/direct" -d "[\"$bot_id\",\"$tgt_id\"]" | jq -r .id)"
+    bot_id="$(curl "${mm[@]}" "$api/users/me" | jq -r .id || true)"
+    tgt_id="$(curl "${mm[@]}" "$api/users/username/${MATTERMOST_TARGET_USER}" | jq -r .id || true)"
+    if [ -n "$bot_id" ] && [ "$bot_id" != "null" ] && [ -n "$tgt_id" ] && [ "$tgt_id" != "null" ]; then
+      chan="$(curl "${mm[@]}" -X POST "$api/channels/direct" -d "[\"$bot_id\",\"$tgt_id\"]" | jq -r .id || true)"
+    fi
   fi
+  [ "$chan" = "null" ] && chan=""
   if [ -n "$chan" ]; then
     # Human tone: no "[foreman]"/urgency tags — the message already comes from the bot
     # account, and the question text is written like a person. Add a light nudge only when
@@ -49,8 +62,9 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
     [ -n "$options" ] && text="$text"$'\n'"($options?)"
     [ "$urgency" = "blocking" ] && text="$text"$'\n\n'"(I'm blocked on this one — whenever you get a sec.)"
     resp="$(curl "${mm[@]}" -X POST "$api/posts" \
-      -d "$(jq -n --arg c "$chan" --arg m "$text" '{channel_id:$c, message:$m}')")"
-    routing="$(echo "$resp" | jq -r .id)"
+      -d "$(jq -n --arg c "$chan" --arg m "$text" '{channel_id:$c, message:$m}')" || true)"
+    routing="$(echo "$resp" | jq -r .id || true)"
+    [ "$routing" = "null" ] && routing=""
   fi
 fi
 
@@ -60,9 +74,14 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
   [ -n "$options" ] && ttext="$ttext"$'\n'"($options?)"
   [ "$urgency" = "blocking" ] && ttext="$ttext"$'\n\n'"(blocked on this one — whenever you get a sec.)"
   ttext="$ttext"$'\n'"(ref #$gen_id)"  # keep the #id so wait-reply can correlate on Telegram
-  curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  # Token stays out of argv (else visible via ps / /proc/<pid>/cmdline): pass the URL (which
+  # embeds the token) via a curl config read from stdin with -K -. chat_id/text are not secret
+  # and text may contain newlines (awkward to quote in a config), so they stay as args.
+  curl -fsS -K - \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${ttext}" >/dev/null && : "${routing:=$gen_id}"
+    --data-urlencode "text=${ttext}" >/dev/null <<EOF && : "${routing:=$gen_id}"
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+EOF
 fi
 
 [ -n "$routing" ] || { echo "ask-human: no channel configured/reachable" >&2; exit 1; }

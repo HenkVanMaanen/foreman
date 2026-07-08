@@ -50,7 +50,9 @@ export async function ensureWorkspace(cfg: Config, home: string): Promise<Record
   // committed template when no state repo is configured (or the state repo is empty).
   if (cfg.stateRepo) {
     if (!existsSync(join(notes, ".git"))) {
-      git(["clone", cfg.stateRepo, notes]); // empty repo → empty tree; template seeded below
+      // `--` stops a stateRepo value starting with `-` from being parsed as a git option
+      // (argument-injection hardening; source is trusted operator env, so risk is low).
+      git(["clone", "--", cfg.stateRepo, notes]); // empty repo → empty tree; template seeded below
       if (!existsSync(notes)) await mkdir(notes, { recursive: true });
       if (!git(["-C", notes, "remote"]).stdout.includes("origin")) {
         git(["-C", notes, "init"]);

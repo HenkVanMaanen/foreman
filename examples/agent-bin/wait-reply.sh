@@ -21,6 +21,12 @@
 set -euo pipefail
 
 id="${1:?usage: wait-reply <id> [--raw]}"
+# Sanitize <id>: it is interpolated into a watermark file path (wm_dir/$id) and a sed
+# expression (s/#$id//) below, so reject anything outside a safe charset to block
+# path-traversal and sed-injection. Mirrors secretFileName()'s posture in src/.
+if ! [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  echo "wait-reply: invalid id '$id' (allowed chars: A-Za-z0-9_-)" >&2; exit 2
+fi
 raw=0; [ "${2:-}" = "--raw" ] && raw=1
 deadline=0
 [ -n "${FOREMAN_WAIT_TIMEOUT:-}" ] && deadline=$(( $(date +%s) + FOREMAN_WAIT_TIMEOUT ))
@@ -31,17 +37,28 @@ timed_out() { [ "$deadline" != 0 ] && [ "$(date +%s)" -ge "$deadline" ]; }
 # --- Mattermost ---
 if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
   api="${MATTERMOST_BASE_URL%/}/api/v4"
-  mm=(-fsS -H "Authorization: Bearer ${MATTERMOST_BOT_TOKEN}" -H "Content-Type: application/json")
-  bot_id="$(curl "${mm[@]}" "$api/users/me" | jq -r .id)"
+  # Keep the bot token out of argv (else visible via ps / /proc/<pid>/cmdline while a request
+  # is in flight): write the Authorization header to a 0600 temp file and have curl read it
+  # with -H @file. Cleaned up on exit. (curl >= 7.55 for -H @file.)
+  auth_hdr="$(mktemp "${TMPDIR:-/tmp}/mm-auth.XXXXXX")"
+  chmod 600 "$auth_hdr"
+  trap 'rm -f "$auth_hdr"' EXIT
+  printf 'Authorization: Bearer %s\n' "$MATTERMOST_BOT_TOKEN" > "$auth_hdr"
+  mm=(-fsS -H @"$auth_hdr" -H "Content-Type: application/json")
+  # Setup calls are guarded (|| true) so a transient Mattermost failure degrades to the next
+  # configured channel (Telegram, below) instead of aborting the whole script under `set -e`.
+  bot_id="$(curl "${mm[@]}" "$api/users/me" | jq -r .id || true)"; [ "$bot_id" = "null" ] && bot_id=""
   # Resolve the target human's id once — needed both to open the DM channel and to attribute
   # an inbound 👍 reaction to the human (Task B, below).
   tgt_id=""
   [ -n "${MATTERMOST_TARGET_USER:-}" ] && \
-    tgt_id="$(curl "${mm[@]}" "$api/users/username/${MATTERMOST_TARGET_USER}" | jq -r .id)"
+    tgt_id="$(curl "${mm[@]}" "$api/users/username/${MATTERMOST_TARGET_USER}" | jq -r .id || true)"
+  [ "$tgt_id" = "null" ] && tgt_id=""
   chan="${MATTERMOST_CHANNEL_ID:-}"
-  if [ -z "$chan" ] && [ -n "$tgt_id" ]; then
-    chan="$(curl "${mm[@]}" -X POST "$api/channels/direct" -d "[\"$bot_id\",\"$tgt_id\"]" | jq -r .id)"
+  if [ -z "$chan" ] && [ -n "$tgt_id" ] && [ -n "$bot_id" ]; then
+    chan="$(curl "${mm[@]}" -X POST "$api/channels/direct" -d "[\"$bot_id\",\"$tgt_id\"]" | jq -r .id || true)"
   fi
+  [ "$chan" = "null" ] && chan=""
   # Acknowledge a human reply with a 👀 so the human can see, at a glance, that foreman read it.
   react() {
     local pid="$1"; [ -n "$pid" ] || return 0
@@ -90,32 +107,43 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
     emit "ACK"; return 0
   }
 
-  # One-shot pre-check: a threaded reply may have arrived while no waiter was running
-  # (e.g. between context recycles). since=now would miss it, so check thread history first.
-  # The watermark filter ensures only replies newer than the last handled one match.
-  pre="$(curl "${mm[@]}" "$api/posts/$id/thread" 2>/dev/null | pick '.root_id == $q')"
-  handle "$pre" && exit 0
-  check_ack && exit 0   # a 👍 may already sit on the question post (e.g. across a recycle)
+  # Only engage Mattermost if setup actually resolved the bot identity; otherwise fall through
+  # to the next configured channel (Telegram) rather than polling a broken/absent channel.
+  if [ -n "$bot_id" ]; then
+    # One-shot pre-check: a threaded reply may have arrived while no waiter was running
+    # (e.g. between context recycles). since=now would miss it, so check thread history first.
+    # The watermark filter ensures only replies newer than the last handled one match.
+    pre="$(curl "${mm[@]}" "$api/posts/$id/thread" 2>/dev/null | pick '.root_id == $q')"
+    handle "$pre" && exit 0
+    check_ack && exit 0   # a 👍 may already sit on the question post (e.g. across a recycle)
 
-  since="$(( $(date +%s) * 1000 ))"  # only consider posts from now on
-  while true; do
-    resp="$(curl "${mm[@]}" "$api/channels/$chan/posts?since=$since" || true)"
-    # 1) a reply in this question's thread — unambiguous under concurrency
-    reply="$(echo "$resp" | pick '.root_id == $q')"
-    # 2) fallback: a plain (non-threaded) human message — fine when one question is pending
-    [ -n "$reply" ] || reply="$(echo "$resp" | pick '.root_id == ""')"
-    handle "$reply" && exit 0
-    check_ack && exit 0   # ...or the human 👍'd the question post instead of replying
-    timed_out && { echo "wait-reply: timed out waiting for $id" >&2; exit 3; }
-    sleep 3
-  done
+    if [ -n "$chan" ]; then
+      since="$(( $(date +%s) * 1000 ))"  # only consider posts from now on
+      while true; do
+        resp="$(curl "${mm[@]}" "$api/channels/$chan/posts?since=$since" || true)"
+        # 1) a reply in this question's thread — unambiguous under concurrency
+        reply="$(echo "$resp" | pick '.root_id == $q')"
+        # 2) fallback: a plain (non-threaded) human message — fine when one question is pending
+        [ -n "$reply" ] || reply="$(echo "$resp" | pick '.root_id == ""')"
+        handle "$reply" && exit 0
+        check_ack && exit 0   # ...or the human 👍'd the question post instead of replying
+        timed_out && { echo "wait-reply: timed out waiting for $id" >&2; exit 3; }
+        sleep 3
+      done
+    fi
+  fi
 fi
 
 # --- Telegram ---
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   offset=0
   while true; do
-    resp="$(curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}")" || { sleep 2; continue; }
+    # Token stays out of argv (else visible via ps / /proc/<pid>/cmdline): pass the URL (which
+    # embeds the token) via a curl config read from stdin with -K -.
+    resp="$(curl -fsS -K - <<EOF
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}"
+EOF
+)" || { sleep 2; continue; }
     last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
     [ -n "$last" ] && offset=$((last + 1))
     reply="$(echo "$resp" | jq -r --arg tag "#$id" '.result[].message.text? // empty | select(contains($tag))' | head -n1 | sed "s/#$id//; s/^[[:space:]]*//; s/[[:space:]]*$//")"
