@@ -168,7 +168,11 @@ its task notes and can be re-spawned with `--resume`.
   confirmation ("stored") reaches the agent's context.
 - **Use without exposure:** `foreman run --secret GITLAB_TOKEN -- glab issue list` decrypts,
   sets the env var **for that child process only**, and execs — the value never appears in
-  the agent's stdout/transcript.
+  the agent's stdout/transcript. **Caveat:** the child's own stdout/stderr are inherited and
+  reach the agent's transcript, so the injection keeps the secret out of argv/logs but cannot
+  stop a child that *prints* it. Only run commands that consume the secret internally; never a
+  child that echoes its env (`env`, `printenv`, verbose `-v` HTTP dumps). See the exposure note
+  on `runWithSecrets` in `src/secrets.ts`.
 - The agent references secrets **by name**, never by value. Log scrubbing strips known
   values as defense-in-depth.
 

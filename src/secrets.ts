@@ -100,7 +100,14 @@ export async function secretSetFromStdin(cfg: Config, name: string): Promise<voi
   console.log(`stored secret ${name}`);
 }
 
-/** `foreman run --secret NAME[,NAME] -- cmd args…` — inject into child env only, exec, forward stdio. */
+/** `foreman run --secret NAME[,NAME] -- cmd args…` — inject into child env only, exec, forward stdio.
+ *
+ * EXPOSURE NOTE: the child's stdout/stderr are inherited, so they flow back into the agent's
+ * tool output (its transcript/context). The env-injection keeps the value out of argv and out of
+ * this process's logs, but it CANNOT stop a child that prints the secret itself. Callers must run
+ * only commands that consume the secret internally (e.g. `glab`, `curl` with `-H @file`) and must
+ * never invoke a child that echoes its env (`env`, `printenv`, `set`, verbose/`-v` HTTP dumps).
+ * This is inherent to the inject-into-a-subprocess model; the guard is caller discipline. */
 export async function runWithSecrets(cfg: Config, names: string[], cmd: string[]): Promise<number> {
   const store = new SecretsStore(cfg);
   const injected: Record<string, string> = {};

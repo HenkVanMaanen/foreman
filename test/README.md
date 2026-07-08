@@ -7,8 +7,17 @@ bun install          # dev deps (types)
 npm test             # unit tests (bun test) + lifecycle (bash test/run-lifecycle.sh)
 ```
 
-`npm test` runs two layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers `*.test.ts`)
-followed by the lifecycle suite below.
+`npm test` runs three layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers
+`*.test.ts`), the lifecycle suite below, then `wait-reply-inbox.sh`.
+
+## wait-reply inbox test
+
+`wait-reply-inbox.sh` drives `examples/agent-bin/wait-reply.sh` in **inbox mode** against a
+PATH-shim `curl` that returns canned Mattermost JSON (no network). It locks the inbox contract:
+the first-ever call seeds the channel watermark to "now" and blocks (→ exit 3 on timeout); a
+canned new human post prints as one `MSG <id> <root> <text>` line, advances the watermark, and is
+👀-reacted; two queued posts both print chronologically; a bot post is filtered out and message
+newlines collapse to spaces; nothing new → exit 3 with the watermark unmoved.
 
 ## Lifecycle test
 

@@ -34,17 +34,12 @@ export async function supervise(cfg: Config): Promise<void> {
   const home = resolve(import.meta.dir, "..");
   const workspaceEnv = await ensureWorkspace(cfg, home);
 
-  // Env for the agent: workspace (PATH + FOREMAN_HOME) + channel creds its scripts use.
-  const passthroughEnv = {
-    ...pickEnv([
-      "TELEGRAM_BOT_TOKEN",
-      "TELEGRAM_CHAT_ID",
-      "MATTERMOST_BASE_URL",
-      "MATTERMOST_BOT_TOKEN",
-      "MATTERMOST_CHANNEL_ID",
-    ]),
-    ...workspaceEnv,
-  };
+  // Env for the agent: workspace (PATH + FOREMAN_HOME) on top of the full inherited process
+  // env. Session.start() already spreads ...process.env into the child, so every channel cred
+  // (TELEGRAM_*, MATTERMOST_*, incl. MATTERMOST_TARGET_USER) reaches the agent's scripts by
+  // inheritance — no explicit allowlist needed. (An allowlist here would only re-copy vars the
+  // child already has, and previously omitted MATTERMOST_TARGET_USER while doing so.)
+  const passthroughEnv = { ...workspaceEnv };
 
   // Track for the dashboard: which fresh lifetime we're on, and the last observed usage.
   let life = 0;
@@ -142,8 +137,15 @@ export async function supervise(cfg: Config): Promise<void> {
       }
       // Keep the work loop alive: prompt the next cycle. The agent's own scripts
       // (wait-reply / wait-for-work) block when there's nothing to do, so this does
-      // not spin.
-      await session.send(CONTINUE);
+      // not spin. If the child died right after this result, the write can throw EPIPE;
+      // treat that as "process ended" and fall through to the tidy keeper-respawn path
+      // rather than surfacing an uncaught error.
+      try {
+        await session.send(CONTINUE);
+      } catch (e) {
+        console.log(`[supervisor] continue send failed (${e}); child gone → exiting for keeper`);
+        break;
+      }
     }
 
     await session.stop();
@@ -161,18 +163,12 @@ export async function supervise(cfg: Config): Promise<void> {
       continue;
     }
     // Process exited on its own (crash or clean stop). The keeper will respawn the
-    // whole harness; exiting here lets it apply backoff.
+    // whole harness; exiting here lets it apply backoff. Stop the watchdog on this clean
+    // return so its interval doesn't outlive the loop (belt-and-suspenders alongside the
+    // process.exit path — the timer is unref()ed, but tidy shutdown shouldn't rely on that).
+    watchdog.stop();
     console.log("[supervisor] agent process ended; exiting for keeper to respawn");
     await recordEvent(cfg, { who: "supervisor", kind: "exit", detail: `life #${life}` });
     return;
   }
-}
-
-function pickEnv(names: string[]): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const n of names) {
-    const v = process.env[n];
-    if (v) out[n] = v;
-  }
-  return out;
 }
