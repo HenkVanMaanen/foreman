@@ -5,17 +5,9 @@
 // additions (PATH, FOREMAN_HOME, FOREMAN_NOTES_DIR) to hand to the agent subprocess.
 
 import { existsSync } from "node:fs";
-import { chmod, cp, mkdir, readdir, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
-
-async function isEmptyDir(path: string): Promise<boolean> {
-  try {
-    return (await readdir(path)).length === 0;
-  } catch {
-    return true;
-  }
-}
 
 /** Run git synchronously; returns {ok, stdout}. Never throws on non-zero exit. */
 function git(args: string[]): { ok: boolean; stdout: string } {
@@ -72,9 +64,7 @@ export async function ensureWorkspace(cfg: Config, home: string): Promise<Record
   }
 
   const seed = join(home, "agent-workspace-seed", "notes");
-  if (!existsSync(notes) || (await isEmptyDir(notes))) {
-    await mkdir(notes, { recursive: true });
-  }
+  await mkdir(notes, { recursive: true }); // idempotent — ensure the notes tree exists
   if (!existsSync(join(notes, "INDEX.md")) && existsSync(seed)) {
     await cp(seed, notes, { recursive: true }); // seed template into a fresh notes tree
   }
