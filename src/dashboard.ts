@@ -10,7 +10,7 @@
 // by design never reach notes). For remote viewing, SSH-tunnel the port.
 
 import { existsSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 
@@ -70,7 +70,13 @@ export async function writeStatus(cfg: Config, s: Omit<Status, "updatedAt">): Pr
   try {
     await mkdir(resolve(cfg.stateDir), { recursive: true });
     const full: Status = { ...s, updatedAt: new Date().toISOString() };
-    await writeFile(statusPath(cfg), JSON.stringify(full, null, 2));
+    // Write-then-rename so a concurrent dashboard read never sees a torn/partial status.json:
+    // rename() is atomic within a filesystem, so the reader gets either the old file or the
+    // complete new one. The temp name is pid-scoped to avoid clobbering a parallel writer's temp.
+    const dest = statusPath(cfg);
+    const tmp = `${dest}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(full, null, 2));
+    await rename(tmp, dest);
   } catch {
     /* ignore */
   }
