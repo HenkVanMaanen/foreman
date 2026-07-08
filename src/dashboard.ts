@@ -177,7 +177,9 @@ function sse(cfg: Config): Response {
         try {
           controller.enqueue(enc.encode(`data: ${JSON.stringify(await snapshot(cfg))}\n\n`));
         } catch {
-          /* client gone */
+          // Client gone (or the stream errored): stop the heartbeat so we don't leak the
+          // interval if cancel() isn't also invoked for this teardown.
+          if (timer) clearInterval(timer);
         }
       };
       void push();
