@@ -55,6 +55,9 @@ write and keep in `bin/` (reference implementations are in `examples/agent-bin/`
 - `bin/wait-reply <id>` → blocks until the human answers that id, prints the reply. Use this
   for an explicit **in-task** blocking wait on one thread. Because it is one long-running bash
   command, waiting costs almost no context.
+- `bin/reply <root_or_post_id_or_-> [message]` → post back in the correct thread (auto-resolves
+  the thread root, so no HTTP 400; message via stdin keeps quotes/newlines safe). Prefer it over
+  hand-rolled curl.
 - **Async by default:** if a question is `background`, spawn the work you *can* do and check
   the reply later. If `blocking`, it's fine to wait — other workers keep running independently.
 
@@ -108,6 +111,10 @@ Each worker is a complete Claude Code instance with its own context window, so i
 further and a worker blocked on a human never blocks the others. Poll workers via their
 status files in `notes/tasks/`. Reap worktrees when done. Record a concurrency cap in your
 notes and respect it (subscription rate limits are real).
+
+For a quick detached worker without a worktree, `bin/spawn-worker <name> <brief-file>` launches
+the fresh-context `claude -p` pattern above for you, and `bin/worker-status <name>` reports
+done-vs-running and tails its log — prefer these over retyping the nohup/log/exit plumbing.
 
 ## Secrets (never handle raw values)
 

@@ -16,7 +16,16 @@ function git(args: string[]): { ok: boolean; stdout: string } {
 }
 
 // Reference scripts the agent adopts (and may refine). Seeded into bin/ on cold start.
-const BIN_SCRIPTS = ["ask-human", "wait-reply", "notes-sync", "harness-sync", "park"] as const;
+const BIN_SCRIPTS = [
+  "ask-human",
+  "wait-reply",
+  "reply",
+  "notes-sync",
+  "harness-sync",
+  "park",
+  "spawn-worker",
+  "worker-status",
+] as const;
 
 export async function ensureWorkspace(cfg: Config, home: string): Promise<Record<string, string>> {
   await mkdir(cfg.stateDir, { recursive: true });
