@@ -28,12 +28,13 @@
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
 #
-# Defaults: DIR=cwd, max-rounds=6, security=auto, effort=high,
+# Defaults: DIR=cwd, max-rounds=6, security=on, effort=high,
 #           base=merge-base of HEAD with origin/main (falls back to HEAD if unavailable).
 #
 # --security:
-#   on   — always run the security-review phase.
-#   off  — never run it.
+#   on   — (default) always run the security-review phase. The /security-review command reads the
+#          actual diff and only reports real findings, so it scopes itself — no need to pre-gate.
+#   off  — never run it (escape hatch for e.g. a huge mechanical sweep).
 #   auto — run it only if the changed-file PATHS (diff vs --base, plus uncommitted) match a
 #          sensitivity heuristic: auth login oidc token secret password credential crypto session
 #          sql query handler route exec deserialize input parse. (Paths, not content — so a script
@@ -58,7 +59,7 @@ set -euo pipefail
 dir="$PWD"
 base=""
 max_rounds=6
-security="auto"
+security="on"     # default: always run security-review; the command scopes itself to real findings
 effort="high"
 stop_hook=0
 
@@ -75,7 +76,7 @@ Usage:
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
 
-Defaults: DIR=cwd, max-rounds=6, security=auto, effort=high,
+Defaults: DIR=cwd, max-rounds=6, security=on, effort=high,
           base=merge-base of HEAD with origin/main.
 
 Exit: 0 CLEAN | 3 NOT-CLEAN (cap hit / review failed / security ESCALATE) | 2 usage/error.
@@ -102,6 +103,7 @@ done
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
 case "$effort" in low|medium|high|max) ;; *) die_usage "--effort must be low|medium|high|max (got '$effort')";; esac
 [[ "$max_rounds" =~ ^[0-9]+$ ]] || die_usage "--max-rounds must be a non-negative integer (got '$max_rounds')"
+max_rounds="$((10#$max_rounds))"  # normalize: strip leading zeros so 08/09 aren't parsed as octal by later arithmetic
 [ "$max_rounds" -ge 1 ] || die_usage "--max-rounds must be >= 1"
 
 command -v git >/dev/null 2>&1 || die_usage "git not found on PATH"
@@ -146,11 +148,19 @@ fi
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
 
 # Digest of the FULL working-tree state (tracked modifications + staged + untracked content).
-# `add -A -N` marks untracked files intent-to-add so their content shows in `diff HEAD`; this is a
-# benign index side-effect (we commit with `add -A` anyway when a round applies changes).
+# We hash the tracked diff plus the name+content of every untracked (non-ignored) file WITHOUT
+# touching the index — an earlier version used `git add -A -N` to make untracked content show in
+# `diff HEAD`, but on the clean-converge path (a phase that ends without committing) that left the
+# intent-to-add entries staged, dirtying the worker's index for files it never touched.
 _tree_digest() {
-  git -C "$dir" add -A -N >/dev/null 2>&1 || true
-  git -C "$dir" diff HEAD 2>/dev/null | _hash | awk '{print $1}'
+  {
+    git -C "$dir" diff HEAD 2>/dev/null || true
+    { git -C "$dir" ls-files --others --exclude-standard 2>/dev/null || true; } \
+      | while IFS= read -r f; do
+          printf '=== %s ===\n' "$f"
+          cat -- "$dir/$f" 2>/dev/null || true
+        done
+  } | _hash | awk '{print $1}'
 }
 
 # Run a slash command headless in DIR, streaming its output indented. Returns claude's exit code
@@ -218,10 +228,15 @@ run_security_phase() {
     off) do_sec=0; SEC_REASON="--security off";;
     auto)
       local changed
-      # committed changes vs base + any uncommitted paths
+      # Committed changes vs base + uncommitted (tracked) + untracked, one whole path per line.
+      # `git diff --name-only` / `ls-files` keep full paths intact — the old
+      # `status --porcelain | awk '{print $NF}'` truncated any path containing a space (e.g.
+      # "src/session store.js" -> "store.js"), dropping the sensitive token so auto-mode wrongly
+      # skipped the security review for exactly the files it exists to catch.
       changed="$( { git -C "$dir" diff --name-only "$base" HEAD 2>/dev/null || true; \
-                    git -C "$dir" status --porcelain 2>/dev/null | awk '{print $NF}'; } | sort -u )"
-      if [ -n "$changed" ] && printf '%s\n' "$changed" | grep -iEq "$SEC_RE"; then
+                    git -C "$dir" diff --name-only HEAD 2>/dev/null || true; \
+                    git -C "$dir" ls-files --others --exclude-standard 2>/dev/null || true; } | sort -u )"
+      if printf '%s\n' "$changed" | grep -iEq "$SEC_RE"; then
         do_sec=1; SEC_REASON="auto: sensitive path(s) in diff"
       else
         do_sec=0; SEC_REASON="auto: no sensitive paths in diff"
@@ -245,16 +260,31 @@ run_security_phase() {
     return 0
   fi
 
-  # Heuristic: findings are never auto-applied, so decide CLEAN vs ESCALATE from the output. A
-  # clear "no issues" style verdict ⇒ CLEAN; anything else ⇒ ESCALATE for a human. This is
-  # deliberately conservative (unknown ⇒ escalate). Adjust the regex if the skill's phrasing drifts.
-  if printf '%s\n' "$out" \
-       | grep -iEq 'no (security )?(issues|vulnerabilit|concerns|findings|problems)|nothing to (report|flag)|looks (good|clean)|0 (findings|issues|vulnerabilit)|no vulnerabilit'; then
+  # Heuristic: findings are never auto-applied, so decide CLEAN vs ESCALATE from the output. Parsing
+  # free text is inherently fragile, so FAIL SAFE — the dangerous direction is a real finding slipping
+  # through as CLEAN, so we bias hard toward ESCALATE:
+  #   1. If the output carries ANY finding/severity marker, ESCALATE — regardless of reassuring prose
+  #      elsewhere. (The old code declared CLEAN on any single "no issues"/"looks good" substring, so a
+  #      report like "no issues in auth, but SQL injection in query.ts (HIGH)" was wrongly passed.)
+  #   2. Else, only if there is an explicit no-findings verdict, CLEAN.
+  #   3. Else (unclear), ESCALATE.
+  # A genuinely clean review that happens to use a severity word thus escalates — a false human ping,
+  # the safe direction. The real fix is a machine-readable verdict/exit code from /security-review.
+  # Note the count clause is [1-9][0-9]* (a NON-ZERO count): "0 findings" / "0 issues" is a CLEAN
+  # verdict, so it must fall through to clean_re below, not match here. A bare [0-9]+ would match the
+  # "0" and wrongly ESCALATE every numerically-phrased clean report, making clean_re's 0-count branch
+  # dead code.
+  finding_re='\b(critical|high)\b|severity[[:space:]]*[:=]|\bcwe-[0-9]|\bcve-[0-9]|finding[[:space:]]*#?[0-9]|[1-9][0-9]* (findings|vulnerabilit|issues)'
+  clean_re='no (open |remaining )?(security )?(issues|vulnerabilit|concerns|findings|problems)|nothing to (report|flag)|(^|[^0-9])0 (findings|issues|vulnerabilit)'
+  if printf '%s\n' "$out" | grep -iEq "$finding_re"; then
+    echo "    security-review: finding/severity markers present — ESCALATE (do NOT auto-fix; human needed)"
+    SEC_STATUS="ESCALATE"; SEC_REASON="security-review surfaced findings (human review required)"
+  elif printf '%s\n' "$out" | grep -iEq "$clean_re"; then
     echo "    security-review: no findings reported — CLEAN"
     SEC_STATUS="CLEAN"
   else
-    echo "    security-review: findings present or verdict unclear — ESCALATE (do NOT auto-fix; human needed)"
-    SEC_STATUS="ESCALATE"; SEC_REASON="security-review surfaced findings (human review required)"
+    echo "    security-review: verdict unclear — ESCALATE (do NOT auto-fix; human needed)"
+    SEC_STATUS="ESCALATE"; SEC_REASON="security-review verdict unclear (human review required)"
   fi
   return 0
 }
