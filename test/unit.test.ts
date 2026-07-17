@@ -224,7 +224,35 @@ describe("classifyInbox", () => {
     }
   });
 
-  test("exit 0 with no MSG lines is unexpected → error (falls back to CONTINUE)", () => {
+  test("exit 0 with an ACK line (reaction-ack) → messages, prompt carries it verbatim", () => {
+    const action = classifyInbox(0, "ACK p9 - +1\n");
+    expect(action.kind).toBe("messages");
+    if (action.kind === "messages") {
+      expect(action.prompt).toContain("ACK p9 - +1");
+      expect(action.prompt.startsWith("[inbox] New message(s)")).toBe(true);
+    }
+  });
+
+  test("exit 0 with mixed ACK + MSG lines → messages, both pass through verbatim", () => {
+    const action = classifyInbox(0, "MSG abc - hello\nACK def rootX +1\n");
+    expect(action.kind).toBe("messages");
+    if (action.kind === "messages") {
+      expect(action.prompt).toContain("MSG abc - hello");
+      expect(action.prompt).toContain("ACK def rootX +1");
+    }
+  });
+
+  test("exit 0 drops stray output but keeps ACK lines", () => {
+    const action = classifyInbox(0, "noise\nACK p1 - +1\nwait-reply: done\n");
+    expect(action.kind).toBe("messages");
+    if (action.kind === "messages") {
+      expect(action.prompt).toContain("ACK p1 - +1");
+      expect(action.prompt).not.toContain("noise");
+      expect(action.prompt).not.toContain("wait-reply: done");
+    }
+  });
+
+  test("exit 0 with no MSG/ACK lines is unexpected → error (falls back to CONTINUE)", () => {
     expect(classifyInbox(0, "").kind).toBe("error");
     expect(classifyInbox(0, "unrelated output\n").kind).toBe("error");
   });

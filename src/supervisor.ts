@@ -129,13 +129,25 @@ export async function supervise(cfg: Config): Promise<void> {
       if (used >= hardTokens) {
         console.log("[supervisor] hard mark hit → asking agent to checkpoint");
         await recordEvent(cfg, { who: "supervisor", kind: "hard-mark", ctx: used });
-        await session.send(HARD_MSG);
+        // Same EPIPE guard as the keep-alive send below: if the child died right as we mark, the
+        // write throws — treat that as "process ended" and take the tidy keeper-respawn path.
+        try {
+          await session.send(HARD_MSG);
+        } catch (e) {
+          console.log(`[supervisor] hard-mark send failed (${e}); child gone → exiting for keeper`);
+          break;
+        }
         awaitingCheckpoint = true;
         continue;
       }
       if (used >= softTokens && !nudgedSoft) {
         await recordEvent(cfg, { who: "supervisor", kind: "soft-mark", ctx: used });
-        await session.send(SOFT_MSG);
+        try {
+          await session.send(SOFT_MSG);
+        } catch (e) {
+          console.log(`[supervisor] soft-mark send failed (${e}); child gone → exiting for keeper`);
+          break;
+        }
         nudgedSoft = true;
         continue;
       }

@@ -111,6 +111,37 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
       fi
       wm="$(cat "$inbox_wm_file" 2>/dev/null || echo 0)"; [[ "$wm" =~ ^[0-9]+$ ]] || wm=0
 
+      # Separate persistent watermark for reaction-acks: the target human adding a 👍 (+1) to one
+      # of the BOT's own recent posts counts as an ack, even while parked (single-thread mode has
+      # long done this on the question post; inbox mode now does it channel-wide). Seed to "now" on
+      # the first-ever call so a pre-existing 👍 doesn't fire, and persist the newest handled
+      # reaction's create_at so a +1 fires exactly once and never re-fires on restart.
+      inbox_react_file="$wm_dir/inbox.react"
+      if [ ! -f "$inbox_react_file" ]; then
+        printf '%s' "$(( $(date +%s) * 1000 ))" > "$inbox_react_file" 2>/dev/null || true
+      fi
+      rwm="$(cat "$inbox_react_file" 2>/dev/null || echo 0)"; [[ "$rwm" =~ ^[0-9]+$ ]] || rwm=0
+
+      # Given a channel posts JSON (with embedded post metadata) on stdin, emit
+      # "<post_id>\t<reaction_create_at>\t<root_or_->" for every FRESH +1 the target human placed
+      # on one of the bot's own posts (reaction create_at > $rwm), chronological. Bounded to the
+      # posts the caller fetched (last ~30). Root is "-" for a root/non-threaded post. Requires the
+      # target id to attribute the reaction to the human; caller skips this when it's unresolved.
+      inbox_react_pick() {
+        jq -r --arg bot "$bot_id" --arg tgt "$tgt_id" --argjson rwm "$rwm" '
+          [ .posts[]?
+            | select(.user_id == $bot)                       # only posts authored by the bot
+            | . as $post
+            | (.metadata.reactions // [])[]
+            | select(.user_id == $tgt and .emoji_name == "+1" and .create_at > $rwm)
+            | { pid: $post.id, rat: .create_at,
+                root: (if ($post.root_id // "") == "" then "-" else $post.root_id end) }
+          ]
+          | sort_by(.rat)
+          | .[]
+          | ( .pid + "\t" + (.rat|tostring) + "\t" + .root )' 2>/dev/null || true
+      }
+
       # Given channel posts JSON on stdin, emit the target human's posts NEWER than $wm, in
       # chronological order, as "<id>\t<create_at>\t<root_or_->\t<message>" (message newlines/tabs
       # collapsed to spaces so each post is exactly one tab-delimited line). The root field is "-"
@@ -150,6 +181,27 @@ $out
 INBOX
             printf '%s' "$newest" > "$inbox_wm_file" 2>/dev/null || true
             exit 0
+          fi
+          # No new POST — also check for a fresh 👍 (+1) reaction from the human on the bot's own
+          # recent posts (bounded to the channel's last ~30). A reaction carries no post text, so
+          # since=$wm above would never surface it; fetch the recent window separately.
+          if [ -n "$tgt_id" ]; then
+            rresp="$(curl "${mm[@]}" "$api/channels/$chan/posts?per_page=30" || true)"
+            racts="$(printf '%s' "$rresp" | inbox_react_pick)"
+            if [ -n "$racts" ]; then
+              newest_r="$rwm"
+              # Heredoc (not a pipe) so newest_r updates in THIS shell and the watermark sticks.
+              while IFS=$'\t' read -r pid rat root; do
+                [ -n "$pid" ] || continue
+                [ -n "$root" ] || root="-"
+                printf 'ACK %s %s +1\n' "$pid" "$root"
+                [ "$rat" -gt "$newest_r" ] 2>/dev/null && newest_r="$rat"
+              done <<RACT
+$racts
+RACT
+              printf '%s' "$newest_r" > "$inbox_react_file" 2>/dev/null || true
+              exit 0
+            fi
           fi
           timed_out && { echo "wait-reply: inbox timed out (nothing new)" >&2; exit 3; }
           sleep 3

@@ -118,5 +118,35 @@ rc=0; run_inbox 1 "$WS/o4" || rc=$?
 [ "$(cat "$WM_FILE")" = 9000 ] || fail "watermark must not move when nothing new"
 echo "  OK (exit 3, watermark unchanged)"
 
+# === 5. A fresh 👍 (+1) from the human on a BOT post → one ACK line, react watermark advances ==
+echo "### 5: a +1 reaction on the bot's own post wakes the parked agent (ACK line) ###"
+printf '9000' > "$WM_FILE"                          # no new POSTs (watermark ahead of everything)
+printf '100'  > "$WS/state/wait-reply/inbox.react"  # last-handled reaction create_at = 100
+cat > "$WS/posts5.json" <<'JSON'
+{"posts":{
+  "b1":{"id":"b1","create_at":4000,"user_id":"bot123","root_id":"","message":"ship it?",
+        "metadata":{"reactions":[
+          {"user_id":"human456","post_id":"b1","emoji_name":"+1","create_at":7000}
+        ]}}
+}}
+JSON
+export MOCK_POSTS_FILE="$WS/posts5.json"
+rc=0; run_inbox 5 "$WS/o5" || rc=$?
+[ "$rc" = 0 ] || { cat "$WS/o5.err"; fail "expected exit 0 on reaction-ack, got $rc"; }
+lines="$(wc -l < "$WS/o5" | tr -d ' ')"
+[ "$lines" = 1 ] || { cat "$WS/o5"; fail "expected exactly 1 ACK line, got $lines"; }
+grep -qx "ACK b1 - +1" "$WS/o5" || { cat "$WS/o5"; fail "ACK line malformed"; }
+[ "$(cat "$WS/state/wait-reply/inbox.react")" = 7000 ] \
+  || fail "reaction watermark should advance to 7000, got $(cat "$WS/state/wait-reply/inbox.react")"
+echo "  OK (one ACK, react wm=7000)"
+
+# === 6. Same +1 does NOT re-fire (reaction watermark now ahead of it) → exit 3 ================
+echo "### 6: an already-handled +1 does not re-fire (idempotent across polls/restarts) ###"
+export MOCK_POSTS_FILE="$WS/posts5.json"           # same reaction, create_at 7000, rwm now 7000
+rc=0; run_inbox 1 "$WS/o6" || rc=$?
+[ "$rc" = 3 ] || { cat "$WS/o6"; fail "expected exit 3 (no fresh reaction), got $rc"; }
+[ -s "$WS/o6" ] && fail "no ACK expected when the +1 was already handled"
+echo "  OK (exit 3, no re-fire)"
+
 echo
 echo "ALL WAIT-REPLY INBOX TESTS PASSED"

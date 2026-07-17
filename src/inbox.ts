@@ -23,26 +23,30 @@ const FAST_TIMEOUT_MS = 2_000;
 const MAX_FAST_EMPTIES = 5;
 
 export type InboxAction =
-  | { kind: "messages"; prompt: string } // exit 0: hand the raw MSG lines to the agent
+  | { kind: "messages"; prompt: string } // exit 0: hand the raw MSG/ACK lines to the agent
   | { kind: "keep-polling" } // exit 3: nothing new, block again (model stays asleep)
   | { kind: "error"; reason: string }; // exit 2/other: caller falls back to CONTINUE
 
 /**
  * Pure classifier for a single `wait-reply --inbox` result → the action the idle loop takes.
  * Factored out so the exit-code contract is unit-testable without a live Mattermost:
- *   exit 0 → messages (stdout carries the MSG lines; empty is unexpected → error)
+ *   exit 0 → messages (stdout carries MSG lines for posts and/or ACK lines for +1 reactions;
+ *            empty/no recognized lines is unexpected → error)
  *   exit 3 → keep-polling (timeout, nothing new)
  *   other  → error (caller degrades to CONTINUE)
+ *
+ * An `ACK <post_id> <root_or_-> +1` line means the human 👍'd one of the agent's own posts while
+ * it was parked — a reaction-ack, no reply text. It wakes the agent just like a MSG line.
  */
 export function classifyInbox(exitCode: number, stdout: string): InboxAction {
   if (exitCode === 0) {
     const lines = stdout
       .split("\n")
       .map((l) => l.trimEnd())
-      .filter((l) => l.startsWith("MSG "));
-    // exit 0 with no MSG lines is unexpected: treat as an error → fall back to CONTINUE rather
+      .filter((l) => l.startsWith("MSG ") || l.startsWith("ACK "));
+    // exit 0 with no MSG/ACK lines is unexpected: treat as an error → fall back to CONTINUE rather
     // than waking the agent with an empty inbox prompt.
-    if (lines.length === 0) return { kind: "error", reason: "exit 0 but no MSG lines" };
+    if (lines.length === 0) return { kind: "error", reason: "exit 0 but no MSG/ACK lines" };
     return { kind: "messages", prompt: formatInboxPrompt(lines.join("\n")) };
   }
   if (exitCode === 3) return { kind: "keep-polling" };
@@ -50,15 +54,17 @@ export function classifyInbox(exitCode: number, stdout: string): InboxAction {
 }
 
 /**
- * Wrap the raw MSG lines (verbatim, so nothing the agent needs is lost — wait-reply already
- * advanced the watermark and reacted eyes, so the agent will NOT see these again via its own
+ * Wrap the raw MSG/ACK lines (verbatim, so nothing the agent needs is lost — wait-reply already
+ * advanced the watermarks and reacted eyes, so the agent will NOT see these again via its own
  * poll) in the prompt the agent receives on wake.
  */
 export function formatInboxPrompt(msgLines: string): string {
   return (
     "[inbox] New message(s) from the human since you parked:\n" +
     `${msgLines}\n\n` +
-    "Handle them (reply in the correct thread; a leading '-' in the 2nd field means a new root)."
+    "Handle them (reply in the correct thread; a leading '-' in the 2nd field means a new root). " +
+    "An `ACK <post_id> <root_or_-> +1` line means the human approved that post with a 👍 (no reply " +
+    "text) — treat it as their go-ahead on that post."
   );
 }
 
