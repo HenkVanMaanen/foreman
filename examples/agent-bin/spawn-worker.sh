@@ -57,8 +57,12 @@ log="$state/$name-worker.log"
 # definition-of-done footer (which wires in the auto-review loop). Written to a file so multi-line
 # text / apostrophes stay safe — the launch still passes it via $(cat …), exactly as before, so
 # the existing safe-quoting is preserved.
-full_brief="$state/$name-brief.txt"
-{ cat "$brief"; printf '%s\n' "$DOD_FOOTER"; } > "$full_brief"
+full_brief="$state/$name-brief.composed.txt"
+# Read the caller's brief into memory BEFORE writing full_brief, so we are safe even if the caller
+# passed a brief path that resolves to full_brief itself (the redirect would otherwise truncate it
+# to empty before cat could read it).
+brief_body="$(cat "$brief")"
+{ printf '%s\n' "$brief_body"; printf '%s\n' "$DOD_FOOTER"; } > "$full_brief"
 
 # Detach so the worker outlives this turn; capture its exit into the log so worker-status can
 # tell done-vs-running. $(cat …) expands in the child at launch, so the full brief is passed as

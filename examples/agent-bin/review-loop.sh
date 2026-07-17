@@ -28,7 +28,7 @@
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
 #
-# Defaults: DIR=cwd, max-rounds=3, security=auto, effort=high,
+# Defaults: DIR=cwd, max-rounds=6, security=auto, effort=high,
 #           base=merge-base of HEAD with origin/main (falls back to HEAD if unavailable).
 #
 # --security:
@@ -57,7 +57,7 @@ set -euo pipefail
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
-max_rounds=3
+max_rounds=6
 security="auto"
 effort="high"
 stop_hook=0
@@ -75,7 +75,7 @@ Usage:
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
 
-Defaults: DIR=cwd, max-rounds=3, security=auto, effort=high,
+Defaults: DIR=cwd, max-rounds=6, security=auto, effort=high,
           base=merge-base of HEAD with origin/main.
 
 Exit: 0 CLEAN | 3 NOT-CLEAN (cap hit / review failed / security ESCALATE) | 2 usage/error.
