@@ -52,10 +52,26 @@ write and keep in `bin/` (reference implementations are in `examples/agent-bin/`
 - `bin/ask-human "<question>" [--options a,b] [--urgency blocking|background]` → posts to the
   configured channel(s) and returns a routing id. The human just replies (in-thread on
   Mattermost); they don't type anything special.
-- `bin/wait-reply <id>` → blocks until the human answers that id, prints the reply. Because
-  this is one long-running bash command, waiting costs almost no context.
+- `bin/wait-reply <id>` → blocks until the human answers that id, prints the reply. Use this
+  for an explicit **in-task** blocking wait on one thread. Because it is one long-running bash
+  command, waiting costs almost no context.
 - **Async by default:** if a question is `background`, spawn the work you *can* do and check
   the reply later. If `blocking`, it's fine to wait — other workers keep running independently.
+
+### Parking when idle (don't foreground-block to idle)
+
+When you have nothing to do and are only waiting for the human to speak next, **do not**
+foreground-block `bin/wait-reply --inbox` — that re-invokes the model on every ~600s poll and
+re-reads your whole context each time (a large chunk of idle spend). Instead:
+
+- Run `bin/park` and **end your turn.** It writes an idle sentinel and returns immediately.
+- The supervisor now owns the idle wait cheaply (it polls in TypeScript, model asleep) and
+  re-invokes you **only when the human sends a message**, delivering the message text in your
+  next prompt, prefixed `[inbox] New message(s)…` (one `MSG <post_id> <root_or_-> <text>` line
+  per message; a leading `-` in the 2nd field means a new root). Reply in the correct thread.
+- This replaces the old idle HOLD/park pattern. Keep the thread-per-topic discipline: settle
+  and re-poll before acting, and `+1`/ack when appropriate. `bin/wait-reply <id>` is still the
+  tool for an explicit blocking wait on a single in-task thread.
 
 ### Write like a human, not a status bot
 

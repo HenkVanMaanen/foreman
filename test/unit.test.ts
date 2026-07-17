@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
+import { classifyInbox, formatInboxPrompt } from "../src/inbox.ts";
 import { usageTotal, userMessage } from "../src/protocol.ts";
 import { secretFileName } from "../src/secrets.ts";
 import { isStalled, startWatchdog } from "../src/watchdog.ts";
@@ -198,5 +199,52 @@ describe("startWatchdog", () => {
     await new Promise((r) => setTimeout(r, 10));
     wd.stop();
     expect(stalls.length).toBe(0);
+  });
+});
+
+describe("classifyInbox", () => {
+  test("exit 0 with MSG lines → messages, prompt carries the lines verbatim", () => {
+    const stdout = "MSG abc - hello there\nMSG def abc follow-up\n";
+    const action = classifyInbox(0, stdout);
+    expect(action.kind).toBe("messages");
+    if (action.kind === "messages") {
+      expect(action.prompt).toContain("MSG abc - hello there");
+      expect(action.prompt).toContain("MSG def abc follow-up");
+      expect(action.prompt.startsWith("[inbox] New message(s)")).toBe(true);
+    }
+  });
+
+  test("exit 0 keeps only MSG lines and drops stray output", () => {
+    const action = classifyInbox(0, "some noise\nMSG p1 - hi\nwait-reply: done\n");
+    expect(action.kind).toBe("messages");
+    if (action.kind === "messages") {
+      expect(action.prompt).toContain("MSG p1 - hi");
+      expect(action.prompt).not.toContain("some noise");
+      expect(action.prompt).not.toContain("wait-reply: done");
+    }
+  });
+
+  test("exit 0 with no MSG lines is unexpected → error (falls back to CONTINUE)", () => {
+    expect(classifyInbox(0, "").kind).toBe("error");
+    expect(classifyInbox(0, "unrelated output\n").kind).toBe("error");
+  });
+
+  test("exit 3 (timeout, nothing new) → keep-polling", () => {
+    expect(classifyInbox(3, "").kind).toBe("keep-polling");
+  });
+
+  test.each([1, 2, 4, 127])("exit %i (non-{0,3}) → error", (code) => {
+    const action = classifyInbox(code, "");
+    expect(action.kind).toBe("error");
+    if (action.kind === "error") expect(action.reason).toContain(String(code));
+  });
+});
+
+describe("formatInboxPrompt", () => {
+  test("wraps raw MSG lines with the [inbox] preamble and handling guidance", () => {
+    const p = formatInboxPrompt("MSG x - yo");
+    expect(p.startsWith("[inbox] New message(s)")).toBe(true);
+    expect(p).toContain("MSG x - yo");
+    expect(p).toContain("new root");
   });
 });
