@@ -8,6 +8,7 @@ import { readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 import { recordEvent, writeStatus } from "./dashboard.ts";
+import { waitForInboxMessages } from "./inbox.ts";
 import { usageTotal } from "./protocol.ts";
 import { Session } from "./session.ts";
 import { startWatchdog } from "./watchdog.ts";
@@ -27,6 +28,9 @@ const HARD_MSG =
 export async function supervise(cfg: Config): Promise<void> {
   const bootstrap = await readFile(cfg.bootstrapPromptPath, "utf8");
   const clearSentinel = join(cfg.stateDir, "clear-request");
+  // Written by bin/park when the agent goes idle: the supervisor (not the model) then owns the
+  // wait for the next human message. See the idle-aware keep-alive at the bottom of the loop.
+  const idleSentinel = join(cfg.stateDir, "idle-wait");
   const hardTokens = Math.floor(cfg.contextWindow * cfg.hardMark);
   const softTokens = Math.floor(cfg.contextWindow * cfg.softMark);
 
@@ -135,13 +139,34 @@ export async function supervise(cfg: Config): Promise<void> {
         nudgedSoft = true;
         continue;
       }
-      // Keep the work loop alive: prompt the next cycle. The agent's own scripts
-      // (wait-reply / wait-for-work) block when there's nothing to do, so this does
-      // not spin. If the child died right after this result, the write can throw EPIPE;
-      // treat that as "process ended" and fall through to the tidy keeper-respawn path
-      // rather than surfacing an uncaught error.
+      // Idle-aware keep-alive. Default to a plain "continue" to prompt the next work cycle.
+      // But if the agent parked (bin/park wrote the idle sentinel and ended its turn), the
+      // SUPERVISOR — not the model — owns the wait: block cheaply on wait-reply --inbox and
+      // re-invoke the agent only when the human writes, delivering the message text in the next
+      // prompt. This stops burning a full ~92K-token turn on every ~600s idle poll (~32% of
+      // spend). Any failure in this path degrades to CONTINUE (the pre-existing behavior) so a
+      // bug here can never wedge or crash-loop the loop — the keeper only catches crashes/exits.
+      let nextPrompt = CONTINUE;
+      if (existsSync(idleSentinel)) {
+        await rm(idleSentinel, { force: true });
+        await stat("idle");
+        try {
+          nextPrompt = await waitForInboxMessages(
+            cfg,
+            watchdog,
+            () => stat("idle"),
+            passthroughEnv,
+          );
+        } catch (e) {
+          console.log(`[supervisor] idle-wait failed (${e}); falling back to continue`);
+          nextPrompt = CONTINUE;
+        }
+      }
+      // If the child died right after the last result, the write can throw EPIPE; treat that as
+      // "process ended" and fall through to the tidy keeper-respawn path rather than surfacing
+      // an uncaught error. (Same handling as before — only the prompt is now idle-aware.)
       try {
-        await session.send(CONTINUE);
+        await session.send(nextPrompt);
       } catch (e) {
         console.log(`[supervisor] continue send failed (${e}); child gone → exiting for keeper`);
         break;
