@@ -29,8 +29,9 @@ read -r -d '' DOD_FOOTER <<'EOF' || true
 Before you mark yourself done / exit:
 1. Complete your change and COMMIT it on your branch.
 2. Run the auto-review loop on your working dir:  `bin/review-loop --dir .`
-   (it runs /code-review and /simplify to convergence, committing each round's fixes, and a
-   conditional /security-review).
+   (it runs /code-review and /simplify to convergence, committing each round's fixes, plus an
+   independent OpenAI Codex reviewer that auto-fixes what it is confident about and escalates
+   risky findings — pass --no-codex to skip it — and a conditional /security-review).
 3. Do NOT mark done / exit until review-loop prints `review-loop: CLEAN` and exits 0.
    - If it reports NOT-CLEAN (hit the round cap with findings still, or a review invocation
      failed), or the security review escalates, DO NOT proceed — report that clearly to the human
@@ -61,7 +62,7 @@ full_brief="$state/$name-brief.composed.txt"
 # Read the caller's brief into memory BEFORE writing full_brief, so we are safe even if the caller
 # passed a brief path that resolves to full_brief itself (the redirect would otherwise truncate it
 # to empty before cat could read it).
-brief_body="$(cat "$brief")"
+brief_body="$(cat -- "$brief")"
 { printf '%s\n' "$brief_body"; printf '%s\n' "$DOD_FOOTER"; } > "$full_brief"
 
 # Detach so the worker outlives this turn; capture its exit into the log so worker-status can

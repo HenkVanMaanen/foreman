@@ -78,9 +78,49 @@ re-run the loop. Options:
 - **Disable:** remove the `Stop` block (or the whole `hooks` key) and restart. Deleting the marker
   file alone does **not** disable the hook — it only re-arms it.
 
+## Codex — an independent second reviewer (default ON)
+
+review-loop runs an **OpenAI Codex** review-and-fix phase as a genuinely independent second model,
+in addition to the Claude phases. Codex reviews the branch diff (vs `--base`) for correctness bugs
+and clear simplifications and **auto-applies the fixes it is confident about**, escalating anything
+risky/uncertain — exactly like the security phase, but for general correctness rather than security.
+It runs through the *same* digest/convergence machinery and the *same* round cap as the Claude
+phases; every finding (fixed or not) is surfaced in the summary.
+
+- **Ordering:** Claude `/code-review` → Claude `/simplify` → **Codex review** → security → final
+  convergence. Codex runs *before* security so security keeps the final word over the exact code
+  that ships (including anything Codex changed).
+- **Joint fixpoint:** when Codex is active, the gated final pass is a bounded **Claude↔Codex
+  reconciliation** — it alternates a Claude `/code-review` pass and a Codex recheck and is CLEAN only
+  when a full alternation applies nothing on *both* models (so a Codex fix Claude would flag, and a
+  Claude fix Codex would flag, are both caught). The alternation is capped at `--max-rounds` cycles
+  and each pass is itself round-capped — no infinite ping-pong.
+- **Disagreement / escalation:** a Codex finding it judges too risky to auto-fix is left UNAPPLIED
+  and surfaced as an escalation (`review-loop: NOT-CLEAN`, WHY printed) — the same human-decides
+  channel as security escalations. Nothing risky is silently applied.
+- **Flags:** `--codex` / `--no-codex` (default **on**), `--codex-model MODEL` (default
+  `gpt-5.6-sol`).
+- **Graceful skip:** if the `codex` CLI is not installed or not logged in (`codex login status`
+  fails), the phase prints a warning and is **skipped** — the loop degrades to Claude-only and never
+  hard-fails. The summary distinguishes `--no-codex (disabled)` from `codex not found` /
+  `codex not logged in`.
+
+## `second-opinion` — a Codex critique of a plan/design (companion tool)
+
+`bin/second-opinion` is a separate, **non-mutating** helper: pipe a plan/design to it and Codex
+returns an independent critique (key risks, hidden assumptions, missing cases, simpler approaches,
+and a build-as-is verdict). It invokes Codex with a read-only sandbox so it cannot edit files or
+touch git. Usage: `second-opinion [--model M] [--title T] <plan-file>` or `... | second-opinion`.
+Same graceful behavior when codex is missing/not-logged-in (warns, exits nonzero, never hangs).
+
 ## Notes
 
-- The hook runs `claude -p` sub-invocations (`/code-review`, `/simplify`, conditionally
-  `/security-review`). Each costs tokens/time; keep `--max-rounds` modest for interactive use.
-- Security findings are **never** auto-applied — a NOT-CLEAN / ESCALATE result is printed for you to
-  act on, but in `--stop-hook` mode the process still exits 0 so it doesn't wedge the session.
+- The hook runs `claude -p` **and `codex exec`** sub-invocations (`/code-review`, `/simplify`, the
+  Codex review loop, the security fix loop, and — only if Codex or security changed code — a final
+  reconciliation / `/code-review`). Each costs tokens/time; keep `--max-rounds` modest for
+  interactive use, or pass `--no-codex` to run Claude-only.
+- The security phase **auto-fixes** the findings it is confident about (auth / input / secrets /
+  network scope) and loops to convergence like the other phases. It escalates (NOT-CLEAN) only if it
+  can't converge within the cap or it found a finding too risky to auto-fix (surfaced with WHY). In
+  `--stop-hook` mode the process still exits 0 so it doesn't wedge the session; the real status and
+  any surfaced findings are printed to the transcript, and all applied fixes are committed.
