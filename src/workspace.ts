@@ -27,6 +27,7 @@ const BIN_SCRIPTS = [
   "worker-status",
   "pipeline-wait",
   "review-loop",
+  "second-opinion",
 ] as const;
 
 export async function ensureWorkspace(cfg: Config, home: string): Promise<Record<string, string>> {
