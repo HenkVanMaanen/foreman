@@ -305,6 +305,9 @@ EOF
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMessageReaction"
 EOF
     }
+    if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+      echo "wait-reply: WARNING TELEGRAM_CHAT_ID unset -> inbox fails closed, no messages will be surfaced" >&2
+    fi
     while true; do
       resp="$(curl -fsS -K - <<EOF
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}"
@@ -313,10 +316,10 @@ EOF
       # SECURITY: a Telegram bot can be DM'd by anyone who knows its @username. Restrict the inbox
       # to the owner's chat (TELEGRAM_CHAT_ID) so a stranger's message can't reach us as if it were
       # the human (a prompt-injection vector). Strangers' updates are still consumed (offset advances
-      # via $last below) but never returned. If TELEGRAM_CHAT_ID is unset, fall back to no filter.
+      # via $last below) but never returned. If TELEGRAM_CHAT_ID is unset, fail CLOSED: surface nothing (see the unset guard below).
       out="$(echo "$resp" | jq -r --arg cid "${TELEGRAM_CHAT_ID:-}" '.result[]
         | select(.message.text != null)
-        | select($cid == "" or ((.message.chat.id|tostring) == $cid))
+        | select($cid != "" and ((.message.chat.id|tostring) == $cid))
         | ((.update_id|tostring) + "\t" + (.message.message_id|tostring) + "\t" + (.message.chat.id|tostring) + "\t" + (.message.text | gsub("[\t\r\n]+"; " ")))' 2>/dev/null || true)"
       last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
       if [ -n "$out" ]; then
@@ -346,9 +349,9 @@ EOF
       last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
       [ -n "$last" ] && offset=$((last + 1))
       # SECURITY: restrict to the owner's chat (TELEGRAM_CHAT_ID) so a stranger can't answer for the
-      # human (see the inbox note above). No filter if TELEGRAM_CHAT_ID is unset.
+      # human (see the inbox note above). Fail CLOSED if TELEGRAM_CHAT_ID is unset (surface nothing).
       reply="$(echo "$resp" | jq -r --arg tag "#$id" --arg cid "${TELEGRAM_CHAT_ID:-}" \
-        '.result[] | select($cid == "" or ((.message.chat.id|tostring) == $cid))
+        '.result[] | select($cid != "" and ((.message.chat.id|tostring) == $cid))
          | .message.text? // empty | select(contains($tag))' | head -n1 | sed "s/#$id//; s/^[[:space:]]*//; s/[[:space:]]*$//")"
       if [ -n "$reply" ]; then emit "$reply"; exit 0; fi
       timed_out && { echo "wait-reply: timed out waiting for $id" >&2; exit 3; }
