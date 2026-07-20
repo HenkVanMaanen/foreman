@@ -59,7 +59,39 @@ case "$arg1" in
 esac
 
 if [ -z "${MATTERMOST_BASE_URL:-}" ] || [ -z "${MATTERMOST_BOT_TOKEN:-}" ]; then
-  echo "reply: Mattermost not configured (need MATTERMOST_BASE_URL + MATTERMOST_BOT_TOKEN)" >&2
+  # No Mattermost → Telegram fallback. Telegram DMs have no threads, so <arg1> (a wait-reply
+  # update_id ref for interface parity) is not used to thread; we just post the message to the
+  # chat. Token stays out of argv via a curl config read from stdin (-K -); chat_id/text (which
+  # may contain newlines/quotes) go through --data-urlencode so they're always safe.
+  if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+    if [ "$dry_run" = 1 ]; then
+      echo "channel: telegram chat ${TELEGRAM_CHAT_ID}"
+      echo "text:"
+      printf '%s\n' "$message"
+      exit 0
+    fi
+    # Render [label](url) markdown as a clickable Telegram link (parse_mode=HTML), so a short ref
+    # like [#15](https://…) shows as clickable "#15". To keep this from ever breaking on stray
+    # < > & in prose, HTML-escape the WHOLE message FIRST (& before < > so it isn't double-escaped),
+    # THEN convert the link syntax — bracket/paren chars aren't HTML-special so they survive intact,
+    # and the <a …> tags we add afterwards are the only real markup. URLs restricted to a safe charset.
+    html="$(printf '%s' "$message" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+    html="$(printf '%s' "$html" | sed -E 's#\[([^][]*)\]\((https?://[^() ]+)\)#<a href="\2">\1</a>#g')"
+    resp="$(curl -fsS -K - \
+      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${html}" \
+      --data-urlencode "parse_mode=HTML" \
+      --data-urlencode "disable_web_page_preview=true" <<EOF || true
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+EOF
+)"
+    mid="$(printf '%s' "$resp" | jq -r '.result.message_id // empty' 2>/dev/null || true)"
+    if [ -n "$mid" ]; then echo "$mid"; exit 0; fi
+    err="$(printf '%s' "$resp" | jq -r '.description // empty' 2>/dev/null || true)"
+    echo "reply: telegram send failed${err:+: $err}" >&2
+    exit 1
+  fi
+  echo "reply: no channel configured (need Mattermost or Telegram env)" >&2
   exit 1
 fi
 api="${MATTERMOST_BASE_URL%/}/api/v4"

@@ -293,18 +293,36 @@ EOF
       else printf '0' > "$tg_off_file" 2>/dev/null || true; fi
     fi
     offset="$(cat "$tg_off_file" 2>/dev/null || echo 0)"; [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+    # Acknowledge a human message with a 👀 (same as Mattermost inbox) so the human sees at a
+    # glance that foreman read it. 👀 (U+1F440) is in Telegram's allowed reaction set. Token stays
+    # out of argv (-K -); best-effort (|| true) so a react failure never drops the message.
+    tg_react() {
+      local cid="$1" mid="$2"; [ -n "$cid" ] && [ -n "$mid" ] || return 0
+      curl -fsS -K - >/dev/null 2>&1 \
+        --data-urlencode "chat_id=${cid}" \
+        --data-urlencode "message_id=${mid}" \
+        --data-urlencode 'reaction=[{"type":"emoji","emoji":"👀"}]' <<EOF || true
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMessageReaction"
+EOF
+    }
     while true; do
       resp="$(curl -fsS -K - <<EOF
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}"
 EOF
 )" || { sleep 2; continue; }
-      out="$(echo "$resp" | jq -r '.result[]
+      # SECURITY: a Telegram bot can be DM'd by anyone who knows its @username. Restrict the inbox
+      # to the owner's chat (TELEGRAM_CHAT_ID) so a stranger's message can't reach us as if it were
+      # the human (a prompt-injection vector). Strangers' updates are still consumed (offset advances
+      # via $last below) but never returned. If TELEGRAM_CHAT_ID is unset, fall back to no filter.
+      out="$(echo "$resp" | jq -r --arg cid "${TELEGRAM_CHAT_ID:-}" '.result[]
         | select(.message.text != null)
-        | ((.update_id|tostring) + "\t" + (.message.text | gsub("[\t\r\n]+"; " ")))' 2>/dev/null || true)"
+        | select($cid == "" or ((.message.chat.id|tostring) == $cid))
+        | ((.update_id|tostring) + "\t" + (.message.message_id|tostring) + "\t" + (.message.chat.id|tostring) + "\t" + (.message.text | gsub("[\t\r\n]+"; " ")))' 2>/dev/null || true)"
       last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
       if [ -n "$out" ]; then
-        while IFS=$'\t' read -r uid text; do
+        while IFS=$'\t' read -r uid mid cid text; do
           [ -n "$uid" ] || continue
+          tg_react "$cid" "$mid"
           printf 'MSG %s - %s\n' "$uid" "$text"
         done <<TGINBOX
 $out
@@ -327,7 +345,11 @@ EOF
 )" || { sleep 2; continue; }
       last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
       [ -n "$last" ] && offset=$((last + 1))
-      reply="$(echo "$resp" | jq -r --arg tag "#$id" '.result[].message.text? // empty | select(contains($tag))' | head -n1 | sed "s/#$id//; s/^[[:space:]]*//; s/[[:space:]]*$//")"
+      # SECURITY: restrict to the owner's chat (TELEGRAM_CHAT_ID) so a stranger can't answer for the
+      # human (see the inbox note above). No filter if TELEGRAM_CHAT_ID is unset.
+      reply="$(echo "$resp" | jq -r --arg tag "#$id" --arg cid "${TELEGRAM_CHAT_ID:-}" \
+        '.result[] | select($cid == "" or ((.message.chat.id|tostring) == $cid))
+         | .message.text? // empty | select(contains($tag))' | head -n1 | sed "s/#$id//; s/^[[:space:]]*//; s/[[:space:]]*$//")"
       if [ -n "$reply" ]; then emit "$reply"; exit 0; fi
       timed_out && { echo "wait-reply: timed out waiting for $id" >&2; exit 3; }
     done

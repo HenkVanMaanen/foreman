@@ -79,7 +79,8 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
   # and text may contain newlines (awkward to quote in a config), so they stay as args.
   curl -fsS -K - \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${ttext}" >/dev/null <<EOF && : "${routing:=$gen_id}"
+    --data-urlencode "text=${ttext}" \
+    --data-urlencode "disable_web_page_preview=true" >/dev/null <<EOF && : "${routing:=$gen_id}"
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
 EOF
 fi
