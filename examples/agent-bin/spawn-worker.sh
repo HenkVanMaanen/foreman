@@ -18,6 +18,27 @@
 # with `worker-status <name>`.
 set -euo pipefail
 
+# Definition-of-done footer appended to EVERY worker brief. This is what makes the
+# review→fix→re-review loop automatic for all future workers: a worker must self-review with
+# bin/review-loop and must not mark itself done until it reports CLEAN (or surfaces a security
+# issue / non-convergence for the human). Edit this constant to change the standard; it is applied
+# additively, so the existing `spawn-worker <name> <brief-file>` interface is unchanged.
+read -r -d '' DOD_FOOTER <<'EOF' || true
+
+## Definition of done (mandatory — appended by spawn-worker)
+Before you mark yourself done / exit:
+1. Complete your change and COMMIT it on your branch.
+2. Run the auto-review loop on your working dir:  `bin/review-loop --dir .`
+   (it runs /code-review and /simplify to convergence, committing each round's fixes, and a
+   conditional /security-review).
+3. Do NOT mark done / exit until review-loop prints `review-loop: CLEAN` and exits 0.
+   - If it reports NOT-CLEAN (hit the round cap with findings still, or a review invocation
+     failed), or the security review escalates, DO NOT proceed — report that clearly to the human
+     (via bin/ask-human / bin/reply) and stop, rather than silently marking the task done.
+4. After any auto-fixes, sanity-check your change still builds / passes `bash -n` (or the repo's
+   equivalent) before finishing.
+EOF
+
 name="${1:?usage: spawn-worker <name> <brief-file>}"
 brief="${2:?usage: spawn-worker <name> <brief-file>}"
 
@@ -32,10 +53,21 @@ state="${FOREMAN_STATE_DIR:-state}"
 mkdir -p "$state" 2>/dev/null || true
 log="$state/$name-worker.log"
 
+# Compose the brief the worker actually receives: the caller's brief followed by the standard
+# definition-of-done footer (which wires in the auto-review loop). Written to a file so multi-line
+# text / apostrophes stay safe — the launch still passes it via $(cat …), exactly as before, so
+# the existing safe-quoting is preserved.
+full_brief="$state/$name-brief.composed.txt"
+# Read the caller's brief into memory BEFORE writing full_brief, so we are safe even if the caller
+# passed a brief path that resolves to full_brief itself (the redirect would otherwise truncate it
+# to empty before cat could read it).
+brief_body="$(cat "$brief")"
+{ printf '%s\n' "$brief_body"; printf '%s\n' "$DOD_FOOTER"; } > "$full_brief"
+
 # Detach so the worker outlives this turn; capture its exit into the log so worker-status can
 # tell done-vs-running. $(cat …) expands in the child at launch, so the full brief is passed as
 # one argument regardless of quotes/newlines in it.
-nohup bash -c "claude -p --dangerously-skip-permissions \"\$(cat $(printf '%q' "$brief"))\" > $(printf '%q' "$log") 2>&1; echo \"WORKER_EXIT=\$?\" >> $(printf '%q' "$log")" >/dev/null 2>&1 &
+nohup bash -c "claude -p --dangerously-skip-permissions \"\$(cat $(printf '%q' "$full_brief"))\" > $(printf '%q' "$log") 2>&1; echo \"WORKER_EXIT=\$?\" >> $(printf '%q' "$log")" >/dev/null 2>&1 &
 pid=$!
 
 echo "spawned worker '$name' (pid $pid)"
