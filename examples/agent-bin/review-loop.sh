@@ -128,7 +128,7 @@ branch_re='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
 # failing — a wedged forge lookup, a logged-out codex). Shared by every hang-guard below.
 # NOTE the bare branch is genuinely unguarded: on such a box a wedged call blocks until it returns.
 # Accepted deliberately — a false "not logged in" / "no MR" on every macOS run is the worse failure,
-# and both guarded calls are local-ish and made at most once per run.
+# and each guarded site (the gh/glab MR lookup, `codex login status`) runs at most once per run.
 _tmo() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
 
 usage() {
@@ -169,13 +169,21 @@ EOF
 # Exit 2 (usage/precondition) — EXCEPT under --stop-hook, where a non-zero exit is how a Stop hook
 # BLOCKS the session from ending (and 2 specifically feeds stderr back to the model as instructions).
 # A bad flag or an unresolvable --target would then wedge the very session the marker guard exists to
-# let finish, and the marker is already written by then, so it cannot un-wedge it either. The message
-# is still printed in full; only the CODE is softened — same invariant as the always-exit-0 tail.
+# let finish. For an unresolvable --target the marker is already written, so it cannot un-wedge it
+# either; a bad flag is worse still — it dies BEFORE the marker block below, so every subsequent Stop
+# re-fires and re-blocks with nothing to stop it. The message is still printed in full; only the CODE
+# is softened — same invariant as the always-exit-0 tail.
 # (Reads $stop_hook, initialized to 0 above, so an error raised before --stop-hook is parsed still
 # exits 2 — put --stop-hook first in the hook command, as review-loop-hook.md's snippet does.)
 die_usage() {
   echo "$prog: $1" >&2; echo >&2; usage >&2
-  [ "$stop_hook" -eq 1 ] && exit 0
+  # Claude Code surfaces a Stop hook's STDERR only when the exit code BLOCKS; on the softened exit 0
+  # it is dropped. Repeat the reason on stdout so a typo'd hook command is not silently reviewing
+  # nothing, session after session, with no visible signal at all.
+  if [ "$stop_hook" -eq 1 ]; then
+    echo "$prog: $1 — (stop-hook mode: exiting 0 to avoid wedging the session; NOTHING was reviewed)"
+    exit 0
+  fi
   exit 2
 }
 
@@ -401,6 +409,9 @@ fi
 # Historical default: merge-base with origin/main, else origin/HEAD, else HEAD (⇒ empty diff,
 # security auto=off). Reached whenever no target was given/derived/usable, so behaviour without MR
 # context is exactly what it was before --target existed.
+# Did the caller pin the base (--base REF, or a --target that resolved), or are we falling back?
+# Decided HERE, while an empty $base still tells the two apart — $scope_arg below needs to know.
+base_explicit=1; [ -n "$base" ] || base_explicit=0
 if [ -z "$base" ]; then
   base="$(git -C "$dir" merge-base HEAD origin/main 2>/dev/null \
         || git -C "$dir" merge-base HEAD origin/HEAD 2>/dev/null \
@@ -411,9 +422,9 @@ fi
 # prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
 base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
 
-# THE resolved review range — the single spelling of "what this run reviews", used by every phase:
-# as the <target> argument of the Claude slash commands, and inside the security/codex driver prompts
-# (`git diff $scope_range`). One variable so the range can never drift between the four reviewers.
+# THE resolved review range — the single spelling of "what this run reviews", from which both of the
+# per-reviewer forms below ($scope_arg for the Claude slash commands, $scope_diff_ref for the
+# security/codex prompts) derive. One variable so the range can never drift between the four reviewers.
 #
 # For the CLAUDE phases specifically: left to themselves, /code-review and /simplify derive their own
 # range (`git diff @{upstream}...HEAD`, else `main...HEAD`). Both take a <target> argument, so hand
@@ -423,15 +434,34 @@ base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base
 # uncommitted changes.
 scope_range="$base_short...HEAD"
 
-# ...but only hand that range to the Claude commands when it names something. When the fallback chain
-# bottomed out at `rev-parse HEAD` (no origin/main, no origin/HEAD — a local-only repo), base IS HEAD,
-# so `$base...HEAD` is EMPTY. Passing an empty range as an explicit target tells /code-review and
-# /simplify to review NOTHING, and a session's uncommitted work would ship reported CLEAN having been
-# read by nobody; with no target they self-derive and fold in `git diff HEAD`. So: empty ⇒ pass no
-# target, exactly as before --target existed. (The security/codex prompts keep using $scope_range
-# unchanged — they always spelled the range out, degenerate base included.)
-scope_arg=""
-[ "$base_short" = "$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)" ] || scope_arg=" $scope_range"
+# ...but that range only NAMES something when base is behind HEAD. When the fallback chain bottomed
+# out at `rev-parse HEAD` (no origin/main, no origin/HEAD — a local-only repo), base IS HEAD, so
+# `$base...HEAD` is EMPTY and every reviewer handed it would review NOTHING — a session's uncommitted
+# work would ship reported CLEAN having been read by nobody.
+#
+# Only the FALLBACK case is degenerate. An explicit --base/--target that happens to resolve to HEAD is
+# left alone: the caller asked for exactly that scope, and quietly widening it to the range the Claude
+# commands self-derive (`@{upstream}...HEAD`) would review MORE than they asked for, not less.
+degenerate_base=0
+if [ "$base_explicit" -eq 0 ] && \
+   [ "$base_short" = "$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)" ]; then
+  degenerate_base=1
+fi
+
+# The two spellings of the scope, one per reviewer family — both derived from the single decision above
+# so they cannot disagree about what this run reviews:
+#   $scope_arg      — the <target> argument of the Claude slash commands. Empty ⇒ pass no target at all
+#                     and let /code-review and /simplify self-derive (both fold in `git diff HEAD`),
+#                     exactly as before --target existed.
+#   $scope_diff_ref — what the security/codex driver prompts spell out as `git diff <ref>`. Those are
+#                     free-form prose with no self-derive fallback, so name the working tree instead of
+#                     an empty A...B that reads as "there is nothing to review".
+scope_arg=" $scope_range"
+scope_diff_ref="$scope_range"
+if [ "$degenerate_base" -eq 1 ]; then
+  scope_arg=""
+  scope_diff_ref="HEAD"
+fi
 
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
 # cycle, post-security pass), so build it once here — keeping the scope argument attached to the
@@ -599,7 +629,7 @@ build_security_prompt() {
   cat <<EOF
 You are running an automated SECURITY FIX pass over the pending changes on this git branch.
 
-SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_range\` plus any
+SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_diff_ref\` plus any
 uncommitted changes. Do the same analysis Claude Code's /security-review does: find REAL,
 exploitable security vulnerabilities that these changes introduce. Do not audit or
 "improve" pre-existing code you did not touch. Concentrate on:
@@ -722,7 +752,7 @@ ALONGSIDE Claude (which reviews the same diff). Your value is catching what the 
 Review the code THIS branch changed for correctness BUGS and clear, low-risk SIMPLIFICATIONS, and
 APPLY the fixes you are confident about (you can edit files directly).
 
-SCOPE: review ONLY the changes on this branch — the diff \`git diff $scope_range\` plus any
+SCOPE: review ONLY the changes on this branch — the diff \`git diff $scope_diff_ref\` plus any
 uncommitted changes. Do NOT review or "improve" pre-existing code you did not touch. Do NOT modify
 files outside this diff, and never touch logs, state/, notes/, generated
 artifacts, or anything under a gitignored path. Do NOT add dependencies, do NOT reformat or refactor
@@ -785,7 +815,7 @@ run_codex_phase() {
   CODEX_ACTIVE=1
   echo ">>> codex review-and-fix loop: $CODEX_REASON"
 
-  # Build the (static, scope_range-only) driver prompt ONCE here and reuse it for every codex round in
+  # Build the (static, scope-only) driver prompt ONCE here and reuse it for every codex round in
   # this phase AND every reconcile recheck, instead of re-forking the heredoc via $(...) each time.
   CODEX_PROMPT="$(build_codex_prompt)"
   CODEX_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-codex.XXXXXX" 2>/dev/null)" \
