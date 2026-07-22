@@ -10,17 +10,25 @@
 //   1) It never touch()es the watchdog. A wedged agent produces no stream frames; if the poller
 //      kept the watchdog alive, that wedge would go undetected. Only the agent's own frames and
 //      the parked-wait keep-alive touch it (see supervisor.ts).
-//   2) It is the ONLY caller of `wait-reply --inbox`. The parked path consumes from the shared
+//   2) It is the ONLY caller of `wait-reply --inbox`. Every other reader — the parked path, and
+//      the re-login relay waiting for a sign-in code (src/relogin.ts) — consumes from the shared
 //      queue rather than spawning its own poll, so Telegram getUpdates has exactly one consumer.
 //      (ask-human's single-thread wait-reply is serialized against it by a sentinel in the
 //      script — see wait-reply.sh.)
+//   3) A line taken off the queue is GONE from it: the watermark moved when the poller read it,
+//      so the in-memory copy is the only one left. Whoever takes a line therefore owns it, and
+//      must either use it, deliver it to the agent, or hand it back — via InboxQueue.push (which
+//      returns lines to the queue) or by echoing it to the human. Never drop one on the floor,
+//      and never let two readers claim the same line. InboxQueue supports ONE waiter at a time,
+//      which is what keeps "two readers" from arising in the first place: the supervisor hands
+//      the queue to the relay only while its own parked wait is not running.
 //
 // Any error or unexpected condition degrades to a plain "continue" (see supervisor.ts), so a bug
 // in this path can never wedge or crash-loop the agent's life-support loop.
 
-import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
-import type { Watchdog } from "./watchdog.ts";
+import type { Heartbeat } from "./watchdog.ts";
+import { binPath, harnessChildEnv } from "./workspace.ts";
 
 // Seconds per blocking `wait-reply --inbox` call. Bounded well under the watchdog timeout
 // (default 20 min) so we touch() the watchdog between calls; on a timeout we simply loop and
@@ -35,7 +43,7 @@ const FAST_TIMEOUT_MS = 2_000;
 const MAX_FAST_EMPTIES = 5;
 
 export type InboxAction =
-  | { kind: "messages"; prompt: string } // exit 0: hand the raw MSG/ACK lines to the agent
+  | { kind: "messages"; lines: string[] } // exit 0: the raw MSG/ACK lines
   | { kind: "keep-polling" } // exit 3: nothing new, block again (model stays asleep)
   | { kind: "error"; reason: string }; // exit 2/other: caller falls back to CONTINUE
 
@@ -56,7 +64,7 @@ export function classifyInbox(exitCode: number, stdout: string): InboxAction {
     // exit 0 with no MSG/ACK lines is unexpected: treat as an error → fall back to CONTINUE rather
     // than waking the agent with an empty inbox prompt.
     if (lines.length === 0) return { kind: "error", reason: "exit 0 but no MSG/ACK lines" };
-    return { kind: "messages", prompt: formatInboxPrompt(lines.join("\n")) };
+    return { kind: "messages", lines };
   }
   if (exitCode === 3) return { kind: "keep-polling" };
   return { kind: "error", reason: `wait-reply exited ${exitCode}` };
@@ -75,10 +83,10 @@ export function extractInboxLines(stdout: string): string[] {
  * advanced the watermarks and reacted eyes, so the agent will NOT see these again via its own
  * poll) in the prompt the agent receives on wake.
  */
-export function formatInboxPrompt(msgLines: string): string {
+export function formatInboxPrompt(msgLines: string[]): string {
   return (
     "[inbox] New message(s) from the human since you parked:\n" +
-    `${msgLines}\n\n` +
+    `${msgLines.join("\n")}\n\n` +
     "Handle them (reply in the correct thread; a leading '-' in the 2nd field means a new root). " +
     "An `ACK <post_id> <root_or_-> +1` line means the human approved that post with a 👍 (no reply " +
     "text) — treat it as their go-ahead on that post."
@@ -164,13 +172,12 @@ export function startInboxPoller(
   queue: InboxQueue,
   hooks: PollerHooks,
 ): InboxPoller {
-  const waitReply = join(resolve("bin"), "wait-reply");
-  // Pin FOREMAN_STATE_DIR from config so wait-reply reads/advances the SAME inbox watermark the
-  // agent's own bin/ used; otherwise a $HOME/.foreman fallback would drain a different watermark.
+  const waitReply = binPath("wait-reply");
+  // harnessChildEnv pins FOREMAN_STATE_DIR from config so wait-reply reads/advances the SAME inbox
+  // watermark the agent's own bin/ used; otherwise a $HOME/.foreman fallback would drain a
+  // different watermark.
   const childEnv = {
-    ...process.env,
-    ...env,
-    FOREMAN_STATE_DIR: resolve(cfg.stateDir),
+    ...harnessChildEnv(cfg, env),
     FOREMAN_WAIT_TIMEOUT: String(WAIT_TIMEOUT_S),
   };
 
@@ -199,11 +206,10 @@ export function startInboxPoller(
       const action = classifyInbox(exitCode, stdout);
       if (action.kind === "messages") {
         fastEmpties = 0;
-        const lines = extractInboxLines(stdout);
-        queue.push(lines);
+        queue.push(action.lines);
         if (hooks.isBusy()) {
           try {
-            await hooks.onBusyMessage(lines);
+            await hooks.onBusyMessage(action.lines);
           } catch {
             // an ack failure must never disturb polling
           }
@@ -240,22 +246,76 @@ export function startInboxPoller(
 }
 
 /**
- * Block (cheaply, off the model) until the always-on poller delivers a human message, then RETURN
- * the prompt carrying its MSG/ACK lines. Consumes from the shared queue rather than polling itself,
- * so Telegram getUpdates keeps exactly one consumer. Touches the watchdog on every wake — including
- * the empty timeout wakes — so a legitimately long idle is never mistaken for a wedge.
+ * Split inbox lines into the human's answer and everything else.
+ *
+ * `text` is the LAST `MSG <id> <root> <text>` line's text — later messages supersede earlier ones,
+ * so a typo'd first attempt followed by a correction does the right thing. `ACK` (👍) lines carry
+ * no text and are never the answer. Used by the re-login relay (src/relogin.ts) to read the
+ * sign-in code the human relayed back.
+ *
+ * `rest` is every line NOT consumed as the answer, in order. Returned together with `text` rather
+ * than left for the caller to re-derive: a line taken off the queue is gone from it, so the relay
+ * has to hand the unused ones back and this is their only remaining copy — and identifying them
+ * any other way means restating the selection rule. An equality filter, for instance, would drop
+ * BOTH of two identical lines when only one of them was read as the answer. One function, so the
+ * rule lives in one place.
  */
-export async function waitForInboxMessages(
+export function takeAnswer(lines: string[]): { text: string | undefined; rest: string[] } {
+  const i = lines.findLastIndex((l) => l.startsWith("MSG "));
+  // MSG <id> <root_or_-> <text…>  — the text is everything after the third space.
+  const text = lines[i]?.split(" ").slice(3).join(" ").trim() || undefined;
+  // A blank-texted MSG line is NOT an answer, so it stays in `rest` like any other spare.
+  return { text, rest: text === undefined ? [...lines] : lines.filter((_, n) => n !== i) };
+}
+
+/**
+ * Block (cheaply, off the model) until the always-on poller delivers a human message, then RETURN
+ * the raw `MSG`/`ACK` lines. Consumes from the shared queue rather than polling itself, so
+ * Telegram getUpdates keeps exactly one consumer (invariant 2 in the file header). Touches the
+ * heartbeat on every wake — including the empty timeout wakes — so a legitimately long wait is
+ * never mistaken for a wedge, and calls `refresh` between them to keep the dashboard status fresh.
+ *
+ * The idle-wait wraps the result in formatInboxPrompt(); the re-login relay reads the human's
+ * literal text off it with takeAnswer(). Both come off the SAME queue — and so the same watermark
+ * — which is what makes double-consumption impossible. The flip side is that a line handed to one
+ * of them is gone for the other, so whatever a caller does not use it must hand back (relay) or
+ * deliver (supervisor); see InboxQueue.push, which takes lines back.
+ *
+ * `deadlineMs` (epoch ms) bounds the wait, clamping each individual `take` to whatever is left of
+ * it and THROWING once it passes. Omitted, the wait is indefinite, which is what the idle-wait
+ * wants (a parked agent may legitimately wait days). The re-login relay passes one because its
+ * sign-in URL EXPIRES: without a bound, a human who never answers leaves the relay blocked forever
+ * on a link that is already dead, instead of failing the attempt and sending a fresh one.
+ */
+export async function waitForInboxLines(
   queue: InboxQueue,
-  watchdog: Watchdog,
+  watchdog: Heartbeat,
   refresh: () => void | Promise<void>,
-): Promise<string> {
+  deadlineMs?: number,
+): Promise<string[]> {
   for (;;) {
-    const lines = await queue.take(WAIT_TIMEOUT_S * 1_000);
-    watchdog.touch(); // legitimate waiting is not a wedge — keep the watchdog alive
-    if (lines.length) return formatInboxPrompt(lines.join("\n"));
+    // Check the deadline BEFORE blocking, not after: a full-length take started just under the
+    // wire would overshoot it by up to WAIT_TIMEOUT_S, and the relay's deadline is the life of a
+    // sign-in link that has already expired by then.
+    const waitMs =
+      deadlineMs === undefined
+        ? WAIT_TIMEOUT_S * 1_000
+        : Math.min(WAIT_TIMEOUT_S * 1_000, deadlineMs - Date.now());
+    if (waitMs <= 0) throw new Error("no message from the human before the deadline");
+    const lines = await queue.take(waitMs);
+    watchdog.touch(); // legitimate waiting is not a wedge — keep the heartbeat alive
+    if (lines.length) return lines;
     await refresh();
   }
+}
+
+/** The idle-wait's view of the above: block until the human writes, return the agent's prompt. */
+export async function waitForInboxMessages(
+  queue: InboxQueue,
+  watchdog: Heartbeat,
+  refresh: () => void | Promise<void>,
+): Promise<string> {
+  return formatInboxPrompt(await waitForInboxLines(queue, watchdog, refresh));
 }
 
 /**

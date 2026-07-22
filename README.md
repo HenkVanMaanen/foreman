@@ -84,9 +84,10 @@ bun run format    # biome autofix (format + organize imports + safe lint fixes)
 
 ```
 keeper.sh                  dumb outer keeper (never changes); respawns the harness
-src/foreman.ts             entrypoint + CLI (supervise | dashboard | secret set | run)
+src/foreman.ts             entrypoint + CLI (supervise | dashboard | secret set | run | relogin)
 src/supervisor.ts          agent lifecycle + context watchdog (checkpoint & recycle)
 src/session.ts             owns one claude -p stream-json subprocess
+src/relogin.ts             Telegram-mediated re-auth when claude's OAuth token dies
 src/protocol.ts            stream-json event/usage types
 src/secrets.ts             encrypted store; capture-via-pipe + inject-by-env
 src/dashboard.ts           read-only observability dashboard (serves /api/state)

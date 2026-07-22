@@ -5,13 +5,18 @@
 //   foreman dashboard                          serve the read-only observability dashboard
 //   foreman secret set NAME                    read a value from stdin, store it encrypted
 //   foreman run --secret NAME[,NAME] -- cmd…   run cmd with the named secret(s) injected as env
+//   foreman relogin [claude|codex] [--force]   drive the Telegram-mediated re-auth by hand
 //
 // Designed to be spawned by keeper.sh, which restarts it on exit.
 
 import { loadConfig } from "./config.ts";
 import { runDashboard } from "./dashboard.ts";
+import { InboxQueue, startInboxPoller } from "./inbox.ts";
+import { RELOGIN_AGENTS } from "./relogin.ts";
 import { runWithSecrets, secretSetFromStdin } from "./secrets.ts";
 import { supervise } from "./supervisor.ts";
+import { NO_HEARTBEAT } from "./watchdog.ts";
+import { ensureWorkspace } from "./workspace.ts";
 
 async function main(argv: string[]): Promise<number> {
   const cfg = loadConfig();
@@ -35,6 +40,47 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
 
+    // Drive the Telegram-mediated re-auth by hand — the same code path the supervisor triggers
+    // automatically, so a real lockout can be recovered (or rehearsed) without the loop running.
+    case "relogin": {
+      // --force starts the flow even when the session still looks live — that is what makes this
+      // a rehearsal rather than a no-op. Off by default: for codex it would clear a WORKING
+      // ~/.codex/auth.json the moment device-auth starts.
+      const force = rest.includes("--force");
+      const which = rest.filter((a) => a !== "--force")[0] ?? "claude";
+      // A Map, so an inherited member name (`foreman relogin constructor`) is simply a miss
+      // rather than something that resolves off Object.prototype and gets called as a flow.
+      const relogin = RELOGIN_AGENTS.get(which);
+      if (!relogin) {
+        console.error(`usage: foreman relogin [${[...RELOGIN_AGENTS.keys()].join("|")}] [--force]`);
+        return 2;
+      }
+      // Seed the workspace exactly as supervise() does before it calls the same relay: the flow
+      // shells out to bin/reply, bin/ask-human and bin/wait-reply, which only exist — and only
+      // see PATH/FOREMAN_* — once ensureWorkspace() has run. Without this the manual recovery
+      // path dies with ENOENT on the very box where the loop is not running.
+      const env = await ensureWorkspace(cfg);
+      // The relay reads the human's reply off an InboxQueue rather than polling itself, so this
+      // path has to supply the poller the supervisor would normally own. Safe precisely because
+      // the loop is NOT running here: `wait-reply --inbox` still has exactly one consumer, which
+      // is the invariant that keeps a message from being consumed twice. Stopped in a finally so
+      // the poll does not keep the CLI alive after the flow returns.
+      const inbox = new InboxQueue();
+      const poller = startInboxPoller(cfg, env, inbox, {
+        // Nothing to auto-ack for: the relay is itself the thing talking to the human, and a
+        // "I'm mid-task" ack on top of "please send me the sign-in code" is just noise.
+        isBusy: () => false,
+        onBusyMessage: () => {},
+      });
+      try {
+        // No stall detection here: a human-paced re-login is legitimately slow, and nothing is
+        // running that a force-exit could rescue.
+        return (await relogin(cfg, NO_HEARTBEAT, inbox, env, force)) ? 0 : 1;
+      } finally {
+        poller.stop();
+      }
+    }
+
     case "run": {
       const { names, command } = parseRun(rest);
       if (names.length === 0 || command.length === 0) {
@@ -46,7 +92,10 @@ async function main(argv: string[]): Promise<number> {
 
     default:
       console.error(`unknown command: ${cmd}`);
-      console.error("commands: supervise | dashboard | secret set NAME | run --secret NAME -- cmd");
+      console.error(
+        "commands: supervise | dashboard | secret set NAME | run --secret NAME -- cmd | " +
+          "relogin [claude|codex] [--force]",
+      );
       return 2;
   }
 }
