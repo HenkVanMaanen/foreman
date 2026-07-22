@@ -126,9 +126,10 @@ stop_hook=0
 prog="review-loop"
 
 # The one charset a branch NAME may use anywhere in this script: --target's value, a name derived
-# from the forge CLI, and the branch we hand to that CLI. Leading-dash-free (so git/gh/glab can
-# never read it as an option) and URL-query-safe (so it can go into a `glab api` query verbatim).
-branch_re='^[A-Za-z0-9._/-]+$'
+# from the forge CLI, and the branch we hand to that CLI. The first character excludes '-' so the
+# name can never be read as an option by git/gh/glab (a trailing/interior '-' is fine), and the whole
+# charset is URL-query-safe so it can go into a `glab api` query verbatim.
+branch_re='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
 
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
@@ -248,13 +249,15 @@ fi
 
 # Resolve a branch NAME to a ref we can merge-base against, preferring the remote-tracking copy
 # (origin/NAME is what the MR actually targets; a stale local NAME may sit far behind). Echoes the
-# ref; returns 1 if neither form exists.
+# ref; returns 1 if no form exists.
+# `remotes/$b` is tried LAST so an already-remote-qualified name (`--target origin/main`, which the
+# docs' own wording invites, or `--target upstream/main`) resolves instead of failing outright.
 # Matched against the full refs/remotes|refs/heads paths, NOT a bare `NAME^{commit}`: the bare form
 # also resolves tags and pseudo-refs, so `--target HEAD` would silently "succeed" with
 # merge-base(HEAD,HEAD)=HEAD — an empty diff that makes every phase converge CLEAN vacuously.
 resolve_branch_ref() {
   local b="$1" cand
-  for cand in "remotes/origin/$b" "heads/$b"; do
+  for cand in "remotes/origin/$b" "heads/$b" "remotes/$b"; do
     if git -C "$dir" rev-parse --verify --quiet "refs/$cand^{commit}" >/dev/null 2>&1; then
       printf '%s\n' "refs/$cand"; return 0
     fi
@@ -295,7 +298,11 @@ detect_target_branch() {
 
   for tool in "${order[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || continue
-    run=("${wrap[@]}" "$tool")
+    # ${wrap[@]+"${wrap[@]}"}, not a bare "${wrap[@]}": on bash < 4.4 (stock macOS bash 3.2)
+    # expanding an EMPTY array under `set -u` is an "unbound variable" fatal. That is exactly the
+    # box where `timeout` is missing (so wrap IS empty), which would kill this subshell and silently
+    # disable --target auto on every macOS run.
+    run=(${wrap[@]+"${wrap[@]}"} "$tool")
     case "$tool" in
       # `pr list --state open`, not `pr view <branch>`: pr view also resolves a CLOSED or MERGED PR
       # for the branch, whose base could be a long-dead release branch — a wrong, over-narrow scope
@@ -346,7 +353,7 @@ if [ -z "$base" ]; then
       # fall back rather than failing a run that would otherwise work.
       echo "$prog: MR/PR target branch '$target_branch' not found locally (try 'git fetch') — falling back to the default base" >&2
     else
-      die_usage "--target '$target' does not resolve to a branch (tried origin/$target and $target)"
+      die_usage "--target '$target' does not resolve to a branch (tried origin/$target, $target, and remote $target)"
     fi
   fi
 fi
