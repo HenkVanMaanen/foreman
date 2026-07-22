@@ -20,7 +20,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 const authOkFile = process.env.MOCK_AUTH_OK ?? "state/mock-auth-ok";
 if (process.argv[2] === "auth") {
   if (process.argv[3] === "status") {
-    // Shape claudeLoggedIn() parses. Absent file → logged out.
+    // Shape claudeAuthStatus() parses. Absent file → logged out.
     process.stdout.write(`${JSON.stringify({ loggedIn: existsSync(authOkFile) })}\n`);
     process.exit(0);
   }
@@ -39,7 +39,7 @@ if (process.argv[2] === "auth") {
       writeFileSync(`${authOkFile}.code`, `${code}\n`);
       if (code !== (process.env.MOCK_AUTH_CODE ?? "GOODCODE")) {
         // Faithful to the real CLI: a wrong code RE-PROMPTS, it does not exit. The relay's
-        // bounded waitForExit + retry loop only exists because of that, so a mock that exited 0
+        // bounded awaitSliced + retry loop only exists because of that, so a mock that exited 0
         // here would make the whole bad-code path untestable.
         process.stdout.write("\nInvalid code. Paste code here: ");
         continue;

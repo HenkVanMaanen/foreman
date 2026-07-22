@@ -77,8 +77,8 @@ const HEARTBEAT_SLICE_MS = 30_000;
  * (`ESC[?25l`) and alt-screen (`ESC[?1049h`) carry a `?` parameter byte, which the narrower
  * pattern did not match and so left in the text; ESC is not whitespace, so one emitted
  * immediately after the sign-in link would be swallowed INTO the match and the human would be
- * sent an unusable URL. (URL_RE bars ESC too, as a second line of defence for sequences that
- * arrive split across pty chunks and so can never be stripped here.)
+ * sent an unusable URL. URL_RE bars ESC too — see its own comment for why that second line of
+ * defence is needed.
  */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping real terminal escapes
 const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]|\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g;
