@@ -52,14 +52,29 @@
 # the loops do 0 productive rounds and exit 0 fast (idempotent).
 #
 # Usage:
-#   review-loop [--dir DIR] [--base REF] [--max-rounds N]
+#   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
 #               [--security auto|on|off] [--effort low|medium|high|max]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
 #
-# Defaults: DIR=cwd, max-rounds=6, security=on, effort=high, codex=on, codex-model=gpt-5.6-sol,
-#           base=merge-base of HEAD with origin/main (falls back to HEAD if unavailable).
+# Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, effort=high, codex=on,
+#           codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch when one
+#           can be derived, else with origin/main (falls back to HEAD if unavailable).
+#
+# SCOPE (--base / --target): a review should cover exactly what the MR/PR changes — no more. The
+# diff base therefore has to be the merge-base with the branch this work MERGES INTO, not with
+# origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
+# origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
+#   --base REF   — use REF verbatim as the diff base. Wins over --target; no merge-base is computed.
+#   --target REF — the branch this work merges INTO; base = merge-base of HEAD with it (origin/REF
+#                  is preferred over a local REF). Errors if REF does not resolve.
+#   --target auto— (default) best-effort: ask glab/gh for the OPEN MR/PR of the current branch and
+#                  use its target branch. Any failure (no CLI, no MR, detached HEAD, network/auth
+#                  error, unresolvable branch) falls back SILENTLY to the historical default below,
+#                  so behaviour without MR context is unchanged.
+#   --target none— skip derivation entirely; use the historical default.
+# Historical default (the fallback): merge-base of HEAD with origin/main, else origin/HEAD, else HEAD.
 #
 # --codex / --no-codex:
 #   on   — (default) run the Codex independent-reviewer phase and the joint reconciliation. If the
@@ -100,6 +115,7 @@ set -euo pipefail
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
+target="auto"     # default: best-effort derive the MR/PR target branch, else the historical base
 max_rounds=6
 security="on"     # default: always run security-review; the command scopes itself to real findings
 effort="high"
@@ -115,11 +131,17 @@ usage() {
 review-loop — run code-review + simplify + security (all auto-fixing) to convergence.
 
 Usage:
-  review-loop [--dir DIR] [--base REF] [--max-rounds N]
+  review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
               [--security auto|on|off] [--effort low|medium|high|max]
               [--codex|--no-codex] [--codex-model MODEL]
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
+
+Scope: --base REF uses REF verbatim as the diff base (wins over --target). --target REF diffs from
+the merge-base with the branch this work merges INTO, so the review scope equals the MR/PR even for
+a branch stacked on another unmerged branch. --target auto (default) derives that branch from the
+open MR/PR via glab/gh, falling back silently to the merge-base with origin/main. --target none
+skips derivation.
 
 Phases run in order, each capped at --max-rounds and committing per round:
   1. /code-review <effort> --fix loop   (fix correctness)
@@ -130,8 +152,9 @@ Phases run in order, each capped at --max-rounds and committing per round:
   5. final convergence                  (ONLY if simplify/codex/security changed code — bounded Claude<->Codex
                                          reconciliation, or a single /code-review pass if codex off)
 
-Defaults: DIR=cwd, max-rounds=6, security=on, effort=high, codex=on, codex-model=gpt-5.6-sol,
-          base=merge-base of HEAD with origin/main.
+Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, effort=high, codex=on,
+          codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch if derivable,
+          else with origin/main.
 
 Exit: 0 CLEAN | 3 NOT-CLEAN (cap hit / review failed / security or codex can't converge or risky fix) | 2 usage/error.
 EOF
@@ -144,6 +167,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --dir)        [ "$#" -ge 2 ] || die_usage "--dir needs DIR"; dir="$2"; shift 2;;
     --base)       [ "$#" -ge 2 ] || die_usage "--base needs REF"; base="$2"; shift 2;;
+    --target)     [ "$#" -ge 2 ] || die_usage "--target needs REF|auto|none"; target="$2"; shift 2;;
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
     --effort)     [ "$#" -ge 2 ] || die_usage "--effort needs a level"; effort="$2"; shift 2;;
@@ -160,6 +184,13 @@ done
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
 case "$effort" in low|medium|high|max) ;; *) die_usage "--effort must be low|medium|high|max (got '$effort')";; esac
 case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$codex')";; esac
+# --target is either a mode word or a branch name we hand to git. Restrict the branch form to a
+# leading-dash-free ref charset so it can never be read by git as an option.
+case "$target" in
+  auto|none) ;;
+  -*) die_usage "--target REF must not start with '-' (got '$target')";;
+  *) [[ "$target" =~ ^[A-Za-z0-9._/-]+$ ]] || die_usage "--target must be auto|none or a branch name matching ^[A-Za-z0-9._/-]+$ (got '$target')";;
+esac
 # --codex-model is interpolated into the `codex -m` command; restrict its charset (mirrors the
 # <name>/<id> posture in spawn-worker.sh / wait-reply.sh) to keep it a single safe token.
 [[ "$codex_model" =~ ^[A-Za-z0-9._-]+$ ]] || die_usage "--codex-model must match ^[A-Za-z0-9._-]+$ (got '$codex_model')"
@@ -174,7 +205,94 @@ command -v claude >/dev/null 2>&1 || die_usage "claude not found on PATH"
 dir="$(cd "$dir" && pwd)"
 git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is not a git repository"
 
-# base = merge-base with origin/main, else origin/HEAD, else HEAD (⇒ empty diff, security auto=off).
+# --- base / target resolution -----------------------------------------------------------------
+# The review scope must equal the MR/PR: diff from the merge-base with the branch this work merges
+# INTO. Diffing from the merge-base with origin/main over-scopes a branch STACKED on another
+# unmerged branch — the parent's commits are below that merge-base and leak into every phase's diff.
+# Resolution order: --base (verbatim) > --target REF > --target auto (derived) > historical default.
+
+# Resolve a branch NAME to a ref we can merge-base against, preferring the remote-tracking copy
+# (origin/NAME is what the MR actually targets; a stale local NAME may sit far behind). Echoes the
+# ref; returns 1 if neither form exists.
+resolve_branch_ref() {
+  local b="$1" cand
+  for cand in "origin/$b" "$b"; do
+    if git -C "$dir" rev-parse --verify --quiet "$cand^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "$cand"; return 0
+    fi
+  done
+  return 1
+}
+
+# Extract the first "key": "value" string field from JSON on stdin. Enough for the single flat field
+# we need, and avoids requiring jq (which glab/gh users do not necessarily have).
+_json_str_field() {
+  grep -aoE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+    | head -n 1 | sed -E 's/.*:[[:space:]]*"([^"]*)"[[:space:]]*$/\1/'
+}
+
+# Best-effort: the target branch of the OPEN MR/PR for the checked-out branch, via glab or gh.
+# Echoes the branch NAME; returns 1 when there is no MR context (detached HEAD, no CLI, no open
+# MR/PR, auth/network failure, junk output) so the caller can fall back cleanly. Every invocation is
+# stdin-closed and `timeout`-wrapped where available, so it can never hang the loop.
+detect_target_branch() {
+  local branch remote_url out="" probe=()
+  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [ -n "$branch" ] || return 1                      # detached HEAD ⇒ no MR to look up
+  remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+
+  # Try the forge that matches origin first, then the other — a repo can have both CLIs installed.
+  local order=(gh glab) tool
+  case "$remote_url" in *gitlab*) order=(glab gh);; esac
+
+  for tool in "${order[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || continue
+    if command -v timeout >/dev/null 2>&1; then probe=(timeout 25 "$tool"); else probe=("$tool"); fi
+    case "$tool" in
+      gh)   out="$( (cd "$dir" && "${probe[@]}" pr view "$branch" --json baseRefName </dev/null 2>/dev/null) \
+                    | _json_str_field baseRefName || true )";;
+      glab) out="$( (cd "$dir" && "${probe[@]}" mr view "$branch" -F json </dev/null 2>/dev/null) \
+                    | _json_str_field target_branch || true )";;
+    esac
+    out="${out//[$'\r\n\t ']/}"
+    # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
+    # into git. An unusable answer means "no MR context", i.e. fall back.
+    [[ "$out" =~ ^[A-Za-z0-9._/-]+$ ]] || { out=""; continue; }
+    printf '%s\n' "$out"; return 0
+  done
+  return 1
+}
+
+if [ -z "$base" ]; then
+  target_branch="" target_ref=""
+  case "$target" in
+    none) ;;
+    auto) target_branch="$(detect_target_branch || true)";;
+    *)    target_branch="$target";;
+  esac
+  if [ -n "$target_branch" ]; then
+    if target_ref="$(resolve_branch_ref "$target_branch")"; then
+      base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
+      if [ -n "$base" ]; then
+        echo "$prog: scoping the review to the MR/PR target branch $target_ref"
+      else
+        # Unrelated histories: no shared commit to diff from. Only reachable for an explicit
+        # --target (auto only yields a branch the forge says we merge into), so tell the user.
+        echo "$prog: no merge-base between HEAD and $target_ref — falling back to the default base" >&2
+      fi
+    elif [ "$target" = "auto" ]; then
+      # Derived a name but have no local copy of it (unfetched target branch) — stay silent-ish and
+      # fall back rather than failing a run that would otherwise work.
+      echo "$prog: MR/PR target branch '$target_branch' not found locally (try 'git fetch') — falling back to the default base" >&2
+    else
+      die_usage "--target '$target' does not resolve to a branch (tried origin/$target and $target)"
+    fi
+  fi
+fi
+
+# Historical default: merge-base with origin/main, else origin/HEAD, else HEAD (⇒ empty diff,
+# security auto=off). Reached whenever no target was given/derived/usable, so behaviour without MR
+# context is exactly what it was before --target existed.
 if [ -z "$base" ]; then
   base="$(git -C "$dir" merge-base HEAD origin/main 2>/dev/null \
         || git -C "$dir" merge-base HEAD origin/HEAD 2>/dev/null \
