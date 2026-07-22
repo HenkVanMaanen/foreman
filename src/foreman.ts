@@ -10,7 +10,7 @@
 // Designed to be spawned by keeper.sh, which restarts it on exit.
 
 import { loadConfig } from "./config.ts";
-import { runDashboard } from "./dashboard.ts";
+import { runDashboard, supervisorIsRunning } from "./dashboard.ts";
 import { InboxQueue, startInboxPoller } from "./inbox.ts";
 import { notifyHuman, RELOGIN_AGENTS } from "./relogin.ts";
 import { runWithSecrets, secretSetFromStdin } from "./secrets.ts";
@@ -53,6 +53,18 @@ async function main(argv: string[]): Promise<number> {
       const relogin = RELOGIN_AGENTS.get(which);
       if (!relogin) {
         console.error(`usage: foreman relogin [${[...RELOGIN_AGENTS.keys()].join("|")}] [--force]`);
+        return 2;
+      }
+      // Refuse to run alongside a live supervisor. This command starts its own inbox poller, and
+      // `wait-reply --inbox` must have exactly ONE consumer (inbox.ts invariant 2): a second one
+      // races the supervisor's for the same Telegram watermark, and every message it wins is
+      // consumed off the agent's inbox for good. The loop already recovers auth by itself, so
+      // there is nothing this command adds while it is up.
+      if (await supervisorIsRunning(cfg)) {
+        console.error(
+          "foreman relogin: a supervisor loop is already running — it recovers auth on its own, " +
+            "and a second inbox poller would steal the agent's messages. Stop it first.",
+        );
         return 2;
       }
       // Seed the workspace exactly as supervise() does before it calls the same relay: the flow

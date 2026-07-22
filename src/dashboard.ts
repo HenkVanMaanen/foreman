@@ -112,6 +112,19 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Is a `foreman supervise` loop live right now? Answered from the status file the supervisor
+ * stamps plus a liveness check on the pid it recorded, so it needs no cooperation from the loop.
+ *
+ * Exported for `foreman relogin`: that command starts its own inbox poller, and a SECOND
+ * `wait-reply --inbox` consumer would break inbox.ts invariant 2 — the two pollers would race for
+ * the same Telegram watermark and messages meant for the agent would be eaten by the CLI.
+ */
+export async function supervisorIsRunning(cfg: Config): Promise<boolean> {
+  const status = await readStatus(cfg);
+  return status !== null && pidAlive(status.pid);
+}
+
 /** Derive display health from harness-observable signals only — no agent cooperation. */
 function healthOf(status: Status | null): Health {
   if (!status) return "offline";

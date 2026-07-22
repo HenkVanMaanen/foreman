@@ -3,8 +3,8 @@
 // When claude's OAuth token dies, the MODEL IS DOWN — it cannot ask for help. The supervisor
 // (plain TS, always up) therefore owns recovery end to end: it spots the auth-required frame in
 // the stream-json it is already reading, drives `claude auth login` under a pty, sends the
-// sign-in URL to the human over the existing channel (bin/reply, or bin/ask-human when the box is
-// Telegram-only — reply.sh speaks Mattermost only), blocks on the SAME InboxQueue — and so the
+// sign-in URL to the human over the existing channel (bin/reply, falling back to bin/ask-human —
+// the one script that posts to EVERY configured channel), blocks on the SAME InboxQueue — and so the
 // same watermark — the idle-wait consumes from until the human replies with the code, pastes it
 // in, and verifies with `claude auth status` before letting the loop relaunch.
 //
@@ -300,11 +300,12 @@ async function ran(
 }
 
 /**
- * Post a message to the human. `bin/reply` first — it threads the message correctly — but it is
- * MATTERMOST-ONLY, so on a Telegram-only box it exits non-zero and this "Telegram-mediated" relay
- * would never reach anyone. `bin/ask-human` posts to every channel that is configured (Mattermost
- * AND Telegram), so it is the fallback that makes the relay actually deliverable. Throws only when
- * BOTH fail: the sign-in URL is the one message that must land.
+ * Post a message to the human. `bin/reply` first — it threads the message correctly — but it posts
+ * to ONE channel (Mattermost, or Telegram when Mattermost is unconfigured) and the agent may have
+ * replaced the reference script with one that is narrower still, so a box it cannot reach exits
+ * non-zero and this "Telegram-mediated" relay would never land. `bin/ask-human` posts to EVERY
+ * channel that is configured, so it is the fallback that makes the relay actually deliverable.
+ * Throws only when BOTH fail: the sign-in URL is the one message that must land.
  */
 async function notify(childEnv: Record<string, string>, text: string): Promise<void> {
   if (await ran([binPath("reply"), "-"], new TextEncoder().encode(text), childEnv)) return;
@@ -668,9 +669,13 @@ export async function reloginClaude(
         );
         return true;
       }
+      // The code itself is NOT echoed. It is an OAuth authorization code: quoting it back writes
+      // a possibly still-live credential into the channel's permanent history (and this branch is
+      // reached whenever verification failed for ANY reason, including a good code the login
+      // child was killed before it could redeem). The human knows what they just sent.
       await handBackSpare(
-        `[harness] that did not work — I read your reply as the sign-in code: "${code}". ` +
-          `If that was an ordinary message, please send it again once we are back in.`,
+        "[harness] that did not work — I read your last reply as the sign-in code. " +
+          "If that was an ordinary message, please send it again once we are back in.",
         "\n\nI also consumed these off the inbox:",
       );
     } catch (e) {

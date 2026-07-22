@@ -248,10 +248,10 @@ export function startInboxPoller(
 /**
  * Split inbox lines into the human's answer and everything else.
  *
- * `text` is the LAST `MSG <id> <root> <text>` line's text — later messages supersede earlier ones,
- * so a typo'd first attempt followed by a correction does the right thing. `ACK` (👍) lines carry
- * no text and are never the answer. Used by the re-login relay (src/relogin.ts) to read the
- * sign-in code the human relayed back.
+ * `text` is the text of the last `MSG <id> <root> <text>` line that CARRIES text — later messages
+ * supersede earlier ones, so a typo'd first attempt followed by a correction does the right thing.
+ * `ACK` (👍) lines carry no text and are never the answer, and neither is a blank-texted `MSG`.
+ * Used by the re-login relay (src/relogin.ts) to read the sign-in code the human relayed back.
  *
  * `rest` is every line NOT consumed as the answer, in order. Returned together with `text` rather
  * than left for the caller to re-derive: a line taken off the queue is gone from it, so the relay
@@ -261,10 +261,16 @@ export function startInboxPoller(
  * rule lives in one place.
  */
 export function takeAnswer(lines: string[]): { text: string | undefined; rest: string[] } {
-  const i = lines.findLastIndex((l) => l.startsWith("MSG "));
   // MSG <id> <root_or_-> <text…>  — the text is everything after the third space.
-  const text = lines[i]?.split(" ").slice(3).join(" ").trim() || undefined;
-  // A blank-texted MSG line is NOT an answer, so it stays in `rest` like any other spare.
+  const msgText = (l: string) =>
+    l.startsWith("MSG ") ? l.split(" ").slice(3).join(" ").trim() : "";
+  // A blank-texted MSG line is NOT an answer, so it is skipped here and stays in `rest` like any
+  // other spare. Skipped rather than merely rejected after the fact: a blank line arriving in the
+  // SAME batch after a real one (the human sends the code, then a whitespace-only follow-up) must
+  // not hide the code — the batch still carries an answer, and dropping it would burn an attempt
+  // and echo the live code back to the human instead of pasting it in.
+  const i = lines.findLastIndex((l) => msgText(l) !== "");
+  const text = i === -1 ? undefined : msgText(lines[i] as string);
   return { text, rest: text === undefined ? [...lines] : lines.filter((_, n) => n !== i) };
 }
 

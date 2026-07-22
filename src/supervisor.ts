@@ -303,10 +303,10 @@ export async function supervise(cfg: Config): Promise<void> {
         authDetail,
         () => stat("auth-required"),
       );
-      io.phase = "busy";
-      io.acked = false;
       await recordEvent(cfg, { who: "supervisor", kind: "relogin", detail: outcome });
       if (outcome === "recovered") {
+        io.phase = "busy";
+        io.acked = false;
         // Put the pre-lockout messages back at the FRONT of the agent's next boundary delivery.
         // push() appends, so re-queue them AHEAD of anything the poller delivered during the
         // re-login and the relay left behind — otherwise the older messages arrive last. push()
@@ -314,12 +314,21 @@ export async function supervise(cfg: Config): Promise<void> {
         inbox.push([...heldBack, ...inbox.drain()]);
         continue;
       }
+      // Phase stays "relogin" on the way out: flipping back to "busy" here would let the poller
+      // answer a message arriving during the notify below with the "I'm mid-task, I'll pick this
+      // up at my next checkpoint" auto-ack — a promise the harness is seconds from breaking.
       console.log(`[supervisor] re-login ${outcome} → exiting for keeper to respawn`);
+      // Stop the poller BEFORE the final drain: it is still filling the queue, and anything it
+      // pushes after the drain has nothing left to read it — the process exits and the watermark
+      // has already moved past those lines (invariant 3).
+      watchdog.stop();
+      poller.stop();
       // We are about to exit, so this in-memory copy is the last one: the watermark moved past
       // these lines when the poller read them, and no future life will ever see them. The relay
       // hands back its own consumed-but-unused lines the same way; these are the ones it never
       // saw, so handing them back is on us.
-      if (heldBack.length) {
+      const orphaned = [...heldBack, ...inbox.drain()];
+      if (orphaned.length) {
         // notifyHuman, not sendTelegramAck: the latter no-ops unless TELEGRAM_* is in the
         // harness's own env, which would silently drop these on a Mattermost-only box.
         await notifyHuman(
@@ -327,11 +336,9 @@ export async function supervise(cfg: Config): Promise<void> {
           passthroughEnv,
           "[harness] I went down for re-authentication before I could handle these, and could " +
             "not recover — please re-send anything that still needs an answer:\n" +
-            heldBack.join("\n"),
+            orphaned.join("\n"),
         );
       }
-      watchdog.stop();
-      poller.stop();
       return;
     }
     if (ended === "recycle") {

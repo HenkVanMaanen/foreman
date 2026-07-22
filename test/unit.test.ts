@@ -522,6 +522,15 @@ describe("takeAnswer", () => {
     expect(takeAnswer(["MSG 1 - dup", "MSG 1 - dup"]).rest).toEqual(["MSG 1 - dup"]);
   });
 
+  // The human sends the code and then a whitespace-only follow-up; both land in ONE poller batch.
+  // Taking the last MSG line unconditionally would read a blank as "no answer", burn an attempt,
+  // and echo the still-live code back into the channel instead of pasting it into the login.
+  test("a later blank-texted MSG does not hide a real answer in the same batch", () => {
+    const { text, rest } = takeAnswer(["MSG 1 - GOODCODE", "MSG 2 -   "]);
+    expect(text).toBe("GOODCODE");
+    expect(rest).toEqual(["MSG 2 -   "]);
+  });
+
   test("no answer → every line is a spare (nothing is silently eaten)", () => {
     expect(takeAnswer(["ACK 2 - +1"]).rest).toEqual(["ACK 2 - +1"]);
     // A blank-texted MSG line is not an answer, so it stays in rest.
