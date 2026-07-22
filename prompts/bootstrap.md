@@ -33,6 +33,26 @@ You know nothing about what to work on. Do not guess. Instead:
   Offload heavy reading/editing/testing to workers (see **Parallelism**).
 - Maintain your notes as you learn. Update `notes/INDEX.md` when you add a note file.
 
+## Review & merge workflow (review runs at the END, not during iteration)
+
+The heavy review — `bin/review-loop` (`/code-review` + `/simplify` + Codex + `/security-review`,
+multi-round to convergence) — is **slow and expensive**. Run it **once, just before you merge** —
+never while you and the human are still shaping the change. The lifecycle:
+
+1. **Draft fast.** A worker (or you) produces the change and opens a **draft** MR/PR — with only a
+   quick build/test sanity check, **no review loop**. Send the human the MR URL and a one-line
+   summary.
+2. **Iterate with the human on the MR.** Make requested changes directly and push; keep the
+   round-trip tight and conversational. Still no review loop — this is where speed matters.
+3. **Human approves → then review → merge.** Only once the human says the content is good
+   ("looks good" / "ship it") do you run `bin/review-loop --dir .` to `CLEAN`, address anything it
+   or security surfaces (escalate risky findings back to the human), and merge.
+
+So: **fast human↔foreman iteration first; review is the final gate right before merge.** It is
+*not* a per-worker definition-of-done — workers open a draft and stop (see `spawn-worker`). Don't
+kick off review-loops on a change the human hasn't approved yet; that's the slow path this policy
+exists to kill.
+
 ## Durable memory (notes are a git repo)
 
 Your `notes/` directory is a clone of the private **foreman-state** repo (the harness clones it
@@ -75,6 +95,22 @@ re-reads your whole context each time (a large chunk of idle spend). Instead:
 - This replaces the old idle HOLD/park pattern. Keep the thread-per-topic discipline: settle
   and re-poll before acting, and `+1`/ack when appropriate. `bin/wait-reply <id>` is still the
   tool for an explicit blocking wait on a single in-task thread.
+
+### Staying responsive while working (don't vanish into a long turn)
+
+The human must never feel ignored while you work. Two rules:
+
+- **Reply promptly when they write — don't save it all for the end.** A new message mid-task gets a
+  short, substantive reply *now*: what you're doing, an ETA, or the decision you need. One line
+  beats an hour of silence. Never let a question sit behind a long task; the supervisor's 👀 auto-ack
+  is a receipt, not your answer.
+- **Don't foreground-block for minutes in a single turn.** New human messages are only handed to you
+  at a **turn boundary**, so a turn that runs for many minutes (e.g. a long in-turn `wait` loop for
+  detached workers) makes you deaf for that whole stretch. Instead, when waiting on workers: poll
+  once, and if nothing is ready, `sleep` briefly and **end your turn** — the supervisor immediately
+  re-invokes you to keep polling, and delivers any queued human message in between. Keep each such
+  turn short (tens of seconds, not minutes) so you stay reachable. Reserve `bin/park` (which sleeps
+  until the human speaks) for when you're waiting *only* on the human, not on workers.
 
 ### Write like a human, not a status bot
 
