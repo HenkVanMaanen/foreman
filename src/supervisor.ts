@@ -16,7 +16,7 @@ import {
   waitForInboxMessages,
 } from "./inbox.ts";
 import { usageTotal } from "./protocol.ts";
-import { makeAuthDetector, makeAuthRecovery } from "./relogin.ts";
+import { makeAuthDetector, makeAuthRecovery, notifyHuman } from "./relogin.ts";
 import { Session } from "./session.ts";
 import { startWatchdog } from "./watchdog.ts";
 import { ensureWorkspace, syncNotes } from "./workspace.ts";
@@ -304,9 +304,11 @@ export async function supervise(cfg: Config): Promise<void> {
       io.acked = false;
       await recordEvent(cfg, { who: "supervisor", kind: "relogin", detail: outcome });
       if (outcome === "recovered") {
-        // Put the pre-lockout messages back at the FRONT of the agent's next boundary delivery —
-        // push() no-ops on an empty list, and nothing is waiting on the queue right now.
-        inbox.push(heldBack);
+        // Put the pre-lockout messages back at the FRONT of the agent's next boundary delivery.
+        // push() appends, so re-queue them AHEAD of anything the poller delivered during the
+        // re-login and the relay left behind — otherwise the older messages arrive last. push()
+        // no-ops on an empty list, and nothing is waiting on the queue right now.
+        inbox.push([...heldBack, ...inbox.drain()]);
         continue;
       }
       console.log(`[supervisor] re-login ${outcome} → exiting for keeper to respawn`);
@@ -315,7 +317,11 @@ export async function supervise(cfg: Config): Promise<void> {
       // hands back its own consumed-but-unused lines the same way; these are the ones it never
       // saw, so handing them back is on us.
       if (heldBack.length) {
-        await sendTelegramAck(
+        // notifyHuman, not sendTelegramAck: the latter no-ops unless TELEGRAM_* is in the
+        // harness's own env, which would silently drop these on a Mattermost-only box.
+        await notifyHuman(
+          cfg,
+          passthroughEnv,
           "[harness] I went down for re-authentication before I could handle these, and could " +
             "not recover — please re-send anything that still needs an answer:\n" +
             heldBack.join("\n"),

@@ -329,6 +329,21 @@ async function notifyQuietly(childEnv: Record<string, string>, text: string) {
 }
 
 /**
+ * The above, for callers outside this module that hold the raw workspace env (the supervisor's
+ * give-up path, which has its own consumed-but-unused inbox lines to hand back). Exported rather
+ * than left to sendTelegramAck(): that helper is a no-op unless TELEGRAM_* is in the harness's own
+ * env, so on a Mattermost-only box it would silently DROP lines the watermark has already moved
+ * past — the one thing inbox.ts invariant 3 forbids.
+ */
+export async function notifyHuman(
+  cfg: Config,
+  env: Record<string, string>,
+  text: string,
+): Promise<void> {
+  await notifyQuietly(harnessChildEnv(cfg, env), text);
+}
+
+/**
  * `p`, or `undefined` if `timeoutMs` passes first. The timer is always cleared, so a race won by
  * `p` cannot leave a pending timeout holding the event loop open (a 16-minute one would keep
  * `foreman relogin codex` "running" long after it finished).
@@ -578,6 +593,14 @@ export async function reloginClaude(
           `3. Reply to this message with JUST the code.`,
       );
 
+      // Everything the poller queued between the supervisor's pre-lockout drain and the send
+      // above was written BEFORE the human was ever asked for a code — the banner read alone can
+      // take URL_TIMEOUT_MS, so that window is minutes wide, not instants. Sweep it into `spare`
+      // here rather than letting the wait below read it: takeAnswer() would hand the last of
+      // those ordinary messages to the login prompt as the sign-in code. Only lines that arrive
+      // after this point can be the answer.
+      spare.push(...inbox.drain());
+
       // Wait for the code on the SAME queue — and so the same watermark
       // (state/wait-reply/inbox.tg.offset) — the idle-wait drains, so it can never be
       // double-consumed by the agent's own poll. The always-on poller keeps filling that queue
@@ -605,16 +628,13 @@ export async function reloginClaude(
         spare.push(...rest);
         if (!code) textlessWakes++;
       }
-      // Name which budget ran out. Both end the attempt the same way, but they call for opposite
-      // responses from whoever reads the log after a lockout — chase the human, or stop replying
-      // with a bare 👍 — and "no code in the human's reply" reads as the second one whichever
-      // actually happened.
+      // The OTHER way out of the loop: nothing but reaction-acks. (The deadline never surfaces
+      // here — waitForInboxLines() THROWS on it, naming itself, so the loop cannot fall out that
+      // way. The `Date.now() < deadline` guard above is belt-and-braces.) Named rather than
+      // reported as a bare "no code", because it calls for a different response from whoever
+      // reads the log after a lockout: stop replying with a bare 👍.
       if (!code) {
-        throw new Error(
-          Date.now() >= deadline
-            ? `no reply from the human within ${HUMAN_TIMEOUT_MS / 60_000} min`
-            : `${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`,
-        );
+        throw new Error(`${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`);
       }
 
       proc.stdin.write(`${code}\n`);
