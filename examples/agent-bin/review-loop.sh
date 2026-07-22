@@ -253,10 +253,13 @@ fi
 # `remotes/$b` is tried LAST so an already-remote-qualified name (`--target origin/main`, which the
 # docs' own wording invites, or `--target upstream/main`) resolves instead of failing outright.
 # Matched against the full refs/remotes|refs/heads paths, NOT a bare `NAME^{commit}`: the bare form
-# also resolves tags and pseudo-refs, so `--target HEAD` would silently "succeed" with
-# merge-base(HEAD,HEAD)=HEAD — an empty diff that makes every phase converge CLEAN vacuously.
+# also resolves TAGS, so a tag named like the target branch could win over the branch itself.
 resolve_branch_ref() {
   local b="$1" cand r
+  # HEAD is not a branch, and the refs/ prefixing alone does NOT reject it: `git clone` creates
+  # refs/remotes/origin/HEAD, so `--target HEAD` would quietly resolve to origin's default branch
+  # instead of erroring — and any candidate ending in /HEAD is that same pseudo-ref. Reject up front.
+  case "$b" in HEAD|*/HEAD) return 1;; esac
   local cands=("remotes/origin/$b" "heads/$b")
   # Then EVERY other configured remote: a fork checkout whose remote is named `upstream` (or a repo
   # with no `origin` at all) would otherwise resolve nothing for a derived name like "main" that has
@@ -337,7 +340,7 @@ detect_target_branch() {
 }
 
 if [ -z "$base" ]; then
-  target_branch="" target_ref=""
+  target_branch=""
   case "$target" in
     none) ;;
     auto) target_branch="$(detect_target_branch || true)";;
