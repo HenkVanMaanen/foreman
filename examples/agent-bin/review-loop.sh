@@ -67,12 +67,14 @@
 # origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
 # origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
 #   --base REF   — use REF verbatim as the diff base. Wins over --target; no merge-base is computed.
-#   --target REF — the branch this work merges INTO; base = merge-base of HEAD with it (origin/REF
-#                  is preferred over a local REF). Errors if REF does not resolve.
+#   --target REF — the branch this work merges INTO; base = merge-base of HEAD with it (every
+#                  <remote>/REF is preferred over a local REF). Errors if REF does not resolve, or
+#                  if it shares no history with HEAD — it never falls back.
 #   --target auto— (default) best-effort: ask glab/gh for the OPEN MR/PR of the current branch and
 #                  use its target branch. Any failure (no CLI, no MR, detached HEAD, network/auth
-#                  error, unresolvable branch) falls back SILENTLY to the historical default below,
-#                  so behaviour without MR context is unchanged.
+#                  error, unresolvable branch) falls back to the historical default below (with a
+#                  stderr note when a branch WAS derived but is not fetched), so behaviour without
+#                  MR context is unchanged.
 #   --target none— skip derivation entirely; use the historical default.
 # Historical default (the fallback): merge-base of HEAD with origin/main, else origin/HEAD, else HEAD.
 #
@@ -194,7 +196,7 @@ case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$c
 # leading-dash-free ref token that git can never read as an option).
 case "$target" in
   auto|none) ;;
-  -*) die_usage "--target REF must not start with '-' (got '$target')";;
+  # $branch_re already excludes a leading '-', so this one test covers the option-injection guard too.
   *) [[ "$target" =~ $branch_re ]] || die_usage "--target must be auto|none or a branch name matching $branch_re (got '$target')";;
 esac
 # --codex-model is interpolated into the `codex -m` command; restrict its charset (mirrors the
@@ -260,14 +262,18 @@ resolve_branch_ref() {
   # refs/remotes/origin/HEAD, so `--target HEAD` would quietly resolve to origin's default branch
   # instead of erroring — and any candidate ending in /HEAD is that same pseudo-ref. Reject up front.
   case "$b" in HEAD|*/HEAD) return 1;; esac
-  local cands=("remotes/origin/$b" "heads/$b")
+  local cands=("remotes/origin/$b")
   # Then EVERY other configured remote: a fork checkout whose remote is named `upstream` (or a repo
   # with no `origin` at all) would otherwise resolve nothing for a derived name like "main" that has
   # no local branch, silently dropping the scope fix on exactly the layout that needs it most.
   while IFS= read -r r; do
     if [ -n "$r" ] && [ "$r" != "origin" ]; then cands+=("remotes/$r/$b"); fi
   done < <(git -C "$dir" remote 2>/dev/null || true)
-  cands+=("remotes/$b")
+  # The LOCAL branch ranks below every remote-tracking copy, not just origin's: on a fork checkout
+  # (origin=fork, upstream=canonical) a stale local `main`/parent branch sitting behind
+  # upstream/<b> would otherwise win, and merge-basing against it lands BELOW the real target —
+  # re-introducing exactly the over-scoping this resolution exists to prevent.
+  cands+=("heads/$b" "remotes/$b")
   for cand in "${cands[@]}"; do
     if git -C "$dir" rev-parse --verify --quiet "refs/$cand^{commit}" >/dev/null 2>&1; then
       printf '%s\n' "refs/$cand"; return 0
@@ -361,10 +367,14 @@ if [ -z "$base" ]; then
       base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
       if [ -n "$base" ]; then
         echo "$prog: scoping the review to the MR/PR target branch $target_disp"
-      else
-        # Unrelated histories: no shared commit to diff from. Only reachable for an explicit
-        # --target (auto only yields a branch the forge says we merge into), so tell the user.
+      elif [ "$target" = "auto" ]; then
+        # Unrelated histories under a DERIVED target: best-effort mode, so fall back quietly.
         echo "$prog: no merge-base between HEAD and $target_disp — falling back to the default base" >&2
+      else
+        # Explicit --target: do NOT fall back. The fallback chain ends at `rev-parse HEAD` when
+        # origin/main is unrelated too, which yields an EMPTY diff — every phase then reviews
+        # nothing and the run reports CLEAN having checked zero lines. Fail loudly instead.
+        die_usage "no merge-base between HEAD and $target_disp (--target '$target') — unrelated histories; pass --base REF explicitly"
       fi
     elif [ "$target" = "auto" ]; then
       # Derived a name but have no local copy of it (unfetched target branch) — stay silent-ish and
