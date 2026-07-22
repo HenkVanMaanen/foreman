@@ -52,14 +52,19 @@
 # the loops do 0 productive rounds and exit 0 fast (idempotent).
 #
 # Usage:
-#   review-loop [--dir DIR] [--base REF] [--max-rounds N]
+#   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
 #               [--security auto|on|off] [--effort low|medium|high|max]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
 #
-# Defaults: DIR=cwd, max-rounds=6, security=on, effort=high, codex=on, codex-model=gpt-5.6-sol,
-#           base=merge-base of HEAD with origin/main (falls back to HEAD if unavailable).
+# Defaults and --base/--target semantics: `--help` (usage() below) is the only copy — this header
+# carries WHY they exist, not what they do.
+#
+# WHY --base / --target exist: a review should cover exactly what the MR/PR changes — no more. The
+# diff base therefore has to be the merge-base with the branch this work MERGES INTO, not with
+# origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
+# origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
 #
 # --codex / --no-codex:
 #   on   — (default) run the Codex independent-reviewer phase and the joint reconciliation. If the
@@ -84,7 +89,8 @@
 #                  and/or the security OR codex phase needs a human (ESCALATE): it could not converge
 #                  within the cap OR it found a finding it judged too risky to auto-fix (flagged with
 #                  WHY). WHY is printed.
-#   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found).
+#   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never in
+#                  --stop-hook mode: a blocking code there would wedge the session (see below).
 #
 # In --stop-hook mode the process still runs the loop once (guarded by a marker file so a
 # re-firing Stop hook cannot recurse), but ALWAYS exits 0 so the session is allowed to end; the
@@ -100,6 +106,7 @@ set -euo pipefail
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
+target="auto"     # default: best-effort derive the MR/PR target branch, else the historical base
 max_rounds=6
 security="on"     # default: always run security-review; the command scopes itself to real findings
 effort="high"
@@ -107,7 +114,26 @@ codex="on"        # default: run the Codex independent-reviewer phase (skips gra
 codex_model="gpt-5.6-sol"
 stop_hook=0
 
+# Learn --stop-hook BEFORE the parse loop reaches it, so `die`'s exit-code softening (see below)
+# holds for an error raised at ANY argument position — not only after --stop-hook was reached.
+for _a in "$@"; do
+  if [ "$_a" = "--stop-hook" ]; then stop_hook=1; break; fi
+done
+
 prog="review-loop"
+
+# The one charset a branch NAME may use anywhere in this script: --target's value, a name derived
+# from the forge CLI, and the branch we hand to that CLI. The first character excludes '-' so the
+# name can never be read as an option by git/gh/glab (a trailing/interior '-' is fine), and the whole
+# charset is URL-query-safe so it can go into a `glab api` query verbatim.
+branch_re='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
+
+# Run "$@" under `timeout SECS`, or BARE when coreutils `timeout` is missing (stock macOS ships
+# none, and there `timeout`'s own 127 "command not found" would be misread as the guarded command
+# failing — a wedged forge lookup, a logged-out codex). The bare branch is genuinely unguarded, and
+# that trade is deliberate: a false "not logged in" / "no MR" on every macOS run is the worse
+# failure, and each guarded site runs at most once per run. Shared by every hang-guard below.
+_tmo() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
 
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
@@ -115,11 +141,20 @@ usage() {
 review-loop — run code-review + simplify + security (all auto-fixing) to convergence.
 
 Usage:
-  review-loop [--dir DIR] [--base REF] [--max-rounds N]
+  review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
               [--security auto|on|off] [--effort low|medium|high|max]
               [--codex|--no-codex] [--codex-model MODEL]
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
+
+Scope: --base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
+commit or it is a usage error. --target REF diffs from the merge-base with the branch this work
+merges INTO, so the review scope equals the MR/PR even for a branch stacked on another unmerged
+branch; an explicit REF that does not resolve locally (try `git fetch`) or shares no history with
+HEAD is likewise a usage error, NOT a silent fallback. --target auto (default) derives that branch
+from the open MR/PR via glab/gh and IS best-effort: it falls back to the merge-base with origin/main
+(with a stderr note when a branch was derived but turned out unusable). --target none skips
+derivation.
 
 Phases run in order, each capped at --max-rounds and committing per round:
   1. /code-review <effort> --fix loop   (fix correctness)
@@ -130,20 +165,42 @@ Phases run in order, each capped at --max-rounds and committing per round:
   5. final convergence                  (ONLY if simplify/codex/security changed code — bounded Claude<->Codex
                                          reconciliation, or a single /code-review pass if codex off)
 
-Defaults: DIR=cwd, max-rounds=6, security=on, effort=high, codex=on, codex-model=gpt-5.6-sol,
-          base=merge-base of HEAD with origin/main.
+Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, effort=high, codex=on,
+          codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch if derivable,
+          else with origin/main.
 
 Exit: 0 CLEAN | 3 NOT-CLEAN (cap hit / review failed / security or codex can't converge or risky fix) | 2 usage/error.
 EOF
 }
 
-die_usage() { echo "$prog: $1" >&2; echo >&2; usage >&2; exit 2; }
+# Exit 2 (usage/precondition) — EXCEPT under --stop-hook, where a non-zero exit is how a Stop hook
+# BLOCKS the session from ending (and 2 specifically feeds stderr back to the model as instructions).
+# A bad flag or an unresolvable --target would then wedge the very session the marker guard exists to
+# let finish: a bad flag dies BEFORE the marker block below, so every subsequent Stop re-fires and
+# re-blocks with nothing to stop it. The message is still printed in full; only the CODE is softened
+# — same invariant as the always-exit-0 tail.
+# $2="usage" also dumps the usage block (argument errors); runtime preconditions omit it, since 25
+# lines of flag documentation only buries the one actionable line.
+die() {
+  echo "$prog: $1" >&2
+  if [ "${2:-}" = "usage" ]; then echo >&2; usage >&2; fi
+  # Claude Code surfaces a Stop hook's STDERR only when the exit code BLOCKS; on the softened exit 0
+  # it is dropped. Repeat the reason on stdout so a typo'd hook command is not silently reviewing
+  # nothing, session after session, with no visible signal at all.
+  if [ "$stop_hook" -eq 1 ]; then
+    echo "$prog: $1 — (stop-hook mode: exiting 0 to avoid wedging the session; NOTHING was reviewed)"
+    exit 0
+  fi
+  exit 2
+}
+die_usage() { die "$1" usage; }
 
 # --- arg parsing ------------------------------------------------------------------------------
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dir)        [ "$#" -ge 2 ] || die_usage "--dir needs DIR"; dir="$2"; shift 2;;
     --base)       [ "$#" -ge 2 ] || die_usage "--base needs REF"; base="$2"; shift 2;;
+    --target)     [ "$#" -ge 2 ] || die_usage "--target needs REF|auto|none"; target="$2"; shift 2;;
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
     --effort)     [ "$#" -ge 2 ] || die_usage "--effort needs a level"; effort="$2"; shift 2;;
@@ -160,6 +217,11 @@ done
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
 case "$effort" in low|medium|high|max) ;; *) die_usage "--effort must be low|medium|high|max (got '$effort')";; esac
 case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$codex')";; esac
+# --target is either a mode word or a branch name we hand to git.
+case "$target" in
+  auto|none) ;;
+  *) [[ "$target" =~ $branch_re ]] || die_usage "--target must be auto|none or a branch name matching $branch_re (got '$target')";;
+esac
 # --codex-model is interpolated into the `codex -m` command; restrict its charset (mirrors the
 # <name>/<id> posture in spawn-worker.sh / wait-reply.sh) to keep it a single safe token.
 [[ "$codex_model" =~ ^[A-Za-z0-9._-]+$ ]] || die_usage "--codex-model must match ^[A-Za-z0-9._-]+$ (got '$codex_model')"
@@ -174,23 +236,16 @@ command -v claude >/dev/null 2>&1 || die_usage "claude not found on PATH"
 dir="$(cd "$dir" && pwd)"
 git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is not a git repository"
 
-# base = merge-base with origin/main, else origin/HEAD, else HEAD (⇒ empty diff, security auto=off).
-if [ -z "$base" ]; then
-  base="$(git -C "$dir" merge-base HEAD origin/main 2>/dev/null \
-        || git -C "$dir" merge-base HEAD origin/HEAD 2>/dev/null \
-        || git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-fi
-[ -n "$base" ] || die_usage "could not resolve a base ref (pass --base REF)"
-# $base is immutable from here on, so resolve its short form ONCE and reuse it (the header + both
-# prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
-base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
-
 # --- stop-hook guard (loop-safety for the Stop-hook entrypoint) -------------------------------
 # A Claude Code Stop hook re-fires every time the session would end, so a hook that does work and
 # lets the session continue can recurse. Guard with a marker file: run the loop at most once per
 # marker lifetime. The marker lives in the runtime state dir (gitignored) and should be cleared at
 # session start (documented in review-loop-hook.md). We ALSO honor `stop_hook_active` from the
 # hook's stdin JSON when present, as a second belt.
+#
+# This runs BEFORE base/target resolution on purpose: --target auto shells out to gh/glab, which is
+# a network round-trip (~10s worst case, twice) — paying that on every Stop fire just to hit
+# the marker and exit would stall the end of every single session.
 state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
 marker="$state_dir/.review-loop-ran"
 if [ "$stop_hook" -eq 1 ]; then
@@ -210,6 +265,213 @@ if [ "$stop_hook" -eq 1 ]; then
   mkdir -p "$state_dir" 2>/dev/null || true
   : > "$marker" 2>/dev/null || true
 fi
+
+# --- base / target resolution -----------------------------------------------------------------
+# Rationale for the scope rule: see the SCOPE block in the header comment.
+# Resolution order: --base (verbatim) > --target REF > --target auto (derived) > historical default.
+
+# Echo the first of the given refs/-relative candidates that names a commit; 1 if none does.
+_first_ref() {
+  local c
+  for c in "$@"; do
+    if git -C "$dir" rev-parse --verify --quiet "refs/$c^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "refs/$c"; return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve a branch NAME to a ref we can merge-base against. Echoes the ref; returns 1 if no form
+# exists. Candidates are matched as full refs/remotes|refs/heads paths, NOT as a bare `NAME^{commit}`
+# — the bare form also resolves TAGS, so a tag named like the target branch could win over it.
+resolve_branch_ref() {
+  local b="$1" r
+  # HEAD is not a branch, and the refs/ prefixing alone does NOT reject it: `git clone` creates
+  # refs/remotes/origin/HEAD, so `--target HEAD` would quietly resolve to origin's default branch
+  # instead of erroring — and any candidate ending in /HEAD is that same pseudo-ref. Reject up front.
+  case "$b" in HEAD|*/HEAD) return 1;; esac
+  # Precedence: origin/<b> > <other-remote>/<b> > local <b> > <b> already remote-qualified. Every
+  # remote-tracking copy outranks the local branch, because a stale local branch merge-bases BELOW
+  # the real target — re-introducing the over-scoping this resolution exists to prevent. Other
+  # remotes are only reached when origin does not carry the branch, so on a fork that mirrors it the
+  # fork's own copy wins — pass `--target upstream/<b>` when the canonical remote must be used. The
+  # already-qualified form is tried LAST so `--target origin/main` still works.
+  # origin/<b> is probed on its OWN first, so the overwhelmingly common case never forks `git remote`
+  # just to enumerate the others.
+  _first_ref "remotes/origin/$b" && return 0
+  local cands=()
+  while IFS= read -r r; do
+    [ "$r" != "origin" ] && cands+=("remotes/$r/$b")
+  done < <(git -C "$dir" remote 2>/dev/null || true)
+  _first_ref "${cands[@]}" "heads/$b" "remotes/$b"
+}
+
+# Extract a top-level "key": "value" string field from JSON on stdin (both forges answer with a
+# one-element ARRAY, so unwrap that first). jq only — it reads the field STRUCTURALLY, where any
+# grep/sed approximation takes the first TEXTUAL match anywhere in the payload and so lets a nested
+# occurrence of the same key win over the real one. No jq ⇒ empty output ⇒ the caller reads that as
+# "no MR context" and falls back to the historical base, the documented graceful path anyway.
+_json_str_field() {
+  command -v jq >/dev/null 2>&1 || return 0
+  jq -r --arg k "$1" 'if type == "array" then .[0] else . end | .[$k]? // empty' 2>/dev/null
+}
+
+# Best-effort: the target branch of the OPEN MR/PR for the checked-out branch, via glab or gh.
+# Echoes the branch NAME; returns 1 when there is no MR context (detached HEAD, no CLI, no open
+# MR/PR, auth/network failure, junk output) so the caller can fall back cleanly. Every invocation is
+# stdin-closed and hang-guarded via _tmo, and at most two CLIs are asked — the second only if the
+# first outright failed.
+detect_target_branch() {
+  local branch remote_url host out=""
+  branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [ -n "$branch" ] || return 1                      # detached HEAD ⇒ no MR to look up
+  # The branch goes into a CLI argument and (for glab) a URL query, so hold it to the same charset
+  # we accept back. An exotic branch name just means "no MR context" — fall back, don't improvise.
+  [[ "$branch" =~ $branch_re ]] || return 1
+  remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+
+  # Pick the forge CLI from origin's HOST, not from a substring of the whole URL (which misroutes
+  # github.com/acme/gitlab-migration). When the host identifies the forge, probe ONLY that CLI: the
+  # other one cannot answer for this repo anyway, and on a repo with both a github and a gitlab
+  # remote it can answer for the WRONG forge. An unrecognized (self-hosted) host lists both — glab
+  # first, since self-hosted GitLab is the case that reaches here — but the second is only reached
+  # when the first CLI outright FAILED (see the loop below), not merely when it found no MR.
+  # Strip scheme, then the PATH, then userinfo, then the port — in that order. Dropping the path
+  # first is what lets the userinfo strip be GREEDY (##*@), which it must be, or a `user@host@real`
+  # URL yields the userinfo's host and routes to the wrong CLI.
+  host="${remote_url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
+  local order=(glab gh) tool
+  case "$host" in
+    *gitlab*) order=(glab);;
+    *github*) order=(gh);;
+  esac
+
+  local raw field
+  for tool in "${order[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || continue
+    # Capture the RAW response separately from the parse so a CLI that FAILED (missing auth, network
+    # error, `timeout` kill) is distinguishable from one that answered fine with no open MR. Only the
+    # former should try the next tool: on an unrecognized self-hosted host `order` is (glab gh), and
+    # treating "answered, no MR" as a failure made every such run pay a SECOND 10s round-trip to a CLI
+    # that cannot speak for this repo anyway.
+    case "$tool" in
+      # `pr list --state open`, not `pr view <branch>`: pr view also resolves a CLOSED or MERGED PR
+      # for the branch, whose base could be a long-dead release branch — a wrong, over-narrow scope
+      # is worse than falling back. --limit 1 keeps the response to the one MR/PR we act on.
+      gh)   field="baseRefName"
+            raw="$(cd "$dir" && _tmo 10 gh pr list --head "$branch" --state open --limit 1 \
+                     --json baseRefName </dev/null 2>/dev/null)" || continue;;
+      # `glab api`, not `glab mr view -F json`: `-F json` only exists on recent glab (on 1.36 it is
+      # "unknown shorthand flag: 'F'"), so the mr-view form fails closed on every older install and
+      # the GitLab path never derives anything. The REST endpoint is stable across versions and
+      # filters to opened MRs the same way the gh call does.
+      glab) field="target_branch"
+            raw="$(cd "$dir" && _tmo 10 glab api \
+                     "projects/:fullpath/merge_requests?source_branch=$branch&state=opened&per_page=1" \
+                     </dev/null 2>/dev/null)" || continue;;
+    esac
+    # here-string, not `printf … | …`: $raw is already in memory, and the pipe costs an extra fork.
+    out="$(_json_str_field "$field" <<<"$raw" || true)"
+    # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
+    # into git. This CLI has spoken for the repo, so an unusable answer means "no MR context" for
+    # real: fall back rather than asking the other forge's CLI about a repo that isn't its.
+    [[ "$out" =~ $branch_re ]] || return 1
+    printf '%s\n' "$out"; return 0
+  done
+  return 1
+}
+
+# A resolved ref in its short display form (origin/main, main) — the full refs/ path exists only to
+# keep resolution unambiguous, and reads as noise in a log line.
+_short_ref() { local r="${1#refs/remotes/}"; printf '%s' "${r#refs/heads/}"; }
+
+# One place for "the target was unusable": a DERIVED target (--target auto) is best-effort, so it
+# warns and lets the historical default take over; an explicit --target must fail LOUDLY instead,
+# because the fallback chain can end at `rev-parse HEAD` (see the empty-range guard below).
+_target_giveup() {
+  [ "$target" != "auto" ] && die_usage "$1 (--target '$target'); pass --base REF explicitly"
+  echo "$prog: $1 — falling back to the default base" >&2
+}
+
+if [ -z "$base" ] && [ "$target" != "none" ]; then
+  # $target_src names the SOURCE for the log line: an explicit --target REF consulted no MR/PR at
+  # all, so calling it "the MR/PR target branch" would misdirect anyone debugging a wrong scope.
+  if [ "$target" = "auto" ]; then
+    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"
+  else
+    target_branch="$target";                         target_src="the --target branch"
+  fi
+  # An empty $target_branch means --target auto found no MR context (detect_target_branch already
+  # knows every reason) — nothing to resolve, so the historical default below takes over.
+  if [ -n "$target_branch" ]; then
+    if ! target_ref="$(resolve_branch_ref "$target_branch")"; then
+      _target_giveup "target branch '$target_branch' does not resolve locally — tried <remote>/$target_branch for every remote, local $target_branch, and $target_branch as a remote-qualified ref (try 'git fetch'; note that HEAD and */HEAD are refused outright — they are not branches)"
+    elif base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"; [ -n "$base" ]; then
+      echo "$prog: scoping the review to $target_src $(_short_ref "$target_ref")"
+    else
+      _target_giveup "no merge-base between HEAD and $(_short_ref "$target_ref") — unrelated histories"
+    fi
+  fi
+fi
+
+# Historical default: merge-base with origin/main, else origin/HEAD, else HEAD (⇒ empty diff,
+# security auto=off). Reached whenever no target was given/derived/usable, so behaviour without MR
+# context is exactly what it was before --target existed.
+# Did the caller pin the base (--base REF, or a --target that resolved), or are we falling back?
+# Decided HERE, while an empty $base still tells the two apart — the warning below needs to know.
+base_pinned=1; [ -n "$base" ] || base_pinned=0
+if [ -z "$base" ]; then
+  base="$(git -C "$dir" merge-base HEAD origin/main 2>/dev/null \
+        || git -C "$dir" merge-base HEAD origin/HEAD 2>/dev/null \
+        || git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
+fi
+[ -n "$base" ] || die "could not resolve a base ref (pass --base REF)"
+# ...and it must NAME a commit. --base is used VERBATIM, so a typo or a deleted branch survives to
+# here and would flow into every reviewer as `git diff <junk>...HEAD` — a command all four of them
+# fail to run, while the security-auto heuristic's `git diff --name-only <junk> HEAD` comes back
+# empty and skips the phase: the whole run then reports CLEAN having read zero lines. Resolve ONCE,
+# loudly, and reuse the sha below.
+base_resolved="$(git -C "$dir" rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null || true)"
+[ -n "$base_resolved" ] || die "base ref '$base' does not resolve to a commit (pass an existing --base REF)"
+# From here on $base IS that commit — ONE name for the base, so no later call site has to pick between
+# a raw ref and its sha. It is immutable from here on, so resolve the short display form ONCE too (the
+# header + both prompt builders would otherwise fork `git rev-parse --short` on every call).
+base="$base_resolved"
+base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
+
+# ONE decision — "what does this run review?" — as a single range, so the scope cannot drift between
+# the four reviewers. $range is EMPTY exactly when base IS HEAD, where `$base...HEAD` would be an
+# empty range and a reviewer handed it reviews NOTHING. Compared on the RESOLVED sha, not on the ref
+# the caller typed (`--base HEAD`) — the very case this guard exists to catch.
+range=""
+[ "$base" = "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" ] || range="$base_short...HEAD"
+
+# The two forms the reviewer families need:
+#   $scope_diff_ref — what the security/codex driver prompts spell out as `git diff <ref>`. Free-form
+#                     prose with no self-derive fallback, so it must always name something real; with
+#                     no range that is HEAD, i.e. the working tree.
+#   the Claude slash-command <target> (below) — a BARE ref range and nothing else: that is the form
+#                     they build the diff command from directly, where added prose would become a
+#                     free-form instruction instead. OMITTED when there is no range, letting them
+#                     self-derive (`git diff @{upstream}...HEAD`, else `main...HEAD`) exactly as
+#                     before --target existed. Both fold in `git diff HEAD`, so uncommitted work is
+#                     covered either way.
+scope_diff_ref="${range:-HEAD}"
+
+# Warn only when someone PINNED an empty range (--base REF, or a --target that resolved to HEAD) —
+# there it is nearly always a mistake. On the fallback path it is the ordinary "no commits ahead yet"
+# state, so warning every such run would be noise. Worded per family: the Claude commands self-derive,
+# which can land WIDER than the base that was pinned, so "only uncommitted changes will be reviewed"
+# would be false for half the reviewers.
+if [ -z "$range" ] && [ "$base_pinned" -eq 1 ]; then
+  echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases see UNCOMMITTED changes only, and /code-review + /simplify fall back to self-deriving their own range" >&2
+fi
+
+# Both Claude invocations are built ONCE here (code-review alone runs in three places: initial phase,
+# reconcile cycle, post-security pass), so the scope argument stays attached to its command in one
+# spot instead of four that can drift apart.
+cr_cmd="/code-review $effort --fix${range:+ $range}"
+si_cmd="/simplify${range:+ $range}"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -372,9 +634,9 @@ build_security_prompt() {
   cat <<EOF
 You are running an automated SECURITY FIX pass over the pending changes on this git branch.
 
-SCOPE: review ONLY the code this branch changed — the diff \`git diff $base_short...HEAD\` plus any
-uncommitted changes (base $base_short). Do the same analysis Claude Code's /security-review does:
-find REAL, exploitable security vulnerabilities that these changes introduce. Do not audit or
+SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_diff_ref\` plus any
+uncommitted changes. Do the same analysis Claude Code's /security-review does: find REAL,
+exploitable security vulnerabilities that these changes introduce. Do not audit or
 "improve" pre-existing code you did not touch. Concentrate on:
   - authentication / authorization
   - input validation & injection (SQL, command, path traversal, XSS, SSRF, deserialization)
@@ -495,9 +757,9 @@ ALONGSIDE Claude (which reviews the same diff). Your value is catching what the 
 Review the code THIS branch changed for correctness BUGS and clear, low-risk SIMPLIFICATIONS, and
 APPLY the fixes you are confident about (you can edit files directly).
 
-SCOPE: review ONLY the changes on this branch — the diff \`git diff $base_short...HEAD\` plus any
-uncommitted changes (base $base_short). Do NOT review or "improve" pre-existing code you did not
-touch. Do NOT modify files outside this diff, and never touch logs, state/, notes/, generated
+SCOPE: review ONLY the changes on this branch — the diff \`git diff $scope_diff_ref\` plus any
+uncommitted changes. Do NOT review or "improve" pre-existing code you did not touch. Do NOT modify
+files outside this diff, and never touch logs, state/, notes/, generated
 artifacts, or anything under a gitignored path. Do NOT add dependencies, do NOT reformat or refactor
 unrelated code.
 
@@ -535,13 +797,8 @@ codex_usable() {
   if ! command -v codex >/dev/null 2>&1; then
     CODEX_REASON="codex not found on PATH — degrading to Claude-only"; return 1
   fi
-  # `codex login status` is a fast LOCAL check (no model call). Wrap it in `timeout` when that binary
-  # is available so a wedged probe can't hang, but fall back to a bare call when `timeout` is absent
-  # (e.g. stock macOS) — otherwise `timeout`'s 127 "command not found" would be misread as "not logged
-  # in" and a fully-configured Codex would be silently skipped.
-  local login_probe
-  if command -v timeout >/dev/null 2>&1; then login_probe=(timeout 20 codex login status); else login_probe=(codex login status); fi
-  if ! "${login_probe[@]}" </dev/null >/dev/null 2>&1; then
+  # `codex login status` is a fast LOCAL check (no model call); guard it against wedging.
+  if ! _tmo 20 codex login status </dev/null >/dev/null 2>&1; then
     CODEX_REASON="codex not logged in ('codex login status' failed) — degrading to Claude-only"; return 1
   fi
   CODEX_REASON="codex on (model $codex_model)"; return 0
@@ -563,7 +820,7 @@ run_codex_phase() {
   CODEX_ACTIVE=1
   echo ">>> codex review-and-fix loop: $CODEX_REASON"
 
-  # Build the (static, base_short-only) driver prompt ONCE here and reuse it for every codex round in
+  # Build the (static, scope-only) driver prompt ONCE here and reuse it for every codex round in
   # this phase AND every reconcile recheck, instead of re-forking the heredoc via $(...) each time.
   CODEX_PROMPT="$(build_codex_prompt)"
   CODEX_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-codex.XXXXXX" 2>/dev/null)" \
@@ -617,11 +874,11 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 SEC_CAP=""
 trap 'rm -f "$SEC_CAP" "$CODEX_CAP" 2>/dev/null || true' EXIT
 
-run_fix_phase "code-review" "/code-review $effort --fix" "chore(review): code-review auto-fixes"
+run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
-run_fix_phase "simplify" "/simplify" "chore(review): simplify"
+run_fix_phase "simplify" "$si_cmd" "chore(review): simplify"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
@@ -662,7 +919,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
-      run_fix_phase "code-review (reconcile)" "/code-review $effort --fix" "chore(review): reconcile code-review"
+      run_fix_phase "code-review (reconcile)" "$cr_cmd" "chore(review): reconcile code-review"
       FCR_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCR_CHANGED=1
       c_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"
 
@@ -703,7 +960,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     done
   else
     echo ">>> final code-review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
-    run_fix_phase "code-review (post-security)" "/code-review $effort --fix" "chore(review): post-security code-review"
+    run_fix_phase "code-review (post-security)" "$cr_cmd" "chore(review): post-security code-review"
     FCR_RAN=1; FCR_ROUNDS="$PHASE_ROUNDS"; FCR_CHANGED="$PHASE_CHANGED"; RECONCILE_STATUS="$PHASE_STATUS"
   fi
 else

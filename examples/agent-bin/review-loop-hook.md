@@ -78,6 +78,14 @@ re-run the loop. Options:
 - **Disable:** remove the `Stop` block (or the whole `hooks` key) and restart. Deleting the marker
   file alone does **not** disable the hook — it only re-arms it.
 
+## Review scope (`--base` / `--target`)
+
+Every phase reviews the diff from a single resolved **base**, derived by default (`--target auto`)
+from the open MR/PR of the current branch — see `review-loop --help` for the flags.
+
+Hook-specific: in `--stop-hook` mode the derivation runs **after** the marker check, so a stop that
+is skipped never pays the forge round-trip.
+
 ## Codex — an independent second reviewer (default ON)
 
 review-loop runs an **OpenAI Codex** review-and-fix phase as a genuinely independent second model,
