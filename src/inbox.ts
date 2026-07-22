@@ -201,12 +201,14 @@ export function startInboxPoller(
         // spawn failed (missing bin, fork limit): treat as a fast empty and back off below.
         exitCode = 1;
       }
-      if (stopped) break;
-
       const action = classifyInbox(exitCode, stdout);
       if (action.kind === "messages") {
         fastEmpties = 0;
+        // Push BEFORE honouring stop(): this batch's watermark was already advanced by the
+        // wait-reply that just returned, so a batch dropped here is gone for good (invariant 3).
+        // Whoever stopped us drains the queue afterwards and hands the leftovers back.
         queue.push(action.lines);
+        if (stopped) break;
         if (hooks.isBusy()) {
           try {
             await hooks.onBusyMessage(action.lines);
@@ -216,6 +218,7 @@ export function startInboxPoller(
         }
         continue;
       }
+      if (stopped) break;
 
       // keep-polling (exit 3) or error: guard against a hot spin (wait-reply returning far faster
       // than its ~250s timeout ⇒ misconfig/API error), then refresh idle state and loop. Unlike the

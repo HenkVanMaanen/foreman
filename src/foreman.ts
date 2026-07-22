@@ -50,8 +50,8 @@ async function main(argv: string[]): Promise<number> {
       const which = rest.filter((a) => a !== "--force")[0] ?? "claude";
       // A Map, so an inherited member name (`foreman relogin constructor`) is simply a miss
       // rather than something that resolves off Object.prototype and gets called as a flow.
-      const relogin = RELOGIN_AGENTS.get(which);
-      if (!relogin) {
+      const flow = RELOGIN_AGENTS.get(which);
+      if (!flow) {
         console.error(`usage: foreman relogin [${[...RELOGIN_AGENTS.keys()].join("|")}] [--force]`);
         return 2;
       }
@@ -77,24 +77,31 @@ async function main(argv: string[]): Promise<number> {
       // the loop is NOT running here: `wait-reply --inbox` still has exactly one consumer, which
       // is the invariant that keeps a message from being consumed twice. Stopped in a finally so
       // the poll does not keep the CLI alive after the flow returns.
+      //
+      // Started ONLY for a flow that reads the queue (see ReloginFlow.readsInbox). A poller is
+      // not a passive listener: every line it reads is consumed off the shared watermark, so
+      // running one through codex's self-polling device-auth wait — which never reads the queue
+      // — would swallow up to 16 minutes of the human's messages just to echo them back below.
       const inbox = new InboxQueue();
-      const poller = startInboxPoller(cfg, env, inbox, {
-        // Nothing to auto-ack for: the relay is itself the thing talking to the human, and a
-        // "I'm mid-task" ack on top of "please send me the sign-in code" is just noise.
-        isBusy: () => false,
-        onBusyMessage: () => {},
-      });
+      const poller = flow.readsInbox
+        ? startInboxPoller(cfg, env, inbox, {
+            // Nothing to auto-ack for: the relay is itself the thing talking to the human, and a
+            // "I'm mid-task" ack on top of "please send me the sign-in code" is just noise.
+            isBusy: () => false,
+            onBusyMessage: () => {},
+          })
+        : undefined;
       try {
         // No stall detection here: a human-paced re-login is legitimately slow, and nothing is
         // running that a force-exit could rescue.
-        return (await relogin(cfg, NO_HEARTBEAT, inbox, env, force)) ? 0 : 1;
+        return (await flow.run(cfg, NO_HEARTBEAT, inbox, env, force)) ? 0 : 1;
       } finally {
-        poller.stop();
+        poller?.stop();
         // The poller ADVANCED the shared watermark for every line it read, so whatever is still
-        // buffered here is the last copy in existence (inbox.ts invariant 3). The codex flow
-        // never reads the queue at all — it polls by itself — and even the claude flow leaves
-        // behind anything that landed after its last wait, so exiting without this silently eats
-        // every message the human sent while they were re-authenticating. Hand them back.
+        // buffered here is the last copy in existence (inbox.ts invariant 3): the claude flow
+        // leaves behind anything that landed after its last wait, so exiting without this
+        // silently eats every message the human sent while they were re-authenticating. Hand
+        // them back. (No-op for a flow that never started a poller — nothing was consumed.)
         const leftover = inbox.drain();
         if (leftover.length) {
           await notifyHuman(

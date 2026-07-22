@@ -258,6 +258,9 @@ async function runBounded(
 ): Promise<{ out: string; code: number }> {
   const deadline = Date.now() + CHILD_TIMEOUT_MS;
   const left = () => Math.max(0, deadline - Date.now());
+  // Tracked outside the try so the catch can reap a child that DID start before one of the awaits
+  // below rejected (a stdout stream error, say) — otherwise the 127 return leaves it running.
+  let started: { kill: () => void; exited: Promise<number> } | undefined;
   try {
     const proc = Bun.spawn(cmd, {
       stdin: opts.stdin ?? "ignore",
@@ -267,6 +270,7 @@ async function runBounded(
       stderr: opts.capture ? "ignore" : "inherit",
       env: opts.env,
     });
+    started = proc;
     let out = "";
     if (opts.capture) {
       const text = await withTimeout(new Response(proc.stdout).text(), left());
@@ -286,6 +290,7 @@ async function runBounded(
     return { out, code };
   } catch (e) {
     console.error(`[relogin] ${cmd[0]} could not be run: ${e}`);
+    if (started) await killAndReap(started);
     return { out: "", code: 127 };
   }
 }
@@ -797,14 +802,26 @@ export type Relogin = (
   refresh?: () => void | Promise<void>,
 ) => Promise<boolean>;
 
+export interface ReloginFlow {
+  run: Relogin;
+  /**
+   * Does the flow actually READ the inbox? Only claude relays a code back through it. Recorded
+   * here so `foreman relogin` can skip starting a poller for the flows that do not: a poller is
+   * not passive — every line it reads is taken off the shared watermark (inbox.ts invariant 3),
+   * so running one through codex's 16-minute device-auth wait consumes whatever the human sends
+   * meanwhile only to bounce it straight back with "please re-send".
+   */
+  readsInbox: boolean;
+}
+
 /**
  * The agents this module can re-authenticate, so the `foreman relogin` CLI looks one up instead
  * of hardcoding the set (and its usage string) in the dispatcher. The two flows stay separate
  * functions on purpose: pty + code relay vs self-polling device-auth are genuinely different.
  */
-export const RELOGIN_AGENTS = new Map<string, Relogin>([
-  ["claude", reloginClaude],
-  ["codex", reloginCodex],
+export const RELOGIN_AGENTS = new Map<string, ReloginFlow>([
+  ["claude", { run: reloginClaude, readsInbox: true }],
+  ["codex", { run: reloginCodex, readsInbox: false }],
 ]);
 
 /** What became of a life that ended on auth. Recorded verbatim as the `relogin` event detail. */
