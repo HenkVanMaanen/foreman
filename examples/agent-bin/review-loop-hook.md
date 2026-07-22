@@ -85,17 +85,11 @@ asks `glab`/`gh` for the **open MR/PR of the current branch** and uses the merge
 *target* branch, so the review scope equals the MR — including for a branch stacked on another
 not-yet-merged branch, where the merge-base with `origin/main` would drag the parent's commits in.
 
-- `--base REF` — use `REF` verbatim; wins over `--target`, no merge-base computed.
-- `--target REF` — merge-base with `REF` (prefers any `<remote>/REF` over a local `REF`). Errors —
-  never falls back — if `REF` does not resolve or shares no history with `HEAD`.
-- `--target auto` — *(default)* derive it from the open MR/PR; any failure (no CLI, no MR, detached
-  HEAD, auth/network error) falls back to the merge-base with `origin/main`, silently except for a
-  stderr note when a target branch *was* derived but turned out to be unusable (not fetched locally,
-  or unrelated history).
-- `--target none` — skip derivation; go straight to the `origin/main` fallback.
+For the per-flag semantics of `--base` / `--target`, see `review-loop --help` — the single copy, so
+this doc cannot drift from what the script does.
 
-In `--stop-hook` mode the derivation runs **after** the marker check, so a stop that is skipped never
-pays the forge round-trip.
+Hook-specific: in `--stop-hook` mode the derivation runs **after** the marker check, so a stop that is
+skipped never pays the forge round-trip.
 
 ## Codex — an independent second reviewer (default ON)
 

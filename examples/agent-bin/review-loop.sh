@@ -334,16 +334,19 @@ detect_target_branch() {
   return 1
 }
 
-# One place for "the target was unusable": --target auto is best-effort, so it warns and lets the
-# historical default take over; an explicit --target must fail LOUDLY instead, because the fallback
-# chain ends at `rev-parse HEAD`, which yields an EMPTY diff — every phase would then review nothing
-# and the run would report CLEAN having checked zero lines.
+# A resolved ref in its short display form (origin/main, main) — the full refs/ path exists only to
+# keep resolution unambiguous, and reads as noise in a log line.
+_short_ref() { local r="${1#refs/remotes/}"; printf '%s' "${r#refs/heads/}"; }
+
+# One place for "the target was unusable": a DERIVED target (--target auto) is best-effort, so it
+# warns and lets the historical default take over; an explicit --target must fail LOUDLY instead,
+# because the fallback chain ends at `rev-parse HEAD`, which yields an EMPTY diff — every phase would
+# then review nothing and the run would report CLEAN having checked zero lines. Which of the two it
+# is comes from $target_strict, decided ONCE beside $target_branch/$target_src below, so a later call
+# site cannot re-read the raw --target string and disagree.
 _target_giveup() {
-  if [ "$target" = "auto" ]; then
-    echo "$prog: $1 — falling back to the default base" >&2
-  else
-    die_usage "$1 (--target '$target'); pass --base REF explicitly"
-  fi
+  [ "$target_strict" -eq 1 ] && die_usage "$1 (--target '$target'); pass --base REF explicitly"
+  echo "$prog: $1 — falling back to the default base" >&2
 }
 
 if [ -z "$base" ] && [ "$target" != "none" ]; then
@@ -351,25 +354,19 @@ if [ -z "$base" ] && [ "$target" != "none" ]; then
   # at all, and calling that "the MR/PR target branch" sends someone debugging a wrong scope looking
   # for an MR that does not exist.
   if [ "$target" = "auto" ]; then
-    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"
+    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"; target_strict=0
   else
-    target_branch="$target";                         target_src="--target"
+    target_branch="$target";                         target_src="--target";                target_strict=1
   fi
   # An empty $target_branch means --target auto found no MR context (detect_target_branch already
   # knows every reason) — nothing to resolve, so the historical default below takes over.
   if [ -n "$target_branch" ]; then
     if ! target_ref="$(resolve_branch_ref "$target_branch")"; then
       _target_giveup "target branch '$target_branch' does not resolve locally — tried <remote>/$target_branch for every remote, local $target_branch, and $target_branch as a remote-qualified ref (try 'git fetch')"
+    elif base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"; [ -n "$base" ]; then
+      echo "$prog: scoping the review to $target_src $(_short_ref "$target_ref")"
     else
-      # Display the short form (origin/main, main) — the full refs/ path is only there to keep
-      # resolution unambiguous, and reads as noise in a log line.
-      target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
-      base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
-      if [ -n "$base" ]; then
-        echo "$prog: scoping the review to $target_src $target_disp"
-      else
-        _target_giveup "no merge-base between HEAD and $target_disp — unrelated histories"
-      fi
+      _target_giveup "no merge-base between HEAD and $(_short_ref "$target_ref") — unrelated histories"
     fi
   fi
 fi
