@@ -75,10 +75,15 @@ async function runRelogin(cfg: Config, rest: string[]): Promise<number> {
   // a rehearsal rather than a no-op. Off by default: for codex it would clear a WORKING
   // ~/.codex/auth.json the moment device-auth starts.
   const force = rest.includes("--force");
-  const which = rest.filter((a) => a !== "--force")[0] ?? "claude";
+  // Every argument is accounted for. A typo'd flag must not be silently ignored: `relogin claude
+  // --forse` would otherwise run WITHOUT force, hit the "already logged in?" guard, and exit 0
+  // having done nothing — which reads as "the rehearsal passed".
+  const agents = rest.filter((a) => !a.startsWith("-"));
+  const unknown = rest.filter((a) => a.startsWith("-") && a !== "--force");
+  const which = agents[0] ?? "claude";
   // A Map, so an inherited member name (`foreman relogin constructor`) is simply a miss
   // rather than something that resolves off Object.prototype and gets called as a flow.
-  const flow = RELOGIN_AGENTS.get(which);
+  const flow = agents.length > 1 || unknown.length ? undefined : RELOGIN_AGENTS.get(which);
   if (!flow) {
     console.error(`usage: foreman relogin [${[...RELOGIN_AGENTS.keys()].join("|")}] [--force]`);
     return 2;

@@ -132,6 +132,14 @@ export class InboxQueue {
    */
   take(timeoutMs: number): Promise<string[]> {
     if (this.buf.length) return Promise.resolve(this.drain());
+    // ONE waiter, enforced rather than merely documented. Two readers now exist (the parked
+    // idle-wait and the re-login relay), and they are kept apart by control flow alone. Were that
+    // ever to slip, a second take() would overwrite the first's resolver: the loser would hang to
+    // its own timeout while the winner took its lines — and since a line off this queue is gone
+    // from the shared watermark (invariant 3), those lines have no other copy. Every caller
+    // already degrades a throw to a safe fallback, so failing loudly here is strictly better than
+    // losing the human's messages silently.
+    if (this.waiter) return Promise.reject(new Error("InboxQueue: a reader is already waiting"));
     return new Promise<string[]>((resolve) => {
       const timer = setTimeout(() => {
         this.waiter = null;
@@ -295,14 +303,13 @@ export function inboxMsgText(line: string): string {
  * rule lives in one place.
  */
 export function takeAnswer(lines: string[]): { text: string | undefined; rest: string[] } {
-  const msgText = inboxMsgText;
   // A blank-texted MSG line is NOT an answer, so it is skipped here and stays in `rest` like any
   // other spare. Skipped rather than merely rejected after the fact: a blank line arriving in the
   // SAME batch after a real one (the human sends the code, then a whitespace-only follow-up) must
   // not hide the code — the batch still carries an answer, and dropping it would burn an attempt
   // and echo the live code back to the human instead of pasting it in.
-  const i = lines.findLastIndex((l) => msgText(l) !== "");
-  const text = i === -1 ? undefined : msgText(lines[i] as string);
+  const i = lines.findLastIndex((l) => inboxMsgText(l) !== "");
+  const text = i === -1 ? undefined : inboxMsgText(lines[i] as string);
   return { text, rest: text === undefined ? [...lines] : lines.filter((_, n) => n !== i) };
 }
 

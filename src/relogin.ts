@@ -417,7 +417,13 @@ async function awaitSliced<T>(
       console.error(`[relogin] status refresh failed: ${e}`);
     }
   }
-  return undefined;
+  // Claim a value that settled AFTER the last slice's withTimeout gave up — during watchdog.touch()
+  // or the onTick above — instead of reporting it as a timeout. A settled promise always wins a
+  // race against a 0ms timer (microtask before macrotask), so this can never extend the wait. It
+  // matters most for `claude auth login`: a login that exits inside that window would otherwise be
+  // read as "did not exit", and on a CLI whose `auth status` gives no verdict that undefined is
+  // taken as failure — burning attempts asking the human to re-paste a code that already worked.
+  return await withTimeout(p, 0);
 }
 
 /**
@@ -643,13 +649,17 @@ export async function reloginClaude(
         spare.push(...rest);
         if (!code) textlessWakes++;
       }
-      // The OTHER way out of the loop: nothing but reaction-acks. (The deadline never surfaces
-      // here — waitForInboxLines() THROWS on it, naming itself, so the loop cannot fall out that
-      // way. The `Date.now() < deadline` guard above is belt-and-braces.) Named rather than
-      // reported as a bare "no code", because it calls for a different response from whoever
-      // reads the log after a lockout: stop replying with a bare 👍.
+      // The two OTHER ways out of the loop, named apart because they call for different responses
+      // from whoever reads the log after a lockout: "stop replying with a bare 👍" versus "you
+      // never answered". A text-less wake consumes real time, so an attempt can hit BOTH counters
+      // — report whichever actually ended the loop rather than always blaming the reaction-acks.
       if (!code) {
-        throw new Error(`${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`);
+        throw new Error(
+          Date.now() >= deadline
+            ? `no code from the human within ${Math.round(HUMAN_TIMEOUT_MS / 60_000)} min` +
+                `${textlessWakes ? ` (${textlessWakes} text-less wake(s) meanwhile)` : ""}`
+            : `${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`,
+        );
       }
 
       tried.add(code); // never echo it back — see `tried`
