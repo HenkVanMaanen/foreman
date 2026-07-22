@@ -90,7 +90,8 @@
 #                  and/or the security OR codex phase needs a human (ESCALATE): it could not converge
 #                  within the cap OR it found a finding it judged too risky to auto-fix (flagged with
 #                  WHY). WHY is printed.
-#   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found).
+#   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never in
+#                  --stop-hook mode: a blocking code there would wedge the session (see below).
 #
 # In --stop-hook mode the process still runs the loop once (guarded by a marker file so a
 # re-firing Stop hook cannot recurse), but ALWAYS exits 0 so the session is allowed to end; the
@@ -125,6 +126,9 @@ branch_re='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
 # Run "$@" under `timeout SECS`, or BARE when coreutils `timeout` is missing (stock macOS ships
 # none, and there `timeout`'s own 127 "command not found" would be misread as the guarded command
 # failing — a wedged forge lookup, a logged-out codex). Shared by every hang-guard below.
+# NOTE the bare branch is genuinely unguarded: on such a box a wedged call blocks until it returns.
+# Accepted deliberately — a false "not logged in" / "no MR" on every macOS run is the worse failure,
+# and both guarded calls are local-ish and made at most once per run.
 _tmo() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
 
 usage() {
@@ -162,7 +166,18 @@ Exit: 0 CLEAN | 3 NOT-CLEAN (cap hit / review failed / security or codex can't c
 EOF
 }
 
-die_usage() { echo "$prog: $1" >&2; echo >&2; usage >&2; exit 2; }
+# Exit 2 (usage/precondition) — EXCEPT under --stop-hook, where a non-zero exit is how a Stop hook
+# BLOCKS the session from ending (and 2 specifically feeds stderr back to the model as instructions).
+# A bad flag or an unresolvable --target would then wedge the very session the marker guard exists to
+# let finish, and the marker is already written by then, so it cannot un-wedge it either. The message
+# is still printed in full; only the CODE is softened — same invariant as the always-exit-0 tail.
+# (Reads $stop_hook, initialized to 0 above, so an error raised before --stop-hook is parsed still
+# exits 2 — put --stop-hook first in the hook command, as review-loop-hook.md's snippet does.)
+die_usage() {
+  echo "$prog: $1" >&2; echo >&2; usage >&2
+  [ "$stop_hook" -eq 1 ] && exit 0
+  exit 2
+}
 
 # --- arg parsing ------------------------------------------------------------------------------
 while [ "$#" -gt 0 ]; do
@@ -213,7 +228,7 @@ git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is no
 # hook's stdin JSON when present, as a second belt.
 #
 # This runs BEFORE base/target resolution on purpose: --target auto shells out to gh/glab, which is
-# a network round-trip (up to the 10s timeout, twice) — paying that on every Stop fire just to hit
+# a network round-trip (~10s worst case, twice) — paying that on every Stop fire just to hit
 # the marker and exit would stall the end of every single session.
 state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
 marker="$state_dir/.review-loop-ran"
@@ -277,7 +292,8 @@ _json_str_field() {
 # Best-effort: the target branch of the OPEN MR/PR for the checked-out branch, via glab or gh.
 # Echoes the branch NAME; returns 1 when there is no MR context (detached HEAD, no CLI, no open
 # MR/PR, auth/network failure, junk output) so the caller can fall back cleanly. Every invocation is
-# stdin-closed and `timeout`-wrapped where available, so it can never hang the loop.
+# stdin-closed and `timeout`-wrapped where `timeout` exists (see _tmo — without it a wedged CLI can
+# still block), and at most two CLIs are asked — the second only if the first outright failed.
 detect_target_branch() {
   local branch remote_url host out=""
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
@@ -356,7 +372,7 @@ if [ -z "$base" ] && [ "$target" != "none" ]; then
   if [ "$target" = "auto" ]; then
     target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"; target_strict=0
   else
-    target_branch="$target";                         target_src="--target";                target_strict=1
+    target_branch="$target";                         target_src="the --target branch";     target_strict=1
   fi
   # An empty $target_branch means --target auto found no MR context (detect_target_branch already
   # knows every reason) — nothing to resolve, so the historical default below takes over.
@@ -390,9 +406,10 @@ base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base
 #
 # For the CLAUDE phases specifically: left to themselves, /code-review and /simplify derive their own
 # range (`git diff @{upstream}...HEAD`, else `main...HEAD`). Both take a <target> argument, so hand
-# them the resolved range THERE. Keep it a BARE ref range and nothing else: that is a target form they build the diff command
-# from directly, whereas any added prose turns the whole argument into a free-form instruction that
-# only softly narrows the range they derived anyway. Both already fold in uncommitted changes.
+# them the resolved range THERE. Keep it a BARE ref range and nothing else: that is a target form
+# they build the diff command from directly, whereas any added prose turns the whole argument into a
+# free-form instruction that only softly narrows the range they derived anyway. Both already fold in
+# uncommitted changes.
 scope_range="$base_short...HEAD"
 
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
@@ -562,8 +579,8 @@ build_security_prompt() {
 You are running an automated SECURITY FIX pass over the pending changes on this git branch.
 
 SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_range\` plus any
-uncommitted changes. Do the same analysis Claude Code's /security-review does:
-find REAL, exploitable security vulnerabilities that these changes introduce. Do not audit or
+uncommitted changes. Do the same analysis Claude Code's /security-review does: find REAL,
+exploitable security vulnerabilities that these changes introduce. Do not audit or
 "improve" pre-existing code you did not touch. Concentrate on:
   - authentication / authorization
   - input validation & injection (SQL, command, path traversal, XSS, SSRF, deserialization)
@@ -685,8 +702,8 @@ Review the code THIS branch changed for correctness BUGS and clear, low-risk SIM
 APPLY the fixes you are confident about (you can edit files directly).
 
 SCOPE: review ONLY the changes on this branch — the diff \`git diff $scope_range\` plus any
-uncommitted changes. Do NOT review or "improve" pre-existing code you did not
-touch. Do NOT modify files outside this diff, and never touch logs, state/, notes/, generated
+uncommitted changes. Do NOT review or "improve" pre-existing code you did not touch. Do NOT modify
+files outside this diff, and never touch logs, state/, notes/, generated
 artifacts, or anything under a gitignored path. Do NOT add dependencies, do NOT reformat or refactor
 unrelated code.
 
