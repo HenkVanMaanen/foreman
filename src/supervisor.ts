@@ -322,7 +322,7 @@ export async function supervise(cfg: Config): Promise<void> {
       // pushes after the drain has nothing left to read it — the process exits and the watermark
       // has already moved past those lines (invariant 3).
       watchdog.stop();
-      poller.stop();
+      await poller.stop();
       // We are about to exit, so this in-memory copy is the last one: the watermark moved past
       // these lines when the poller read them, and no future life will ever see them. The relay
       // hands back its own consumed-but-unused lines the same way; these are the ones it never
@@ -355,7 +355,7 @@ export async function supervise(cfg: Config): Promise<void> {
     // clean return so neither's async work outlives the loop (belt-and-suspenders alongside the
     // process.exit path — the timer is unref()ed, but tidy shutdown shouldn't rely on that).
     watchdog.stop();
-    poller.stop();
+    await poller.stop();
     console.log("[supervisor] agent process ended; exiting for keeper to respawn");
     await recordEvent(cfg, { who: "supervisor", kind: "exit", detail: `life #${life}` });
     return;

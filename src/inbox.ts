@@ -146,7 +146,15 @@ export class InboxQueue {
 }
 
 export interface InboxPoller {
-  stop(): void;
+  /**
+   * Stop polling and resolve once the loop has actually exited. Awaitable, and it kills the
+   * in-flight `wait-reply`, because a bare flag is not enough to satisfy invariant 3: that child
+   * has already advanced the watermark for whatever it is about to print, so a caller that drains
+   * the queue and exits while it is still running loses that batch for good. Killing it collapses
+   * the window to the child's own read-then-advance, and awaiting the loop guarantees anything it
+   * did manage to return is in the queue before the caller's final drain.
+   */
+  stop(): Promise<void>;
 }
 
 export interface PollerHooks {
@@ -182,7 +190,9 @@ export function startInboxPoller(
   };
 
   let stopped = false;
-  (async () => {
+  // The `wait-reply` currently running, so stop() can end it rather than wait out its ~250s poll.
+  let inflight: { kill: () => void } | undefined;
+  const loop = (async () => {
     let fastEmpties = 0;
     while (!stopped) {
       const started = Date.now();
@@ -195,8 +205,11 @@ export function startInboxPoller(
           stderr: "inherit",
           env: childEnv,
         });
+        inflight = proc;
+        if (stopped) proc.kill(); // stop() landed between the flag check and the spawn
         stdout = await new Response(proc.stdout).text();
         exitCode = await proc.exited;
+        inflight = undefined;
       } catch {
         // spawn failed (missing bin, fork limit): treat as a fast empty and back off below.
         exitCode = 1;
@@ -239,13 +252,31 @@ export function startInboxPoller(
         }
       }
     }
-  })();
+    // A kill mid-poll leaves the child un-reaped if we bailed out before awaiting it.
+    inflight = undefined;
+    // Never rejects in practice (every await inside is guarded), but stop() awaits this and must
+    // not turn a poller bug into an unhandled rejection on the caller's shutdown path.
+  })().catch((e) => console.error(`[inbox] poller loop ended abnormally: ${e}`));
 
   return {
-    stop() {
+    async stop() {
       stopped = true;
+      inflight?.kill();
+      await loop;
     },
   };
+}
+
+/**
+ * The text of a `MSG <id> <root_or_-> <text…>` line — everything after the third space — or "" for
+ * a line that carries none (an `ACK` reaction-ack, a blank-texted `MSG`).
+ *
+ * Exported because takeAnswer() is not the only caller that has to reason about a line's text: the
+ * re-login relay filters the sign-in code it already pasted out of the lines it hands back, and
+ * that filter has to match on exactly what takeAnswer() selected by. One rule, one place.
+ */
+export function inboxMsgText(line: string): string {
+  return line.startsWith("MSG ") ? line.split(" ").slice(3).join(" ").trim() : "";
 }
 
 /**
@@ -264,9 +295,7 @@ export function startInboxPoller(
  * rule lives in one place.
  */
 export function takeAnswer(lines: string[]): { text: string | undefined; rest: string[] } {
-  // MSG <id> <root_or_-> <text…>  — the text is everything after the third space.
-  const msgText = (l: string) =>
-    l.startsWith("MSG ") ? l.split(" ").slice(3).join(" ").trim() : "";
+  const msgText = inboxMsgText;
   // A blank-texted MSG line is NOT an answer, so it is skipped here and stays in `rest` like any
   // other spare. Skipped rather than merely rejected after the fact: a blank line arriving in the
   // SAME batch after a real one (the human sends the code, then a whitespace-only follow-up) must

@@ -19,7 +19,7 @@
 // See notes/tasks/telegram-login-relay.md for the captured observable signals this matches on.
 
 import type { Config } from "./config.ts";
-import { type InboxQueue, takeAnswer, waitForInboxLines } from "./inbox.ts";
+import { type InboxQueue, inboxMsgText, takeAnswer, waitForInboxLines } from "./inbox.ts";
 import type { StreamEvent } from "./protocol.ts";
 import type { Heartbeat } from "./watchdog.ts";
 import { binPath, harnessChildEnv } from "./workspace.ts";
@@ -565,12 +565,21 @@ export async function reloginClaude(
   // everything it had consumed on the floor with nothing echoed to anyone.
   const spare: string[] = [];
   /**
+   * Every reply already pasted into a login prompt as a sign-in code. An OAuth authorization code
+   * must never be quoted back into the channel's permanent history (see the failed-verification
+   * notice below) — but takeAnswer() removes only the ONE line it selected, so a human who sends
+   * the code twice, or sends it and then a follow-up that lands in the same poller batch, leaves a
+   * second copy of it sitting in `spare` for the hand-back to publish. Filtered by TEXT, using
+   * inbox.ts's own rule, so the check matches exactly what takeAnswer() selected.
+   */
+  const tried = new Set<string>();
+  /**
    * Hand back everything consumed-but-unused so far, appended to `lead`. splice() so each line is
    * echoed exactly once no matter which of the three exits gets here first. Best-effort delivery:
    * every caller is on a path where a failed notify must not change the outcome.
    */
   const handBackSpare = async (lead: string, trailer: string) => {
-    const consumed = spare.splice(0);
+    const consumed = spare.splice(0).filter((l) => !tried.has(inboxMsgText(l)));
     await notifyQuietly(
       childEnv,
       lead + (consumed.length ? `${trailer}\n${consumed.join("\n")}` : ""),
@@ -643,6 +652,7 @@ export async function reloginClaude(
         throw new Error(`${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`);
       }
 
+      tried.add(code); // never echo it back — see `tried`
       proc.stdin.write(`${code}\n`);
       await proc.stdin.flush();
       // Bounded because a WRONG code makes the CLI re-prompt instead of exiting: unbounded, the
