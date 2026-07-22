@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
-import { classifyInbox, formatInboxPrompt } from "../src/inbox.ts";
+import { classifyInbox, extractInboxLines, formatInboxPrompt, InboxQueue } from "../src/inbox.ts";
 import { usageTotal, userMessage } from "../src/protocol.ts";
 import { secretFileName } from "../src/secrets.ts";
 import { isStalled, startWatchdog } from "../src/watchdog.ts";
@@ -274,5 +274,63 @@ describe("formatInboxPrompt", () => {
     expect(p.startsWith("[inbox] New message(s)")).toBe(true);
     expect(p).toContain("MSG x - yo");
     expect(p).toContain("new root");
+  });
+});
+
+describe("extractInboxLines", () => {
+  test("keeps only MSG/ACK lines and trims trailing whitespace", () => {
+    expect(extractInboxLines("noise\nMSG p1 - hi  \nwait-reply: done\nACK p2 - +1")).toEqual([
+      "MSG p1 - hi",
+      "ACK p2 - +1",
+    ]);
+  });
+  test("returns [] when nothing recognized", () => {
+    expect(extractInboxLines("")).toEqual([]);
+    expect(extractInboxLines("just chatter\n")).toEqual([]);
+  });
+});
+
+describe("InboxQueue", () => {
+  test("drain returns and clears buffered lines", () => {
+    const q = new InboxQueue();
+    q.push(["MSG a - 1", "MSG b - 2"]);
+    expect(q.size()).toBe(2);
+    expect(q.drain()).toEqual(["MSG a - 1", "MSG b - 2"]);
+    expect(q.size()).toBe(0);
+    expect(q.drain()).toEqual([]);
+  });
+
+  test("push([]) is a no-op", () => {
+    const q = new InboxQueue();
+    q.push([]);
+    expect(q.size()).toBe(0);
+  });
+
+  test("take resolves immediately when lines are already buffered", async () => {
+    const q = new InboxQueue();
+    q.push(["MSG a - 1"]);
+    expect(await q.take(10_000)).toEqual(["MSG a - 1"]);
+    expect(q.size()).toBe(0);
+  });
+
+  test("a batch push delivers all its lines to a blocked waiter at once", async () => {
+    const q = new InboxQueue();
+    const p = q.take(10_000);
+    q.push(["MSG a - 1", "MSG b - 2"]);
+    expect(await p).toEqual(["MSG a - 1", "MSG b - 2"]);
+  });
+
+  test("a push after the waiter resolved is buffered, not lost", async () => {
+    const q = new InboxQueue();
+    const p = q.take(10_000);
+    q.push(["MSG a - 1"]); // resolves the pending waiter
+    q.push(["MSG b - 2"]); // no waiter now → stays buffered for the next take
+    expect(await p).toEqual(["MSG a - 1"]);
+    expect(await q.take(10_000)).toEqual(["MSG b - 2"]);
+  });
+
+  test("take returns [] on timeout with nothing pending", async () => {
+    const q = new InboxQueue();
+    expect(await q.take(5)).toEqual([]);
   });
 });

@@ -66,6 +66,35 @@ timed_out() { [ "$deadline" != 0 ] && [ "$(date +%s)" -ge "$deadline" ]; }
 wm_dir="${FOREMAN_STATE_DIR:-$HOME/.foreman}/wait-reply"
 mkdir -p "$wm_dir" 2>/dev/null || true
 
+# --- getUpdates single-consumer coordination -------------------------------------------------
+# Telegram allows only ONE getUpdates long-poll at a time, and single-thread vs inbox mode keep
+# SEPARATE offset bookkeeping — so if both poll at once they 409 and, worse, one confirms/consumes
+# updates the other never sees. The supervisor now runs an ALWAYS-ON inbox poller, so a single-
+# thread wait (an explicit ask-human) would otherwise race it. Serialize with a sentinel: single-
+# thread mode claims it (stamped with this PID); inbox mode yields — returning keep-polling without
+# touching getUpdates — while a LIVE claimer holds it, handing the channel to the waiter. Stamping
+# the PID makes a stale sentinel (owner SIGKILLed before its EXIT trap ran) self-healing rather than
+# deadlocking the inbox forever. auth_hdr (Mattermost) is cleaned up by the same trap.
+single_active="$wm_dir/.single-active"
+single_owner=""
+auth_hdr=""
+_cleanup() {
+  [ -n "$single_owner" ] && rm -f "$single_active" 2>/dev/null || true
+  [ -n "$auth_hdr" ] && rm -f "$auth_hdr" 2>/dev/null || true
+}
+trap _cleanup EXIT
+if [ "$mode" = "single" ]; then single_owner=1; printf '%s' "$$" > "$single_active" 2>/dev/null || true; fi
+
+# True while a LIVE single-thread wait holds the sentinel; clears a stale one (dead owner) so the
+# inbox never yields forever to a claimer that crashed.
+single_thread_active() {
+  [ -e "$single_active" ] || return 1
+  local sp; sp="$(cat "$single_active" 2>/dev/null || echo)"
+  if [ -n "$sp" ] && kill -0 "$sp" 2>/dev/null; then return 0; fi
+  rm -f "$single_active" 2>/dev/null || true
+  return 1
+}
+
 # --- Mattermost ---
 if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
   api="${MATTERMOST_BASE_URL%/}/api/v4"
@@ -74,7 +103,8 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
   # with -H @file. Cleaned up on exit. (curl >= 7.55 for -H @file.)
   auth_hdr="$(mktemp "${TMPDIR:-/tmp}/mm-auth.XXXXXX")"
   chmod 600 "$auth_hdr"
-  trap 'rm -f "$auth_hdr"' EXIT
+  # Cleanup is handled by the _cleanup EXIT trap set above (which also clears the single-active
+  # sentinel); a second `trap … EXIT` here would clobber it and leak the sentinel.
   printf 'Authorization: Bearer %s\n' "$MATTERMOST_BOT_TOKEN" > "$auth_hdr"
   mm=(-fsS -H @"$auth_hdr" -H "Content-Type: application/json")
   # Setup calls are guarded (|| true) so a transient Mattermost failure degrades to the next
@@ -309,6 +339,13 @@ EOF
       echo "wait-reply: WARNING TELEGRAM_CHAT_ID unset -> inbox fails closed, no messages will be surfaced" >&2
     fi
     while true; do
+      # Yield getUpdates to any LIVE single-thread waiter (ask-human) rather than racing it — see
+      # the single-consumer note near the top. We back off briefly and honor our own timeout so the
+      # supervisor's poll cycles instead of spinning.
+      if single_thread_active; then
+        timed_out && { echo "wait-reply: inbox timed out (nothing new)" >&2; exit 3; }
+        sleep 1; continue
+      fi
       resp="$(curl -fsS -K - <<EOF
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}"
 EOF
