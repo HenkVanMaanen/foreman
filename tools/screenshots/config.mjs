@@ -9,6 +9,12 @@ import { fileURLToPath } from 'node:url';
 export const BASE = process.env.CONSULTATIE_BASE
   || 'https://consultatie-feat-beheerder-workspace.simulatie.datastelsel.nl';
 
+// The one werkbank route and the one seeded-fixture link text every walk script navigates through.
+// Both were copy-pasted into each script, so a route change or a fixture rename broke all of them at
+// once and each needed its own edit — they live here so that is a one-line change.
+export const WERKBANK = '/beheer/werkbank/voorbeeld';
+export const REACTIE_LINK = 'Het federatief datastelsel verbindt';
+
 // Default to <repo>/state — the SAME default review-loop.sh uses ($dir/state) — resolved from this
 // file's own location, not a hardcoded /home/dev path: a one-machine absolute default is exactly
 // what this module was created to remove, and on any other box (CI, container, another dev) it

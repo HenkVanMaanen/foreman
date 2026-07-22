@@ -58,15 +58,13 @@
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
 #
-# Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, effort=high, codex=on,
-#           codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch when one
-#           can be derived, else with origin/main (falls back to HEAD if unavailable).
+# Defaults and per-flag semantics: `--help` (usage() below) — the single copy, so they cannot drift
+# from what the script actually does.
 #
 # WHY --base / --target exist: a review should cover exactly what the MR/PR changes — no more. The
 # diff base therefore has to be the merge-base with the branch this work MERGES INTO, not with
 # origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
 # origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
-# The flag semantics live in `usage()` below (`--help`) and in review-loop-hook.md — not here too.
 # Historical default (the fallback): merge-base of HEAD with origin/main, else origin/HEAD, else HEAD.
 #
 # --codex / --no-codex:
@@ -393,10 +391,9 @@ base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base
 # as the <target> argument of the Claude slash commands, and inside the security/codex driver prompts
 # (`git diff $scope_range`). One variable so the range can never drift between the four reviewers.
 #
-# For the CLAUDE phases specifically: left to themselves, /code-review and /simplify derive the range
-# (`git diff @{upstream}...HEAD`, else `main...HEAD`) — exactly the over-scoping the --base/--target
-# resolution above exists to fix. Both take a <target> argument, so hand them the resolved range
-# THERE. Keep it a BARE ref range and nothing else: that is a target form they build the diff command
+# For the CLAUDE phases specifically: left to themselves, /code-review and /simplify derive their own
+# range (`git diff @{upstream}...HEAD`, else `main...HEAD`). Both take a <target> argument, so hand
+# them the resolved range THERE. Keep it a BARE ref range and nothing else: that is a target form they build the diff command
 # from directly, whereas any added prose turns the whole argument into a free-form instruction that
 # only softly narrows the range they derived anyway. Both already fold in uncommitted changes.
 scope_range="$base_short...HEAD"
@@ -568,7 +565,7 @@ build_security_prompt() {
 You are running an automated SECURITY FIX pass over the pending changes on this git branch.
 
 SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_range\` plus any
-uncommitted changes (base $base_short). Do the same analysis Claude Code's /security-review does:
+uncommitted changes. Do the same analysis Claude Code's /security-review does:
 find REAL, exploitable security vulnerabilities that these changes introduce. Do not audit or
 "improve" pre-existing code you did not touch. Concentrate on:
   - authentication / authorization
@@ -691,7 +688,7 @@ Review the code THIS branch changed for correctness BUGS and clear, low-risk SIM
 APPLY the fixes you are confident about (you can edit files directly).
 
 SCOPE: review ONLY the changes on this branch — the diff \`git diff $scope_range\` plus any
-uncommitted changes (base $base_short). Do NOT review or "improve" pre-existing code you did not
+uncommitted changes. Do NOT review or "improve" pre-existing code you did not
 touch. Do NOT modify files outside this diff, and never touch logs, state/, notes/, generated
 artifacts, or anything under a gitignored path. Do NOT add dependencies, do NOT reformat or refactor
 unrelated code.
@@ -753,7 +750,7 @@ run_codex_phase() {
   CODEX_ACTIVE=1
   echo ">>> codex review-and-fix loop: $CODEX_REASON"
 
-  # Build the (static, base_short-only) driver prompt ONCE here and reuse it for every codex round in
+  # Build the (static, scope_range-only) driver prompt ONCE here and reuse it for every codex round in
   # this phase AND every reconcile recheck, instead of re-forking the heredoc via $(...) each time.
   CODEX_PROMPT="$(build_codex_prompt)"
   CODEX_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-codex.XXXXXX" 2>/dev/null)" \
