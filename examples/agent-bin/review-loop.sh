@@ -281,9 +281,16 @@ resolve_branch_ref() {
   return 1
 }
 
-# Extract the first "key": "value" string field from JSON on stdin. Enough for the single flat field
-# we need, and avoids requiring jq (which glab/gh users do not necessarily have).
+# Extract a top-level "key": "value" string field from JSON on stdin (both forges answer with a
+# one-element ARRAY, so unwrap that first). `jq` when available — the rest of examples/agent-bin
+# already depends on it — because it reads the field STRUCTURALLY: the grep fallback below takes the
+# first textual match anywhere in the payload, so any future/nested occurrence of the same key wins
+# over the real one. The fallback stays because jq is not a hard requirement of this script.
 _json_str_field() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "$1" 'if type == "array" then .[0] else . end | .[$k]? // empty' 2>/dev/null
+    return
+  fi
   # `grep -o` puts each match on its own line, so `q` after the substitution takes the first one.
   grep -aoE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
     | sed -E 's/.*:[[:space:]]*"([^"]*)"[[:space:]]*$/\1/;q'
