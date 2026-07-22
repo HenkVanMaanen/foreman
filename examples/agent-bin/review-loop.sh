@@ -152,11 +152,14 @@ Usage:
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
 
-Scope: --base REF uses REF verbatim as the diff base (wins over --target). --target REF diffs from
-the merge-base with the branch this work merges INTO, so the review scope equals the MR/PR even for
-a branch stacked on another unmerged branch. --target auto (default) derives that branch from the
-open MR/PR via glab/gh, falling back to the merge-base with origin/main (a stderr note when a
-branch was derived but is unusable). --target none skips derivation.
+Scope: --base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
+commit or it is a usage error. --target REF diffs from the merge-base with the branch this work
+merges INTO, so the review scope equals the MR/PR even for a branch stacked on another unmerged
+branch; an explicit REF that does not resolve locally (try `git fetch`) or shares no history with
+HEAD is likewise a usage error, NOT a silent fallback. --target auto (default) derives that branch
+from the open MR/PR via glab/gh and IS best-effort: it falls back to the merge-base with origin/main
+(with a stderr note when a branch was derived but turned out unusable). --target none skips
+derivation.
 
 Phases run in order, each capped at --max-rounds and committing per round:
   1. /code-review <effort> --fix loop   (fix correctness)
@@ -283,8 +286,11 @@ resolve_branch_ref() {
   # Precedence: origin/<b> > <other-remote>/<b> > local <b> > <b> already remote-qualified. Every
   # remote-tracking copy outranks the local branch, because a stale local branch merge-bases BELOW
   # the real target — re-introducing the over-scoping this resolution exists to prevent. Non-origin
-  # remotes are enumerated for fork checkouts (origin=fork, upstream=canonical) and repos with no
-  # `origin`; the already-qualified form is tried LAST so `--target origin/main` still works.
+  # remotes are enumerated as a FALLBACK for repos where origin does not carry the branch (no
+  # `origin` at all, or a fork checkout whose upstream base branch was never mirrored into the fork);
+  # note they are only reached THEN — on a fork that does mirror the branch, the fork's own copy
+  # wins, so pass `--target upstream/<b>` explicitly when the canonical remote must be used. The
+  # already-qualified form is tried LAST so `--target origin/main` still works.
   local cands=("remotes/origin/$b")
   while IFS= read -r r; do
     [ "$r" != "origin" ] && cands+=("remotes/$r/$b")
@@ -423,9 +429,16 @@ if [ -z "$base" ]; then
         || git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
 fi
 [ -n "$base" ] || die_usage "could not resolve a base ref (pass --base REF)"
+# ...and it must NAME a commit. --base is used VERBATIM, so a typo or a deleted branch survives to
+# here and would flow into every reviewer as `git diff <junk>...HEAD` — a command all four of them
+# fail to run, while the security-auto heuristic's `git diff --name-only <junk> HEAD` comes back
+# empty and skips the phase: the whole run then reports CLEAN having read zero lines. Resolve ONCE,
+# loudly, and reuse the sha below.
+base_sha="$(git -C "$dir" rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null || true)"
+[ -n "$base_sha" ] || die_usage "base ref '$base' does not resolve to a commit (pass an existing --base REF)"
 # $base is immutable from here on, so resolve its short form ONCE and reuse it (the header + both
 # prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
-base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
+base_short="$(git -C "$dir" rev-parse --short "$base_sha" 2>/dev/null || echo "$base_sha")"
 
 # THE resolved review range — the single spelling of "what this run reviews", from which both of the
 # per-reviewer forms below ($scope_arg for the Claude slash commands, $scope_diff_ref for the
@@ -441,27 +454,16 @@ scope_range="$base_short...HEAD"
 
 # ...but that range only NAMES something when base is behind HEAD. Whenever base IS HEAD,
 # `$base...HEAD` is EMPTY and a reviewer handed it reviews NOTHING — a session's uncommitted work
-# would ship reported CLEAN having been read by nobody. That happens two ways, and they are NOT the
-# same case, so decide "is base HEAD" once and branch on how we got there.
-#
-# Compare RESOLVED full shas. Not $base against $head_sha directly — $base can still be a symbolic
-# ref the caller typed (`--base HEAD`), which is the very case this guard exists to catch. Not
-# $base_short either — it falls back to the raw 40-char $base when `rev-parse --short` fails (see
-# above), which could never equal an abbreviated HEAD, silently disarming the guard.
+# would ship reported CLEAN having been read by nobody. Decide "is base HEAD" once, from the
+# RESOLVED full shas: not $base against $head_sha directly, since $base can still be a symbolic ref
+# the caller typed (`--base HEAD`), which is the very case this guard exists to catch.
 head_sha="$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)"
-base_sha="$(git -C "$dir" rev-parse "$base" 2>/dev/null || true)"
 base_is_head=0
 if [ -n "$head_sha" ] && [ "$base_sha" = "$head_sha" ]; then base_is_head=1; fi
 
-# Case 1 — the FALLBACK chain bottomed out at `rev-parse HEAD` (no origin/main, no origin/HEAD: a
-# local-only repo). Nobody asked for this scope; drop the target argument entirely and let the Claude
-# commands self-derive, exactly as before --target existed.
-degenerate_base=0
-if [ "$base_explicit" -eq 0 ] && [ "$base_is_head" -eq 1 ]; then degenerate_base=1; fi
-
 # The two spellings of the scope, one per reviewer family. Both derive from the single decision above,
-# so neither can invent a range of its own — but they are NOT always the same string, because the two
-# families differ in what they do when handed an empty range (see the degenerate arms below):
+# so neither can invent a range of its own — but they are NOT the same string on the empty-range path,
+# because the two families need different things to fall back to the working tree:
 #   $scope_arg      — the <target> argument of the Claude slash commands. Empty ⇒ pass no target at all
 #                     and let /code-review and /simplify self-derive (both fold in `git diff HEAD`),
 #                     exactly as before --target existed.
@@ -470,19 +472,22 @@ if [ "$base_explicit" -eq 0 ] && [ "$base_is_head" -eq 1 ]; then degenerate_base
 #                     an empty A...B that reads as "there is nothing to review".
 scope_arg=" $scope_range"
 scope_diff_ref="$scope_range"
-if [ "$degenerate_base" -eq 1 ]; then
+if [ "$base_is_head" -eq 1 ]; then
+  # NEITHER family may be handed the empty range. The Claude commands take a passed <target> INSTEAD
+  # of self-deriving, so an empty one makes them review nothing too — drop the argument rather than
+  # trusting them to recover from it; the codex/security prompts get the working tree named outright.
   scope_arg=""
   scope_diff_ref="HEAD"
-elif [ "$base_is_head" -eq 1 ]; then
-  # Case 2 — an EXPLICIT --base/--target that resolves to HEAD (e.g. `--target <branch>` where HEAD is
-  # already an ancestor of that branch, which resolves fine and prints the reassuring "scoping the
-  # review to ..." line). $scope_arg is left alone: the caller asked for exactly that scope, and the
-  # Claude commands already recover on their own (an empty range ⇒ they also diff the working tree).
-  # The codex/security prompts do NOT recover, so give them the working tree explicitly rather than an
-  # empty range, and SAY so — an empty committed range is nearly always a mistake, and staying quiet
-  # is what would let the run report CLEAN having read zero lines.
-  scope_diff_ref="HEAD"
-  echo "$prog: WARNING — the resolved base IS HEAD, so '$scope_range' is an EMPTY range; only UNCOMMITTED changes will be reviewed" >&2
+  # WARN only when someone PINNED this scope (--base REF, or a --target that resolved to an ancestor
+  # of HEAD) — there, an empty committed range is nearly always a mistake, and staying quiet is what
+  # would let the run report CLEAN having read zero lines. On the fallback path it is the ordinary
+  # "no commits ahead yet" state (merge-base with origin/main IS HEAD, or a local-only repo with
+  # neither origin/main nor origin/HEAD, so the chain bottomed out at `rev-parse HEAD`): nobody asked
+  # for this scope, the behaviour is exactly what it was before --target existed, and warning every
+  # such run would be noise.
+  if [ "$base_explicit" -eq 1 ]; then
+    echo "$prog: WARNING — the resolved base IS HEAD, so '$scope_range' is an EMPTY range; only UNCOMMITTED changes will be reviewed" >&2
+  fi
 fi
 
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
