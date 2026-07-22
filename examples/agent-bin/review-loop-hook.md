@@ -80,16 +80,12 @@ re-run the loop. Options:
 
 ## Review scope (`--base` / `--target`)
 
-Every phase reviews the diff from a single resolved **base**. By default (`--target auto`) the loop
-asks `glab`/`gh` for the **open MR/PR of the current branch** and uses the merge-base with that MR's
-*target* branch, so the review scope equals the MR — including for a branch stacked on another
-not-yet-merged branch, where the merge-base with `origin/main` would drag the parent's commits in.
+Every phase reviews the diff from a single resolved **base**, derived by default (`--target auto`)
+from the open MR/PR of the current branch. Per-flag semantics live in `review-loop --help` and the
+rationale in the script's header comment — not restated here, so this doc cannot drift from either.
 
-For the per-flag semantics of `--base` / `--target`, see `review-loop --help` — the single copy, so
-this doc cannot drift from what the script does.
-
-Hook-specific: in `--stop-hook` mode the derivation runs **after** the marker check, so a stop that is
-skipped never pays the forge round-trip.
+Hook-specific, and the only part that is: in `--stop-hook` mode the derivation runs **after** the
+marker check, so a stop that is skipped never pays the forge round-trip.
 
 ## Codex — an independent second reviewer (default ON)
 

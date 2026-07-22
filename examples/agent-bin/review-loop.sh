@@ -387,11 +387,11 @@ _short_ref() { local r="${1#refs/remotes/}"; printf '%s' "${r#refs/heads/}"; }
 # One place for "the target was unusable": a DERIVED target (--target auto) is best-effort, so it
 # warns and lets the historical default take over; an explicit --target must fail LOUDLY instead,
 # because the fallback chain ends at `rev-parse HEAD`, which yields an EMPTY diff — every phase would
-# then review nothing and the run would report CLEAN having checked zero lines. Which of the two it
-# is comes from $target_strict, decided ONCE beside $target_branch/$target_src below, so a later call
-# site cannot re-read the raw --target string and disagree.
+# then review nothing and the run would report CLEAN having checked zero lines. `--target auto` is
+# exactly the derived case, and $target is assigned only by the arg parser, so it still says which
+# one this is.
 _target_giveup() {
-  [ "$target_strict" -eq 1 ] && die_usage "$1 (--target '$target'); pass --base REF explicitly"
+  [ "$target" != "auto" ] && die_usage "$1 (--target '$target'); pass --base REF explicitly"
   echo "$prog: $1 — falling back to the default base" >&2
 }
 
@@ -400,9 +400,9 @@ if [ -z "$base" ] && [ "$target" != "none" ]; then
   # at all, and calling that "the MR/PR target branch" sends someone debugging a wrong scope looking
   # for an MR that does not exist.
   if [ "$target" = "auto" ]; then
-    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"; target_strict=0
+    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"
   else
-    target_branch="$target";                         target_src="the --target branch";     target_strict=1
+    target_branch="$target";                         target_src="the --target branch"
   fi
   # An empty $target_branch means --target auto found no MR context (detect_target_branch already
   # knows every reason) — nothing to resolve, so the historical default below takes over.
@@ -486,7 +486,11 @@ if [ "$base_is_head" -eq 1 ]; then
   # for this scope, the behaviour is exactly what it was before --target existed, and warning every
   # such run would be noise.
   if [ "$base_explicit" -eq 1 ]; then
-    echo "$prog: WARNING — the resolved base IS HEAD, so '$scope_range' is an EMPTY range; only UNCOMMITTED changes will be reviewed" >&2
+    # Word it as what actually happens per family: the security/codex prompts really are narrowed to
+    # the working tree, but the Claude commands fall back to self-deriving, which can land WIDER than
+    # the base that was pinned. Saying "only uncommitted changes will be reviewed" would be false for
+    # half the reviewers and hide exactly the over-scoping this feature exists to prevent.
+    echo "$prog: WARNING — the resolved base IS HEAD, so '$scope_range' is an EMPTY range; the security/codex phases see UNCOMMITTED changes only, and /code-review + /simplify fall back to self-deriving their own range" >&2
   fi
 fi
 
@@ -713,7 +717,7 @@ run_security_phase() {
       # `status --porcelain | awk '{print $NF}'` truncated any path containing a space (e.g.
       # "src/session store.js" -> "store.js"), dropping the sensitive token so auto-mode wrongly
       # skipped the security review for exactly the files it exists to catch.
-      changed="$( { git -C "$dir" diff --name-only "$base" HEAD 2>/dev/null || true; \
+      changed="$( { git -C "$dir" diff --name-only "$base_sha" HEAD 2>/dev/null || true; \
                     git -C "$dir" diff --name-only HEAD 2>/dev/null || true; \
                     git -C "$dir" ls-files --others --exclude-standard 2>/dev/null || true; } | sort -u )"
       # here-string, not `printf … | grep`: under `set -o pipefail`, when the path list exceeds the
