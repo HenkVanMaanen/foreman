@@ -20,7 +20,7 @@ set -euo pipefail
 
 # Definition-of-done footer appended to EVERY worker brief. Policy: a worker produces a REVIEWABLE
 # DRAFT fast and stops for the human — it does NOT run the heavy multi-round review loop. That
-# review (/code-review + /simplify + Codex + /security-review) is a PRE-MERGE gate foreman runs once
+# review (`/review` + /simplify + Codex + /security-review) is a PRE-MERGE gate foreman runs once
 # the human approves the MR content (see the review policy in prompts/bootstrap.md), so human↔foreman
 # iteration on the MR stays fast. Edit this constant to change the standard; it is applied additively,
 # so the existing `spawn-worker <name> <brief-file>` interface is unchanged.
