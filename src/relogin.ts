@@ -313,11 +313,13 @@ async function ran(
  * Throws only when BOTH fail: the sign-in URL is the one message that must land.
  */
 async function notify(childEnv: Record<string, string>, text: string): Promise<void> {
-  if (await ran([binPath("reply"), "-"], new TextEncoder().encode(text), childEnv)) return;
-  // ask-human takes the text as an argument (no shell involved, so newlines/quotes are safe) and
-  // --urgency background keeps it from appending the "I'm blocked" nudge to an already-loud alert.
-  if (await ran([binPath("ask-human"), text, "--urgency", "background"], "ignore", childEnv))
-    return;
+  const body = new TextEncoder().encode(text);
+  if (await ran([binPath("reply"), "-"], body, childEnv)) return;
+  // Both take the text on STDIN ("-"), never argv: these messages carry the sign-in URL and, for
+  // codex, the one-time device code, and /proc/<pid>/cmdline is world-readable — an argv-passed
+  // code is readable by any local user for as long as the child lives. --urgency background keeps
+  // ask-human from appending the "I'm blocked" nudge to an already-loud alert.
+  if (await ran([binPath("ask-human"), "-", "--urgency", "background"], body, childEnv)) return;
   throw new Error("neither bin/reply nor bin/ask-human could reach the human");
 }
 
