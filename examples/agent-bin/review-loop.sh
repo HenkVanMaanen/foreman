@@ -366,7 +366,14 @@ if [ -z "$base" ]; then
       target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
       base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
       if [ -n "$base" ]; then
-        echo "$prog: scoping the review to the MR/PR target branch $target_disp"
+        # Say which SOURCE the branch came from: this same branch is taken for an explicit
+        # --target REF, where no MR/PR was consulted at all — calling it "the MR/PR target branch"
+        # sends someone debugging a wrong scope looking for an MR that does not exist.
+        if [ "$target" = "auto" ]; then
+          echo "$prog: scoping the review to the MR/PR target branch $target_disp"
+        else
+          echo "$prog: scoping the review to --target $target_disp"
+        fi
       elif [ "$target" = "auto" ]; then
         # Unrelated histories under a DERIVED target: best-effort mode, so fall back quietly.
         echo "$prog: no merge-base between HEAD and $target_disp — falling back to the default base" >&2
