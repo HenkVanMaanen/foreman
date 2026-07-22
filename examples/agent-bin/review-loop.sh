@@ -256,8 +256,16 @@ fi
 # also resolves tags and pseudo-refs, so `--target HEAD` would silently "succeed" with
 # merge-base(HEAD,HEAD)=HEAD — an empty diff that makes every phase converge CLEAN vacuously.
 resolve_branch_ref() {
-  local b="$1" cand
-  for cand in "remotes/origin/$b" "heads/$b" "remotes/$b"; do
+  local b="$1" cand r
+  local cands=("remotes/origin/$b" "heads/$b")
+  # Then EVERY other configured remote: a fork checkout whose remote is named `upstream` (or a repo
+  # with no `origin` at all) would otherwise resolve nothing for a derived name like "main" that has
+  # no local branch, silently dropping the scope fix on exactly the layout that needs it most.
+  while IFS= read -r r; do
+    if [ -n "$r" ] && [ "$r" != "origin" ]; then cands+=("remotes/$r/$b"); fi
+  done < <(git -C "$dir" remote 2>/dev/null || true)
+  cands+=("remotes/$b")
+  for cand in "${cands[@]}"; do
     if git -C "$dir" rev-parse --verify --quiet "refs/$cand^{commit}" >/dev/null 2>&1; then
       printf '%s\n' "refs/$cand"; return 0
     fi
@@ -353,7 +361,7 @@ if [ -z "$base" ]; then
       # fall back rather than failing a run that would otherwise work.
       echo "$prog: MR/PR target branch '$target_branch' not found locally (try 'git fetch') — falling back to the default base" >&2
     else
-      die_usage "--target '$target' does not resolve to a branch (tried origin/$target, $target, and remote $target)"
+      die_usage "--target '$target' does not resolve to a branch (tried <remote>/$target for every remote, local $target, and $target as a remote-qualified ref)"
     fi
   fi
 fi
@@ -370,6 +378,13 @@ fi
 # $base is immutable from here on, so resolve its short form ONCE and reuse it (the header + both
 # prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
 base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
+
+# Scope suffix for the CLAUDE phases. /code-review and /simplify derive the diff range THEMSELVES
+# (`git diff @{upstream}...HEAD`, else `main...HEAD`) — which is exactly the over-scoping the
+# --base/--target resolution above exists to fix, so without handing them the resolved base the fix
+# would only reach the codex/security prompts and the `--security auto` heuristic. Appended to the
+# slash command; run_fix_phase's $display keeps the per-round header short.
+claude_scope=" — SCOPE: the diff base for this review is $base_short. Review ONLY \`git diff $base_short...HEAD\` plus any uncommitted changes; do NOT derive the range yourself and do NOT review commits below that base."
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -777,11 +792,12 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 SEC_CAP=""
 trap 'rm -f "$SEC_CAP" "$CODEX_CAP" 2>/dev/null || true' EXIT
 
-run_fix_phase "code-review" "/code-review $effort --fix" "chore(review): code-review auto-fixes"
+run_fix_phase "code-review" "/code-review $effort --fix$claude_scope" "chore(review): code-review auto-fixes" \
+              "/code-review $effort --fix"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
-run_fix_phase "simplify" "/simplify" "chore(review): simplify"
+run_fix_phase "simplify" "/simplify$claude_scope" "chore(review): simplify" "/simplify"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
@@ -822,7 +838,8 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
-      run_fix_phase "code-review (reconcile)" "/code-review $effort --fix" "chore(review): reconcile code-review"
+      run_fix_phase "code-review (reconcile)" "/code-review $effort --fix$claude_scope" \
+                    "chore(review): reconcile code-review" "/code-review $effort --fix"
       FCR_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCR_CHANGED=1
       c_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"
 
@@ -863,7 +880,8 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     done
   else
     echo ">>> final code-review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
-    run_fix_phase "code-review (post-security)" "/code-review $effort --fix" "chore(review): post-security code-review"
+    run_fix_phase "code-review (post-security)" "/code-review $effort --fix$claude_scope" \
+                  "chore(review): post-security code-review" "/code-review $effort --fix"
     FCR_RAN=1; FCR_ROUNDS="$PHASE_ROUNDS"; FCR_CHANGED="$PHASE_CHANGED"; RECONCILE_STATUS="$PHASE_STATUS"
   fi
 else
