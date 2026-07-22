@@ -275,6 +275,10 @@ export async function supervise(cfg: Config): Promise<void> {
       // existing channel, blocks on the same inbox watermark the idle-wait uses until the code
       // arrives, and pastes it in. On success we relaunch fresh; on anything else we exit so the
       // keeper respawns with backoff (the relay blocks on the human, so this can't spam them).
+      // Flip the phase FIRST, before anything that yields: `isBusy()` still reads "busy" until
+      // this lands, so a message the poller picks up during the awaits below would draw the
+      // "I'm mid-task" auto-ack — the one reply this path must never send.
+      io.phase = "relogin";
       await stat("auth-required");
       // Same safety net the recycle path takes, for the same reason: whatever happens next —
       // relaunch fresh, or exit for the keeper — this life's context is gone, so anything the
@@ -286,10 +290,9 @@ export async function supervise(cfg: Config): Promise<void> {
       // They are not dropped: the queue is restored below on the way back into the loop, and
       // echoed to the human on the way out. The relay only ever sees lines that arrive after the
       // sign-in URL was sent.
-      const heldBack = inbox.drain();
       // The relay is now the queue's only reader (the parked wait cannot run — the session is
       // stopped), which is what keeps InboxQueue's one-waiter rule satisfied.
-      io.phase = "relogin";
+      const heldBack = inbox.drain();
       // Re-stamp the status between inbox waits: the relay can block on the human for the better
       // part of an hour, and a status that old reads as "quiet"/wedged on the dashboard.
       const outcome = await recoverAuth(

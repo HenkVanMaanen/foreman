@@ -305,7 +305,15 @@ export async function waitForInboxLines(
     const lines = await queue.take(waitMs);
     watchdog.touch(); // legitimate waiting is not a wedge — keep the heartbeat alive
     if (lines.length) return lines;
-    await refresh();
+    // The refresh is cosmetic (a dashboard status re-stamp), so a failing one must never abort
+    // the wait: for the re-login relay this wait IS a login in progress, and throwing out of it
+    // kills the login child mid-sign-in. Same guard, same reason, as awaitSliced()'s onTick in
+    // relogin.ts.
+    try {
+      await refresh();
+    } catch (e) {
+      console.error(`[inbox] status refresh failed: ${e}`);
+    }
   }
 }
 

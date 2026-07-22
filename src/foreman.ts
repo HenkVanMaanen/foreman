@@ -12,7 +12,7 @@
 import { loadConfig } from "./config.ts";
 import { runDashboard } from "./dashboard.ts";
 import { InboxQueue, startInboxPoller } from "./inbox.ts";
-import { RELOGIN_AGENTS } from "./relogin.ts";
+import { notifyHuman, RELOGIN_AGENTS } from "./relogin.ts";
 import { runWithSecrets, secretSetFromStdin } from "./secrets.ts";
 import { supervise } from "./supervisor.ts";
 import { NO_HEARTBEAT } from "./watchdog.ts";
@@ -78,6 +78,21 @@ async function main(argv: string[]): Promise<number> {
         return (await relogin(cfg, NO_HEARTBEAT, inbox, env, force)) ? 0 : 1;
       } finally {
         poller.stop();
+        // The poller ADVANCED the shared watermark for every line it read, so whatever is still
+        // buffered here is the last copy in existence (inbox.ts invariant 3). The codex flow
+        // never reads the queue at all — it polls by itself — and even the claude flow leaves
+        // behind anything that landed after its last wait, so exiting without this silently eats
+        // every message the human sent while they were re-authenticating. Hand them back.
+        const leftover = inbox.drain();
+        if (leftover.length) {
+          await notifyHuman(
+            cfg,
+            env,
+            "[harness] I consumed these off the inbox while re-authenticating and never " +
+              "delivered them — please re-send anything that still needs an answer:\n" +
+              leftover.join("\n"),
+          );
+        }
       }
     }
 
