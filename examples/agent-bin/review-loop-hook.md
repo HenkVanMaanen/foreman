@@ -78,6 +78,22 @@ re-run the loop. Options:
 - **Disable:** remove the `Stop` block (or the whole `hooks` key) and restart. Deleting the marker
   file alone does **not** disable the hook — it only re-arms it.
 
+## Review scope (`--base` / `--target`)
+
+Every phase reviews the diff from a single resolved **base**. By default (`--target auto`) the loop
+asks `glab`/`gh` for the **open MR/PR of the current branch** and uses the merge-base with that MR's
+*target* branch, so the review scope equals the MR — including for a branch stacked on another
+not-yet-merged branch, where the merge-base with `origin/main` would drag the parent's commits in.
+
+- `--base REF` — use `REF` verbatim; wins over `--target`, no merge-base computed.
+- `--target REF` — merge-base with `REF` (prefers `origin/REF`).
+- `--target auto` — *(default)* derive it from the open MR/PR; any failure (no CLI, no MR, detached
+  HEAD, auth/network error) falls back silently to the merge-base with `origin/main`.
+- `--target none` — skip derivation; go straight to the `origin/main` fallback.
+
+In `--stop-hook` mode the derivation runs **after** the marker check, so a stop that is skipped never
+pays the forge round-trip.
+
 ## Codex — an independent second reviewer (default ON)
 
 review-loop runs an **OpenAI Codex** review-and-fix phase as a genuinely independent second model,

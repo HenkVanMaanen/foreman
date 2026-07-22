@@ -296,12 +296,19 @@ detect_target_branch() {
   [[ "$branch" =~ $branch_re ]] || return 1
   remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
 
-  # Try the forge that matches origin first, then the other — a repo can have both CLIs installed.
-  # Match on the HOST only: a substring test over the whole URL misroutes a GitHub repo that merely
-  # has "gitlab" in its path (github.com/acme/gitlab-migration).
+  # Pick the forge CLI from origin's HOST. Match on the host only: a substring test over the whole
+  # URL misroutes a GitHub repo that merely has "gitlab" in its path (github.com/acme/gitlab-migration).
+  # When the host identifies the forge we probe ONLY that CLI — the other one cannot answer for this
+  # repo anyway (glab refuses a remote that points at no known GitLab host, gh refuses a non-GitHub
+  # one), so trying it just burns a second `timeout 25` round-trip on the common "no MR yet" path,
+  # and on a repo configured with BOTH a github and a gitlab remote it can answer for the WRONG
+  # forge. An unrecognized (self-hosted) host still tries both, in the order that CLI presence allows.
   host="${remote_url#*://}"; host="${host#*@}"; host="${host%%[:/]*}"
   local order=(gh glab) tool
-  case "$host" in *gitlab*) order=(glab gh);; esac
+  case "$host" in
+    *gitlab*) order=(glab);;
+    *github*) order=(gh);;
+  esac
 
   # Probe wrapper (hoisted: the timeout lookup does not vary per tool).
   local wrap=()
@@ -388,6 +395,12 @@ base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base
 # would only reach the codex/security prompts and the `--security auto` heuristic. Appended to the
 # slash command; run_fix_phase's $display keeps the per-round header short.
 claude_scope=" — SCOPE: the diff base for this review is $base_short. Review ONLY \`git diff $base_short...HEAD\` plus any uncommitted changes; do NOT derive the range yourself and do NOT review commits below that base."
+
+# The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
+# cycle, post-security pass), so build the prompt and its short header form once here — keeping the
+# scope suffix attached to the command in one spot instead of three that can drift apart.
+cr_cmd="/code-review $effort --fix$claude_scope"
+cr_disp="/code-review $effort --fix"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -795,8 +808,7 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 SEC_CAP=""
 trap 'rm -f "$SEC_CAP" "$CODEX_CAP" 2>/dev/null || true' EXIT
 
-run_fix_phase "code-review" "/code-review $effort --fix$claude_scope" "chore(review): code-review auto-fixes" \
-              "/code-review $effort --fix"
+run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes" "$cr_disp"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
@@ -841,8 +853,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
-      run_fix_phase "code-review (reconcile)" "/code-review $effort --fix$claude_scope" \
-                    "chore(review): reconcile code-review" "/code-review $effort --fix"
+      run_fix_phase "code-review (reconcile)" "$cr_cmd" "chore(review): reconcile code-review" "$cr_disp"
       FCR_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCR_CHANGED=1
       c_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"
 
@@ -883,8 +894,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     done
   else
     echo ">>> final code-review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
-    run_fix_phase "code-review (post-security)" "/code-review $effort --fix$claude_scope" \
-                  "chore(review): post-security code-review" "/code-review $effort --fix"
+    run_fix_phase "code-review (post-security)" "$cr_cmd" "chore(review): post-security code-review" "$cr_disp"
     FCR_RAN=1; FCR_ROUNDS="$PHASE_ROUNDS"; FCR_CHANGED="$PHASE_CHANGED"; RECONCILE_STATUS="$PHASE_STATUS"
   fi
 else
