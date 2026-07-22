@@ -90,7 +90,8 @@ not-yet-merged branch, where the merge-base with `origin/main` would drag the pa
   never falls back — if `REF` does not resolve or shares no history with `HEAD`.
 - `--target auto` — *(default)* derive it from the open MR/PR; any failure (no CLI, no MR, detached
   HEAD, auth/network error) falls back to the merge-base with `origin/main`, silently except for a
-  stderr note when a target branch *was* derived but is not fetched locally.
+  stderr note when a target branch *was* derived but turned out to be unusable (not fetched locally,
+  or unrelated history).
 - `--target none` — skip derivation; go straight to the `origin/main` fallback.
 
 In `--stop-hook` mode the derivation runs **after** the marker check, so a stop that is skipped never

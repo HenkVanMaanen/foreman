@@ -62,20 +62,11 @@
 #           codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch when one
 #           can be derived, else with origin/main (falls back to HEAD if unavailable).
 #
-# SCOPE (--base / --target): a review should cover exactly what the MR/PR changes — no more. The
+# WHY --base / --target exist: a review should cover exactly what the MR/PR changes — no more. The
 # diff base therefore has to be the merge-base with the branch this work MERGES INTO, not with
 # origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
 # origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
-#   --base REF   — use REF verbatim as the diff base. Wins over --target; no merge-base is computed.
-#   --target REF — the branch this work merges INTO; base = merge-base of HEAD with it (every
-#                  <remote>/REF is preferred over a local REF). Errors if REF does not resolve, or
-#                  if it shares no history with HEAD — it never falls back.
-#   --target auto— (default) best-effort: ask glab/gh for the OPEN MR/PR of the current branch and
-#                  use its target branch. Any failure (no CLI, no MR, detached HEAD, network/auth
-#                  error, unresolvable branch) falls back to the historical default below (with a
-#                  stderr note when a branch WAS derived but is not fetched), so behaviour without
-#                  MR context is unchanged.
-#   --target none— skip derivation entirely; use the historical default.
+# The flag semantics live in `usage()` below (`--help`) and in review-loop-hook.md — not here too.
 # Historical default (the fallback): merge-base of HEAD with origin/main, else origin/HEAD, else HEAD.
 #
 # --codex / --no-codex:
@@ -133,10 +124,10 @@ prog="review-loop"
 # charset is URL-query-safe so it can go into a `glab api` query verbatim.
 branch_re='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
 
-# Is coreutils `timeout` available? Probed ONCE and shared by every hang-guard below. Stock macOS
-# ships none, and there the guarded command must run BARE: `timeout`'s own 127 "command not found"
-# would otherwise be misread as the probe itself failing (a wedged forge lookup, a logged-out codex).
-if command -v timeout >/dev/null 2>&1; then have_timeout=1; else have_timeout=0; fi
+# Run "$@" under `timeout SECS`, or BARE when coreutils `timeout` is missing (stock macOS ships
+# none, and there `timeout`'s own 127 "command not found" would be misread as the guarded command
+# failing — a wedged forge lookup, a logged-out codex). Shared by every hang-guard below.
+_tmo() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi; }
 
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
@@ -153,8 +144,8 @@ Usage:
 Scope: --base REF uses REF verbatim as the diff base (wins over --target). --target REF diffs from
 the merge-base with the branch this work merges INTO, so the review scope equals the MR/PR even for
 a branch stacked on another unmerged branch. --target auto (default) derives that branch from the
-open MR/PR via glab/gh, falling back silently to the merge-base with origin/main. --target none
-skips derivation.
+open MR/PR via glab/gh, falling back to the merge-base with origin/main (a stderr note when a
+branch was derived but is unusable). --target none skips derivation.
 
 Phases run in order, each capped at --max-rounds and committing per round:
   1. /code-review <effort> --fix loop   (fix correctness)
@@ -224,7 +215,7 @@ git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is no
 # hook's stdin JSON when present, as a second belt.
 #
 # This runs BEFORE base/target resolution on purpose: --target auto shells out to gh/glab, which is
-# a network round-trip (up to the 25s timeout, twice) — paying that on every Stop fire just to hit
+# a network round-trip (up to the 10s timeout, twice) — paying that on every Stop fire just to hit
 # the marker and exit would stall the end of every single session.
 state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
 marker="$state_dir/.review-loop-ran"
@@ -250,26 +241,20 @@ fi
 # Rationale for the scope rule: see the SCOPE block in the header comment.
 # Resolution order: --base (verbatim) > --target REF > --target auto (derived) > historical default.
 
-# Resolve a branch NAME to a ref we can merge-base against, preferring the remote-tracking copy
-# (origin/NAME is what the MR actually targets; a stale local NAME may sit far behind). Echoes the
-# ref; returns 1 if no form exists.
-# `remotes/$b` is tried LAST so an already-remote-qualified name (`--target origin/main`, which the
-# docs' own wording invites, or `--target upstream/main`) resolves instead of failing outright.
-# Matched against the full refs/remotes|refs/heads paths, NOT a bare `NAME^{commit}`: the bare form
-# also resolves TAGS, so a tag named like the target branch could win over the branch itself.
+# Resolve a branch NAME to a ref we can merge-base against. Echoes the ref; returns 1 if no form
+# exists. Candidates are matched as full refs/remotes|refs/heads paths, NOT as a bare `NAME^{commit}`
+# — the bare form also resolves TAGS, so a tag named like the target branch could win over it.
 resolve_branch_ref() {
   local b="$1" cand r
   # HEAD is not a branch, and the refs/ prefixing alone does NOT reject it: `git clone` creates
   # refs/remotes/origin/HEAD, so `--target HEAD` would quietly resolve to origin's default branch
   # instead of erroring — and any candidate ending in /HEAD is that same pseudo-ref. Reject up front.
   case "$b" in HEAD|*/HEAD) return 1;; esac
-  # Precedence: origin/<b> > <other-remote>/<b> > local <b> > <b> already remote-qualified.
-  # Every remote-tracking copy outranks the local branch (not just origin's): on a fork checkout
-  # (origin=fork, upstream=canonical) a stale local `main` sitting behind upstream/<b> would
-  # otherwise win, and merge-basing against it lands BELOW the real target — re-introducing exactly
-  # the over-scoping this resolution exists to prevent. Other remotes are enumerated because a fork
-  # checkout whose remote is named `upstream` (or a repo with no `origin`) would otherwise resolve
-  # nothing for a derived name like "main" that has no local branch.
+  # Precedence: origin/<b> > <other-remote>/<b> > local <b> > <b> already remote-qualified. Every
+  # remote-tracking copy outranks the local branch, because a stale local branch merge-bases BELOW
+  # the real target — re-introducing the over-scoping this resolution exists to prevent. Non-origin
+  # remotes are enumerated for fork checkouts (origin=fork, upstream=canonical) and repos with no
+  # `origin`; the already-qualified form is tried LAST so `--target origin/main` still works.
   local cands=("remotes/origin/$b")
   while IFS= read -r r; do
     [ "$r" != "origin" ] && cands+=("remotes/$r/$b")
@@ -286,8 +271,9 @@ resolve_branch_ref() {
 # Extract the first "key": "value" string field from JSON on stdin. Enough for the single flat field
 # we need, and avoids requiring jq (which glab/gh users do not necessarily have).
 _json_str_field() {
+  # `grep -o` puts each match on its own line, so `q` after the substitution takes the first one.
   grep -aoE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
-    | head -n 1 | sed -E 's/.*:[[:space:]]*"([^"]*)"[[:space:]]*$/\1/'
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"[[:space:]]*$/\1/;q'
 }
 
 # Best-effort: the target branch of the OPEN MR/PR for the checked-out branch, via glab or gh.
@@ -295,7 +281,7 @@ _json_str_field() {
 # MR/PR, auth/network failure, junk output) so the caller can fall back cleanly. Every invocation is
 # stdin-closed and `timeout`-wrapped where available, so it can never hang the loop.
 detect_target_branch() {
-  local branch remote_url host out="" run=()
+  local branch remote_url host out=""
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
   [ -n "$branch" ] || return 1                      # detached HEAD ⇒ no MR to look up
   # The branch goes into a CLI argument and (for glab) a URL query, so hold it to the same charset
@@ -303,47 +289,37 @@ detect_target_branch() {
   [[ "$branch" =~ $branch_re ]] || return 1
   remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
 
-  # Pick the forge CLI from origin's HOST. Match on the host only: a substring test over the whole
-  # URL misroutes a GitHub repo that merely has "gitlab" in its path (github.com/acme/gitlab-migration).
-  # When the host identifies the forge we probe ONLY that CLI — the other one cannot answer for this
-  # repo anyway (glab refuses a remote that points at no known GitLab host, gh refuses a non-GitHub
-  # one), so trying it just burns a second `timeout 25` round-trip on the common "no MR yet" path,
-  # and on a repo configured with BOTH a github and a gitlab remote it can answer for the WRONG
-  # forge. An unrecognized (self-hosted) host still tries both, in the order that CLI presence allows.
+  # Pick the forge CLI from origin's HOST, not from a substring of the whole URL (which misroutes
+  # github.com/acme/gitlab-migration). When the host identifies the forge, probe ONLY that CLI: the
+  # other one cannot answer for this repo anyway, and on a repo with both a github and a gitlab
+  # remote it can answer for the WRONG forge. An unrecognized (self-hosted) host tries both — glab
+  # first, since self-hosted GitLab is the case that reaches here.
   host="${remote_url#*://}"; host="${host#*@}"; host="${host%%[:/]*}"
-  local order=(gh glab) tool
+  local order=(glab gh) tool
   case "$host" in
     *gitlab*) order=(glab);;
     *github*) order=(gh);;
   esac
 
-  local wrap=()
-  [ "$have_timeout" -eq 1 ] && wrap=(timeout 25)
-
   for tool in "${order[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || continue
-    # ${wrap[@]+"${wrap[@]}"}, not a bare "${wrap[@]}": on bash < 4.4 (stock macOS bash 3.2)
-    # expanding an EMPTY array under `set -u` is an "unbound variable" fatal. That is exactly the
-    # box where `timeout` is missing (so wrap IS empty), which would kill this subshell and silently
-    # disable --target auto on every macOS run.
-    run=(${wrap[@]+"${wrap[@]}"} "$tool")
     case "$tool" in
       # `pr list --state open`, not `pr view <branch>`: pr view also resolves a CLOSED or MERGED PR
       # for the branch, whose base could be a long-dead release branch — a wrong, over-narrow scope
       # is worse than falling back. --limit 1 keeps the response to the one MR/PR we act on.
-      gh)   out="$( (cd "$dir" && "${run[@]}" pr list --head "$branch" --state open --limit 1 \
+      gh)   out="$( (cd "$dir" && _tmo 10 gh pr list --head "$branch" --state open --limit 1 \
                        --json baseRefName </dev/null 2>/dev/null) \
                     | _json_str_field baseRefName || true )";;
       # `glab api`, not `glab mr view -F json`: `-F json` only exists on recent glab (on 1.36 it is
       # "unknown shorthand flag: 'F'"), so the mr-view form fails closed on every older install and
       # the GitLab path never derives anything. The REST endpoint is stable across versions and
       # filters to opened MRs the same way the gh call does.
-      glab) out="$( (cd "$dir" && "${run[@]}" api \
+      glab) out="$( (cd "$dir" && _tmo 10 glab api \
                        "projects/:fullpath/merge_requests?source_branch=$branch&state=opened&per_page=1" \
                        </dev/null 2>/dev/null) \
                     | _json_str_field target_branch || true )";;
     esac
-    out="${out//[$'\r\n\t ']/}"
+    out="${out%$'\r'}"   # tolerate a CRLF-terminated answer; the regex below rejects the rest
     # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
     # into git. An unusable answer means "no MR context", i.e. fall back.
     [[ "$out" =~ $branch_re ]] || continue
@@ -352,38 +328,40 @@ detect_target_branch() {
   return 1
 }
 
+# One place for "the target was unusable": --target auto is best-effort, so it warns and lets the
+# historical default take over; an explicit --target must fail LOUDLY instead, because the fallback
+# chain ends at `rev-parse HEAD`, which yields an EMPTY diff — every phase would then review nothing
+# and the run would report CLEAN having checked zero lines.
+_target_giveup() {
+  if [ "$target" = "auto" ]; then
+    echo "$prog: $1 — falling back to the default base" >&2
+  else
+    die_usage "$1 (--target '$target'); pass --base REF explicitly"
+  fi
+}
+
 if [ -z "$base" ] && [ "$target" != "none" ]; then
-  # $target_src names the SOURCE the branch came from: the same branch is taken for an explicit
-  # --target REF, where no MR/PR was consulted at all — calling that "the MR/PR target branch" sends
-  # someone debugging a wrong scope looking for an MR that does not exist.
+  # $target_src names the SOURCE the branch came from: an explicit --target REF consulted no MR/PR
+  # at all, and calling that "the MR/PR target branch" sends someone debugging a wrong scope looking
+  # for an MR that does not exist.
   if [ "$target" = "auto" ]; then
     target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"
   else
     target_branch="$target";                         target_src="--target"
   fi
-  if [ -n "$target_branch" ]; then
-    if target_ref="$(resolve_branch_ref "$target_branch")"; then
-      # Display the short form (origin/main, main) — the full refs/ path is only there to keep
-      # resolution unambiguous, and reads as noise in a log line.
-      target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
-      base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
-      if [ -n "$base" ]; then
-        echo "$prog: scoping the review to $target_src $target_disp"
-      elif [ "$target" = "auto" ]; then
-        # Unrelated histories under a DERIVED target: best-effort mode, so fall back quietly.
-        echo "$prog: no merge-base between HEAD and $target_disp — falling back to the default base" >&2
-      else
-        # Explicit --target: do NOT fall back. The fallback chain ends at `rev-parse HEAD` when
-        # origin/main is unrelated too, which yields an EMPTY diff — every phase then reviews
-        # nothing and the run reports CLEAN having checked zero lines. Fail loudly instead.
-        die_usage "no merge-base between HEAD and $target_disp (--target '$target') — unrelated histories; pass --base REF explicitly"
-      fi
-    elif [ "$target" = "auto" ]; then
-      # Derived a name but have no local copy of it (unfetched target branch) — stay silent-ish and
-      # fall back rather than failing a run that would otherwise work.
-      echo "$prog: MR/PR target branch '$target_branch' not found locally (try 'git fetch') — falling back to the default base" >&2
+  if [ -z "$target_branch" ]; then
+    :   # --target auto found no MR context (detect_target_branch already knows every reason)
+  elif ! target_ref="$(resolve_branch_ref "$target_branch")"; then
+    _target_giveup "target branch '$target_branch' does not resolve locally — tried <remote>/$target_branch for every remote, local $target_branch, and $target_branch as a remote-qualified ref (try 'git fetch')"
+  else
+    # Display the short form (origin/main, main) — the full refs/ path is only there to keep
+    # resolution unambiguous, and reads as noise in a log line.
+    target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
+    base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
+    if [ -n "$base" ]; then
+      echo "$prog: scoping the review to $target_src $target_disp"
     else
-      die_usage "--target '$target' does not resolve to a branch (tried <remote>/$target for every remote, local $target, and $target as a remote-qualified ref)"
+      _target_giveup "no merge-base between HEAD and $target_disp — unrelated histories"
     fi
   fi
 fi
@@ -404,14 +382,15 @@ base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base
 # Scope for the CLAUDE phases. Left to themselves, /code-review and /simplify derive the range
 # (`git diff @{upstream}...HEAD`, else `main...HEAD`) — exactly the over-scoping the --base/--target
 # resolution above exists to fix. Both take a <target> argument, so hand them the resolved range
-# THERE: a ref range is a target form they build the diff command from directly, where a prose
-# instruction only gets honored as a soft narrowing of the range they derived anyway.
-claude_scope=" $base_short...HEAD (plus any uncommitted changes)"
+# THERE. Keep it a BARE ref range and nothing else: that is a target form they build the diff command
+# from directly, whereas any added prose turns the whole argument into a free-form instruction that
+# only softly narrows the range they derived anyway. Both already fold in uncommitted changes.
+claude_scope="$base_short...HEAD"
 
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
 # cycle, post-security pass), so build it once here — keeping the scope argument attached to the
 # command in one spot instead of three that can drift apart.
-cr_cmd="/code-review $effort --fix$claude_scope"
+cr_cmd="/code-review $effort --fix $claude_scope"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -737,11 +716,8 @@ codex_usable() {
   if ! command -v codex >/dev/null 2>&1; then
     CODEX_REASON="codex not found on PATH — degrading to Claude-only"; return 1
   fi
-  # `codex login status` is a fast LOCAL check (no model call); guard it against wedging (see
-  # $have_timeout for why the bare fallback matters).
-  local login_probe=(codex login status)
-  [ "$have_timeout" -eq 1 ] && login_probe=(timeout 20 codex login status)
-  if ! "${login_probe[@]}" </dev/null >/dev/null 2>&1; then
+  # `codex login status` is a fast LOCAL check (no model call); guard it against wedging.
+  if ! _tmo 20 codex login status </dev/null >/dev/null 2>&1; then
     CODEX_REASON="codex not logged in ('codex login status' failed) — degrading to Claude-only"; return 1
   fi
   CODEX_REASON="codex on (model $codex_model)"; return 0
@@ -821,7 +797,7 @@ run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
-run_fix_phase "simplify" "/simplify$claude_scope" "chore(review): simplify"
+run_fix_phase "simplify" "/simplify $claude_scope" "chore(review): simplify"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
