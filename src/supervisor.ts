@@ -8,7 +8,13 @@ import { readFile, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 import { recordEvent, writeStatus } from "./dashboard.ts";
-import { waitForInboxMessages } from "./inbox.ts";
+import {
+  formatInboxPrompt,
+  InboxQueue,
+  sendTelegramAck,
+  startInboxPoller,
+  waitForInboxMessages,
+} from "./inbox.ts";
 import { usageTotal } from "./protocol.ts";
 import { Session } from "./session.ts";
 import { startWatchdog } from "./watchdog.ts";
@@ -86,6 +92,31 @@ export async function supervise(cfg: Config): Promise<void> {
     },
   });
 
+  // Always-on inbox. ONE poller drains Telegram for the whole harness lifetime (across every
+  // agent life), so the agent never goes deaf during a long work turn the way the old parked-only
+  // poll did. `io.phase` lets the poller distinguish "agent busy" (auto-ack + queue for the next
+  // boundary) from "agent parked" (the parked wait below wakes it directly, no ack). `io.acked`
+  // throttles the auto-ack to once per busy stretch so a burst of messages isn't a burst of acks.
+  const inbox = new InboxQueue();
+  const io = { phase: "busy" as "busy" | "parked", acked: false };
+  const poller = startInboxPoller(cfg, passthroughEnv, inbox, {
+    isBusy: () => io.phase === "busy",
+    onBusyMessage: async (lines) => {
+      if (io.acked) return; // already acked this busy stretch — don't spam
+      io.acked = true;
+      await sendTelegramAck(
+        "👀 Got it — I'm mid-task right now. I'll pick this up at my next checkpoint; " +
+          "no need to resend.",
+      );
+      await recordEvent(cfg, {
+        who: "supervisor",
+        kind: "inbox-queued",
+        detail: `${lines.length} line(s) while busy`,
+      });
+    },
+    refresh: () => stat(io.phase === "parked" ? "idle" : "working"),
+  });
+
   // Outer loop: each iteration is one fresh agent lifetime (until a recycle or exit).
   for (;;) {
     watchdog.touch();
@@ -95,6 +126,8 @@ export async function supervise(cfg: Config): Promise<void> {
     watchdog.touch();
     life++;
     lastUsed = 0;
+    io.phase = "busy";
+    io.acked = false;
     console.log("[supervisor] agent launched; bootstrap sent");
     await recordEvent(cfg, { who: "supervisor", kind: "launch", detail: `life #${life}` });
     await stat("working");
@@ -151,27 +184,40 @@ export async function supervise(cfg: Config): Promise<void> {
         nudgedSoft = true;
         continue;
       }
-      // Idle-aware keep-alive. Default to a plain "continue" to prompt the next work cycle.
-      // But if the agent parked (bin/park wrote the idle sentinel and ended its turn), the
-      // SUPERVISOR — not the model — owns the wait: block cheaply on wait-reply --inbox and
-      // re-invoke the agent only when the human writes, delivering the message text in the next
-      // prompt. This stops burning a full ~92K-token turn on every ~600s idle poll (~32% of
-      // spend). Any failure in this path degrades to CONTINUE (the pre-existing behavior) so a
-      // bug here can never wedge or crash-loop the loop — the keeper only catches crashes/exits.
+      // Turn-boundary prompt. The always-on poller (above) feeds `inbox`; here — at the only safe
+      // point to hand the agent new input — we decide what to send next:
+      //   • Parked (bin/park wrote the idle sentinel and ended the turn): the SUPERVISOR owns the
+      //     wait, blocking on the queue and re-invoking the agent only when the human writes. This
+      //     keeps the model asleep while idle instead of burning a ~92K-token turn on every poll.
+      //   • Busy but messages queued while the agent worked: deliver them NOW instead of a bare
+      //     "continue", so a message that arrived mid-turn is handled the instant the turn ends
+      //     (rather than waiting for the agent to happen to park).
+      //   • Otherwise: a plain "continue" to prompt the next work cycle.
+      // Any failure degrades to CONTINUE so a bug here can never wedge or crash-loop the loop.
       let nextPrompt = CONTINUE;
       if (existsSync(idleSentinel)) {
         await rm(idleSentinel, { force: true });
+        io.phase = "parked";
         await stat("idle");
         try {
-          nextPrompt = await waitForInboxMessages(
-            cfg,
-            watchdog,
-            () => stat("idle"),
-            passthroughEnv,
-          );
+          nextPrompt = await waitForInboxMessages(inbox, watchdog, () => stat("idle"));
         } catch (e) {
           console.log(`[supervisor] idle-wait failed (${e}); falling back to continue`);
           nextPrompt = CONTINUE;
+        }
+        io.phase = "busy";
+        io.acked = false;
+      } else {
+        // Not parked: drain anything the poller queued while this turn ran, and deliver it.
+        const queued = inbox.drain();
+        if (queued.length) {
+          nextPrompt = formatInboxPrompt(queued.join("\n"));
+          io.acked = false;
+          await recordEvent(cfg, {
+            who: "supervisor",
+            kind: "inbox-deliver",
+            detail: `${queued.length} line(s) at boundary`,
+          });
         }
       }
       // If the child died right after the last result, the write can throw EPIPE; treat that as
@@ -200,10 +246,11 @@ export async function supervise(cfg: Config): Promise<void> {
       continue;
     }
     // Process exited on its own (crash or clean stop). The keeper will respawn the
-    // whole harness; exiting here lets it apply backoff. Stop the watchdog on this clean
-    // return so its interval doesn't outlive the loop (belt-and-suspenders alongside the
+    // whole harness; exiting here lets it apply backoff. Stop the watchdog and the poller on this
+    // clean return so neither's async work outlives the loop (belt-and-suspenders alongside the
     // process.exit path — the timer is unref()ed, but tidy shutdown shouldn't rely on that).
     watchdog.stop();
+    poller.stop();
     console.log("[supervisor] agent process ended; exiting for keeper to respawn");
     await recordEvent(cfg, { who: "supervisor", kind: "exit", detail: `life #${life}` });
     return;
