@@ -133,6 +133,11 @@ prog="review-loop"
 # charset is URL-query-safe so it can go into a `glab api` query verbatim.
 branch_re='^[A-Za-z0-9._][A-Za-z0-9._/-]*$'
 
+# Is coreutils `timeout` available? Probed ONCE and shared by every hang-guard below. Stock macOS
+# ships none, and there the guarded command must run BARE: `timeout`'s own 127 "command not found"
+# would otherwise be misread as the probe itself failing (a wedged forge lookup, a logged-out codex).
+if command -v timeout >/dev/null 2>&1; then have_timeout=1; else have_timeout=0; fi
+
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
   cat <<'EOF'
@@ -192,11 +197,9 @@ done
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
 case "$effort" in low|medium|high|max) ;; *) die_usage "--effort must be low|medium|high|max (got '$effort')";; esac
 case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$codex')";; esac
-# --target is either a mode word or a branch name we hand to git ($branch_re keeps it a
-# leading-dash-free ref token that git can never read as an option).
+# --target is either a mode word or a branch name we hand to git.
 case "$target" in
   auto|none) ;;
-  # $branch_re already excludes a leading '-', so this one test covers the option-injection guard too.
   *) [[ "$target" =~ $branch_re ]] || die_usage "--target must be auto|none or a branch name matching $branch_re (got '$target')";;
 esac
 # --codex-model is interpolated into the `codex -m` command; restrict its charset (mirrors the
@@ -244,9 +247,7 @@ if [ "$stop_hook" -eq 1 ]; then
 fi
 
 # --- base / target resolution -----------------------------------------------------------------
-# The review scope must equal the MR/PR: diff from the merge-base with the branch this work merges
-# INTO. Diffing from the merge-base with origin/main over-scopes a branch STACKED on another
-# unmerged branch — the parent's commits are below that merge-base and leak into every phase's diff.
+# Rationale for the scope rule: see the SCOPE block in the header comment.
 # Resolution order: --base (verbatim) > --target REF > --target auto (derived) > historical default.
 
 # Resolve a branch NAME to a ref we can merge-base against, preferring the remote-tracking copy
@@ -262,17 +263,17 @@ resolve_branch_ref() {
   # refs/remotes/origin/HEAD, so `--target HEAD` would quietly resolve to origin's default branch
   # instead of erroring — and any candidate ending in /HEAD is that same pseudo-ref. Reject up front.
   case "$b" in HEAD|*/HEAD) return 1;; esac
+  # Precedence: origin/<b> > <other-remote>/<b> > local <b> > <b> already remote-qualified.
+  # Every remote-tracking copy outranks the local branch (not just origin's): on a fork checkout
+  # (origin=fork, upstream=canonical) a stale local `main` sitting behind upstream/<b> would
+  # otherwise win, and merge-basing against it lands BELOW the real target — re-introducing exactly
+  # the over-scoping this resolution exists to prevent. Other remotes are enumerated because a fork
+  # checkout whose remote is named `upstream` (or a repo with no `origin`) would otherwise resolve
+  # nothing for a derived name like "main" that has no local branch.
   local cands=("remotes/origin/$b")
-  # Then EVERY other configured remote: a fork checkout whose remote is named `upstream` (or a repo
-  # with no `origin` at all) would otherwise resolve nothing for a derived name like "main" that has
-  # no local branch, silently dropping the scope fix on exactly the layout that needs it most.
   while IFS= read -r r; do
-    if [ -n "$r" ] && [ "$r" != "origin" ]; then cands+=("remotes/$r/$b"); fi
+    [ "$r" != "origin" ] && cands+=("remotes/$r/$b")
   done < <(git -C "$dir" remote 2>/dev/null || true)
-  # The LOCAL branch ranks below every remote-tracking copy, not just origin's: on a fork checkout
-  # (origin=fork, upstream=canonical) a stale local `main`/parent branch sitting behind
-  # upstream/<b> would otherwise win, and merge-basing against it lands BELOW the real target —
-  # re-introducing exactly the over-scoping this resolution exists to prevent.
   cands+=("heads/$b" "remotes/$b")
   for cand in "${cands[@]}"; do
     if git -C "$dir" rev-parse --verify --quiet "refs/$cand^{commit}" >/dev/null 2>&1; then
@@ -316,9 +317,8 @@ detect_target_branch() {
     *github*) order=(gh);;
   esac
 
-  # Probe wrapper (hoisted: the timeout lookup does not vary per tool).
   local wrap=()
-  if command -v timeout >/dev/null 2>&1; then wrap=(timeout 25); fi
+  [ "$have_timeout" -eq 1 ] && wrap=(timeout 25)
 
   for tool in "${order[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || continue
@@ -346,19 +346,21 @@ detect_target_branch() {
     out="${out//[$'\r\n\t ']/}"
     # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
     # into git. An unusable answer means "no MR context", i.e. fall back.
-    [[ "$out" =~ $branch_re ]] || { out=""; continue; }
+    [[ "$out" =~ $branch_re ]] || continue
     printf '%s\n' "$out"; return 0
   done
   return 1
 }
 
-if [ -z "$base" ]; then
-  target_branch=""
-  case "$target" in
-    none) ;;
-    auto) target_branch="$(detect_target_branch || true)";;
-    *)    target_branch="$target";;
-  esac
+if [ -z "$base" ] && [ "$target" != "none" ]; then
+  # $target_src names the SOURCE the branch came from: the same branch is taken for an explicit
+  # --target REF, where no MR/PR was consulted at all — calling that "the MR/PR target branch" sends
+  # someone debugging a wrong scope looking for an MR that does not exist.
+  if [ "$target" = "auto" ]; then
+    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"
+  else
+    target_branch="$target";                         target_src="--target"
+  fi
   if [ -n "$target_branch" ]; then
     if target_ref="$(resolve_branch_ref "$target_branch")"; then
       # Display the short form (origin/main, main) — the full refs/ path is only there to keep
@@ -366,14 +368,7 @@ if [ -z "$base" ]; then
       target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
       base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
       if [ -n "$base" ]; then
-        # Say which SOURCE the branch came from: this same branch is taken for an explicit
-        # --target REF, where no MR/PR was consulted at all — calling it "the MR/PR target branch"
-        # sends someone debugging a wrong scope looking for an MR that does not exist.
-        if [ "$target" = "auto" ]; then
-          echo "$prog: scoping the review to the MR/PR target branch $target_disp"
-        else
-          echo "$prog: scoping the review to --target $target_disp"
-        fi
+        echo "$prog: scoping the review to $target_src $target_disp"
       elif [ "$target" = "auto" ]; then
         # Unrelated histories under a DERIVED target: best-effort mode, so fall back quietly.
         echo "$prog: no merge-base between HEAD and $target_disp — falling back to the default base" >&2
@@ -406,18 +401,17 @@ fi
 # prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
 base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
 
-# Scope suffix for the CLAUDE phases. /code-review and /simplify derive the diff range THEMSELVES
-# (`git diff @{upstream}...HEAD`, else `main...HEAD`) — which is exactly the over-scoping the
-# --base/--target resolution above exists to fix, so without handing them the resolved base the fix
-# would only reach the codex/security prompts and the `--security auto` heuristic. Appended to the
-# slash command; run_fix_phase's $display keeps the per-round header short.
-claude_scope=" — SCOPE: the diff base for this review is $base_short. Review ONLY \`git diff $base_short...HEAD\` plus any uncommitted changes; do NOT derive the range yourself and do NOT review commits below that base."
+# Scope for the CLAUDE phases. Left to themselves, /code-review and /simplify derive the range
+# (`git diff @{upstream}...HEAD`, else `main...HEAD`) — exactly the over-scoping the --base/--target
+# resolution above exists to fix. Both take a <target> argument, so hand them the resolved range
+# THERE: a ref range is a target form they build the diff command from directly, where a prose
+# instruction only gets honored as a soft narrowing of the range they derived anyway.
+claude_scope=" $base_short...HEAD (plus any uncommitted changes)"
 
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
-# cycle, post-security pass), so build the prompt and its short header form once here — keeping the
-# scope suffix attached to the command in one spot instead of three that can drift apart.
+# cycle, post-security pass), so build it once here — keeping the scope argument attached to the
+# command in one spot instead of three that can drift apart.
 cr_cmd="/code-review $effort --fix$claude_scope"
-cr_disp="/code-review $effort --fix"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -743,12 +737,10 @@ codex_usable() {
   if ! command -v codex >/dev/null 2>&1; then
     CODEX_REASON="codex not found on PATH — degrading to Claude-only"; return 1
   fi
-  # `codex login status` is a fast LOCAL check (no model call). Wrap it in `timeout` when that binary
-  # is available so a wedged probe can't hang, but fall back to a bare call when `timeout` is absent
-  # (e.g. stock macOS) — otherwise `timeout`'s 127 "command not found" would be misread as "not logged
-  # in" and a fully-configured Codex would be silently skipped.
-  local login_probe
-  if command -v timeout >/dev/null 2>&1; then login_probe=(timeout 20 codex login status); else login_probe=(codex login status); fi
+  # `codex login status` is a fast LOCAL check (no model call); guard it against wedging (see
+  # $have_timeout for why the bare fallback matters).
+  local login_probe=(codex login status)
+  [ "$have_timeout" -eq 1 ] && login_probe=(timeout 20 codex login status)
   if ! "${login_probe[@]}" </dev/null >/dev/null 2>&1; then
     CODEX_REASON="codex not logged in ('codex login status' failed) — degrading to Claude-only"; return 1
   fi
@@ -825,11 +817,11 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 SEC_CAP=""
 trap 'rm -f "$SEC_CAP" "$CODEX_CAP" 2>/dev/null || true' EXIT
 
-run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes" "$cr_disp"
+run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
-run_fix_phase "simplify" "/simplify$claude_scope" "chore(review): simplify" "/simplify"
+run_fix_phase "simplify" "/simplify$claude_scope" "chore(review): simplify"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
@@ -870,7 +862,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
-      run_fix_phase "code-review (reconcile)" "$cr_cmd" "chore(review): reconcile code-review" "$cr_disp"
+      run_fix_phase "code-review (reconcile)" "$cr_cmd" "chore(review): reconcile code-review"
       FCR_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCR_CHANGED=1
       c_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"
 
@@ -911,7 +903,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     done
   else
     echo ">>> final code-review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
-    run_fix_phase "code-review (post-security)" "$cr_cmd" "chore(review): post-security code-review" "$cr_disp"
+    run_fix_phase "code-review (post-security)" "$cr_cmd" "chore(review): post-security code-review"
     FCR_RAN=1; FCR_ROUNDS="$PHASE_ROUNDS"; FCR_CHANGED="$PHASE_CHANGED"; RECONCILE_STATUS="$PHASE_STATUS"
   fi
 else
