@@ -20,6 +20,11 @@ export interface StreamEvent {
   subtype?: string;
   /** present on `result` frames */
   usage?: Usage;
+  /** present on `result` frames: the turn failed, with `result` carrying the message */
+  is_error?: boolean;
+  result?: string;
+  /** set on the synthetic frame claude emits when the OAuth session is dead */
+  error?: string;
   /** the full raw frame, for anything not modelled here */
   raw: unknown;
 }

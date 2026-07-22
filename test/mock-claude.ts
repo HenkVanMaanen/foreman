@@ -13,6 +13,46 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
+// `auth status` / `auth login` — the re-login relay shells out to the SAME binary for these, so
+// they must be answered before anything below (no lives counter, no stream-json init frame).
+// Handled here rather than in a second mock so the relay is driven through exactly the binary
+// the supervisor was configured with.
+const authOkFile = process.env.MOCK_AUTH_OK ?? "state/mock-auth-ok";
+if (process.argv[2] === "auth") {
+  if (process.argv[3] === "status") {
+    // Shape claudeAuthStatus() parses. Absent file → logged out.
+    process.stdout.write(`${JSON.stringify({ loggedIn: existsSync(authOkFile) })}\n`);
+    process.exit(0);
+  }
+  if (process.argv[3] === "login") {
+    // A URL, then a trailing prompt: matchComplete() needs at least one byte AFTER the link to
+    // prove it is not still arriving, which is exactly what the real CLI's prompt supplies.
+    process.stdout.write("Browser did not open. Visit:\n");
+    process.stdout.write("https://claude.ai/oauth/authorize?code=true&state=mock123\n");
+    process.stdout.write("Paste code here: ");
+    // Under `script -qec` stdin IS the pty, so the relayed code arrives here.
+    for await (const chunk of Bun.stdin.stream()) {
+      const code = new TextDecoder().decode(chunk).trim();
+      if (!code) continue;
+      // To DISK, not stderr: under `script -qec` our stderr is the pty, which the relay drains
+      // and discards once it has the URL — so a stderr line here is unobservable to the test.
+      writeFileSync(`${authOkFile}.code`, `${code}\n`);
+      if (code !== (process.env.MOCK_AUTH_CODE ?? "GOODCODE")) {
+        // Faithful to the real CLI: a wrong code RE-PROMPTS, it does not exit. The relay's
+        // bounded awaitSliced + retry loop only exists because of that, so a mock that exited 0
+        // here would make the whole bad-code path untestable.
+        process.stdout.write("\nInvalid code. Paste code here: ");
+        continue;
+      }
+      writeFileSync(authOkFile, "ok\n");
+      process.stdout.write("\nLogin successful.\n");
+      process.exit(0);
+    }
+    process.exit(1);
+  }
+  process.exit(2);
+}
+
 const livesFile = process.env.MOCK_LIVES_FILE ?? "state/mock-lives";
 const step = Number(process.env.MOCK_STEP ?? "300");
 // "usage" (default): grow usage to cross the context marks and force a recycle.

@@ -5,6 +5,14 @@
 export interface Config {
   claudeBin: string;
   claudeExtraArgs: string[];
+  // codex CLI, used only by the re-login relay (src/relogin.ts) to re-auth the second model.
+  codexBin: string;
+  // When claude's OAuth dies the model can't ask for help, so the supervisor relays the sign-in
+  // over the human channel itself. 0 disables (the loop then just exits for the keeper).
+  reloginEnabled: boolean;
+  // Test seam: report the first stream frame of the run as an auth failure, so the whole relay
+  // can be rehearsed end to end without logging anyone out. One-shot per run.
+  fakeAuthRequired: boolean;
   // Autonomous agents run tools without interactive approval; the human-in-the-loop is
   // ask-human, not per-tool prompts. Adds --dangerously-skip-permissions when true.
   skipPermissions: boolean;
@@ -51,6 +59,9 @@ export function loadConfig(): Config {
   return {
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
+    codexBin: str("FOREMAN_CODEX_BIN", "codex"),
+    reloginEnabled: str("FOREMAN_RELOGIN", "1") !== "0",
+    fakeAuthRequired: str("FOREMAN_FAKE_AUTH_REQUIRED", "0") === "1",
     skipPermissions: str("FOREMAN_SKIP_PERMISSIONS", "1") !== "0",
     contextWindow: num("FOREMAN_CONTEXT_WINDOW", 200_000),
     softMark: num("FOREMAN_SOFT_MARK", 0.6),

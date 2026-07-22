@@ -18,9 +18,20 @@ export function isStalled(lastProgressMs: number, nowMs: number, timeoutMs: numb
   return nowMs - lastProgressMs >= timeoutMs;
 }
 
-export interface Watchdog {
+/**
+ * What a long-running helper needs from the watchdog: somewhere to report progress. Taking this
+ * instead of the full Watchdog keeps callers that have no stall detection to run (the `foreman
+ * relogin` CLI, tests) from having to fabricate a deliberately-disabled timer just to make a call.
+ */
+export interface Heartbeat {
   /** Record a sign of life. Call on every stream event, send, and loop turn. */
   touch(): void;
+}
+
+/** No-op heartbeat for flows that are legitimately human-paced and must never be stall-killed. */
+export const NO_HEARTBEAT: Heartbeat = { touch() {} };
+
+export interface Watchdog extends Heartbeat {
   /** Stop the timer (graceful shutdown / test cleanup). */
   stop(): void;
 }

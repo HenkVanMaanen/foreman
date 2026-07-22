@@ -5,8 +5,26 @@
 import { describe, expect, test } from "bun:test";
 import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
-import { classifyInbox, extractInboxLines, formatInboxPrompt, InboxQueue } from "../src/inbox.ts";
+import {
+  classifyInbox,
+  extractInboxLines,
+  formatInboxPrompt,
+  InboxQueue,
+  takeAnswer,
+  waitForInboxLines,
+} from "../src/inbox.ts";
+import type { StreamEvent } from "../src/protocol.ts";
 import { usageTotal, userMessage } from "../src/protocol.ts";
+import {
+  DEVICE_CODE_RE,
+  detectAuthRequired,
+  extractDeviceCode,
+  extractUrl,
+  makeAuthDetector,
+  makeReloginBreaker,
+  matchComplete,
+  URL_RE,
+} from "../src/relogin.ts";
 import { secretFileName } from "../src/secrets.ts";
 import { isStalled, startWatchdog } from "../src/watchdog.ts";
 
@@ -203,53 +221,38 @@ describe("startWatchdog", () => {
 });
 
 describe("classifyInbox", () => {
-  test("exit 0 with MSG lines → messages, prompt carries the lines verbatim", () => {
-    const stdout = "MSG abc - hello there\nMSG def abc follow-up\n";
+  // The classifier returns the raw lines; formatInboxPrompt (tested below) turns them into the
+  // agent-facing prompt, and the re-login relay reads the human's code straight off the lines.
+  const linesOf = (stdout: string): string[] | undefined => {
     const action = classifyInbox(0, stdout);
     expect(action.kind).toBe("messages");
-    if (action.kind === "messages") {
-      expect(action.prompt).toContain("MSG abc - hello there");
-      expect(action.prompt).toContain("MSG def abc follow-up");
-      expect(action.prompt.startsWith("[inbox] New message(s)")).toBe(true);
-    }
+    return action.kind === "messages" ? action.lines : undefined;
+  };
+
+  test("exit 0 with MSG lines → messages, carrying the lines verbatim", () => {
+    expect(linesOf("MSG abc - hello there\nMSG def abc follow-up\n")).toEqual([
+      "MSG abc - hello there",
+      "MSG def abc follow-up",
+    ]);
   });
 
   test("exit 0 keeps only MSG lines and drops stray output", () => {
-    const action = classifyInbox(0, "some noise\nMSG p1 - hi\nwait-reply: done\n");
-    expect(action.kind).toBe("messages");
-    if (action.kind === "messages") {
-      expect(action.prompt).toContain("MSG p1 - hi");
-      expect(action.prompt).not.toContain("some noise");
-      expect(action.prompt).not.toContain("wait-reply: done");
-    }
+    expect(linesOf("some noise\nMSG p1 - hi\nwait-reply: done\n")).toEqual(["MSG p1 - hi"]);
   });
 
-  test("exit 0 with an ACK line (reaction-ack) → messages, prompt carries it verbatim", () => {
-    const action = classifyInbox(0, "ACK p9 - +1\n");
-    expect(action.kind).toBe("messages");
-    if (action.kind === "messages") {
-      expect(action.prompt).toContain("ACK p9 - +1");
-      expect(action.prompt.startsWith("[inbox] New message(s)")).toBe(true);
-    }
+  test("exit 0 with an ACK line (reaction-ack) → messages, carrying it verbatim", () => {
+    expect(linesOf("ACK p9 - +1\n")).toEqual(["ACK p9 - +1"]);
   });
 
   test("exit 0 with mixed ACK + MSG lines → messages, both pass through verbatim", () => {
-    const action = classifyInbox(0, "MSG abc - hello\nACK def rootX +1\n");
-    expect(action.kind).toBe("messages");
-    if (action.kind === "messages") {
-      expect(action.prompt).toContain("MSG abc - hello");
-      expect(action.prompt).toContain("ACK def rootX +1");
-    }
+    expect(linesOf("MSG abc - hello\nACK def rootX +1\n")).toEqual([
+      "MSG abc - hello",
+      "ACK def rootX +1",
+    ]);
   });
 
   test("exit 0 drops stray output but keeps ACK lines", () => {
-    const action = classifyInbox(0, "noise\nACK p1 - +1\nwait-reply: done\n");
-    expect(action.kind).toBe("messages");
-    if (action.kind === "messages") {
-      expect(action.prompt).toContain("ACK p1 - +1");
-      expect(action.prompt).not.toContain("noise");
-      expect(action.prompt).not.toContain("wait-reply: done");
-    }
+    expect(linesOf("noise\nACK p1 - +1\nwait-reply: done\n")).toEqual(["ACK p1 - +1"]);
   });
 
   test("exit 0 with no MSG/ACK lines is unexpected → error (falls back to CONTINUE)", () => {
@@ -270,7 +273,7 @@ describe("classifyInbox", () => {
 
 describe("formatInboxPrompt", () => {
   test("wraps raw MSG lines with the [inbox] preamble and handling guidance", () => {
-    const p = formatInboxPrompt("MSG x - yo");
+    const p = formatInboxPrompt(["MSG x - yo"]);
     expect(p.startsWith("[inbox] New message(s)")).toBe(true);
     expect(p).toContain("MSG x - yo");
     expect(p).toContain("new root");
@@ -332,5 +335,280 @@ describe("InboxQueue", () => {
   test("take returns [] on timeout with nothing pending", async () => {
     const q = new InboxQueue();
     expect(await q.take(5)).toEqual([]);
+  });
+});
+
+describe("waitForInboxLines", () => {
+  const beat = () => {
+    let n = 0;
+    return { touch: () => n++, count: () => n };
+  };
+
+  test("returns the lines the poller pushed, and consumes them from the queue", async () => {
+    const q = new InboxQueue();
+    const hb = beat();
+    const p = waitForInboxLines(q, hb, () => {}, Date.now() + 10_000);
+    q.push(["MSG a - 1234"]);
+    expect(await p).toEqual(["MSG a - 1234"]);
+    expect(q.size()).toBe(0); // taken, not copied — the caller now owns the only copy
+    expect(hb.count()).toBe(1);
+  });
+
+  test("throws once the deadline passes, so the relay can send a fresh sign-in link", async () => {
+    const q = new InboxQueue();
+    // Already expired: the check happens BEFORE blocking, so this must not wait at all.
+    await expect(waitForInboxLines(q, beat(), () => {}, Date.now() - 1)).rejects.toThrow(
+      /before the deadline/,
+    );
+  });
+
+  test("an empty wake refreshes and keeps waiting until the deadline", async () => {
+    const q = new InboxQueue();
+    const hb = beat();
+    let refreshes = 0;
+    // A 30ms deadline is several clamped takes: each empty one refreshes and re-blocks, and the
+    // last throws rather than overshooting.
+    await expect(
+      waitForInboxLines(
+        q,
+        hb,
+        () => {
+          refreshes++;
+        },
+        Date.now() + 30,
+      ),
+    ).rejects.toThrow(/before the deadline/);
+    expect(refreshes).toBeGreaterThan(0);
+    expect(hb.count()).toBeGreaterThan(0); // a long wait is not a wedge
+  });
+});
+
+/** A minimal StreamEvent, built the way Session.parse builds one: raw fields spread onto it. */
+const ev = (type: string, raw: Record<string, unknown>) => ({ type, ...raw, raw }) as StreamEvent;
+
+describe("detectAuthRequired", () => {
+  test("assistant frame carrying error:authentication_failed is the signal", () => {
+    expect(detectAuthRequired(ev("assistant", { error: "authentication_failed" }))).toBe(
+      "authentication_failed",
+    );
+  });
+
+  test("the is_error result frame claude emits when logged out", () => {
+    const detail = detectAuthRequired(
+      ev("result", { is_error: true, result: "Not logged in · Please run /login" }),
+    );
+    expect(detail).toContain("Not logged in");
+  });
+
+  test("an expired-token result frame also matches", () => {
+    expect(
+      detectAuthRequired(ev("result", { is_error: true, result: "OAuth token has expired" })),
+    ).toBeTruthy();
+  });
+
+  test("an ordinary failed turn is NOT an auth failure", () => {
+    expect(
+      detectAuthRequired(ev("result", { is_error: true, result: "Tool use failed: ENOENT" })),
+    ).toBeUndefined();
+  });
+
+  // An is_error frame carries whatever the failing TOOL said. A loose keyword match would read
+  // some other service's logged-out message as claude's own and drag the human through a
+  // pointless sign-in against a session that never expired.
+  test("another tool's 'not logged in' error is NOT claude's auth failure", () => {
+    expect(
+      detectAuthRequired(
+        ev("result", {
+          is_error: true,
+          result: "gh: You are not logged in to any GitHub hosts. Run `gh auth login`",
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("a failed turn that merely mentions refresh tokens is NOT an auth failure", () => {
+    expect(
+      detectAuthRequired(
+        ev("result", { is_error: true, result: "test failed: refresh token rotation spec" }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("an invalid/expired refresh token IS an auth failure", () => {
+    expect(
+      detectAuthRequired(ev("result", { is_error: true, result: "invalid refresh token" })),
+    ).toBeTruthy();
+    expect(
+      detectAuthRequired(ev("result", { is_error: true, result: "refresh token has expired" })),
+    ).toBeTruthy();
+  });
+
+  test("a healthy result frame is not a signal", () => {
+    expect(detectAuthRequired(ev("result", { is_error: false, result: "done" }))).toBeUndefined();
+  });
+
+  test("auth-shaped text on a NON-error frame is ignored (the agent may just be talking)", () => {
+    expect(
+      detectAuthRequired(ev("result", { is_error: false, result: "tell them to run /login" })),
+    ).toBeUndefined();
+  });
+
+  test("a frame with no raw payload is safe", () => {
+    expect(detectAuthRequired({ type: "system", raw: undefined } as StreamEvent)).toBeUndefined();
+  });
+});
+
+describe("makeAuthDetector", () => {
+  const healthy = ev("result", { is_error: false });
+
+  test("the fake-auth injection fires exactly once, then defers to the real detector", () => {
+    const detect = makeAuthDetector(true);
+    expect(detect(healthy)).toContain("injected");
+    expect(detect(healthy)).toBeUndefined();
+  });
+
+  test("without the flag it is a pass-through", () => {
+    expect(makeAuthDetector(false)(healthy)).toBeUndefined();
+  });
+});
+
+describe("makeReloginBreaker", () => {
+  test("auth-only lives in a row trip it", () => {
+    const breaker = makeReloginBreaker(3);
+    expect(breaker(false)).toBe("attempt");
+    expect(breaker(false)).toBe("attempt");
+    expect(breaker(false)).toBe("give-up");
+  });
+
+  test("a life that completed a healthy turn is a genuine expiry and resets the count", () => {
+    const breaker = makeReloginBreaker(3);
+    breaker(false);
+    breaker(false);
+    expect(breaker(true)).toBe("attempt");
+    expect(breaker(false)).toBe("attempt");
+    expect(breaker(false)).toBe("attempt");
+    expect(breaker(false)).toBe("give-up");
+  });
+});
+
+describe("takeAnswer", () => {
+  test("returns the text of the LAST MSG line (a correction supersedes a typo)", () => {
+    expect(takeAnswer(["MSG 1 - wrongcode", "MSG 2 - rightcode#state"]).text).toBe(
+      "rightcode#state",
+    );
+  });
+
+  test("ignores ACK lines, which carry no text", () => {
+    expect(takeAnswer(["MSG 1 - thecode", "ACK 2 - +1"]).text).toBe("thecode");
+  });
+
+  test("a code containing spaces is preserved whole", () => {
+    expect(takeAnswer(["MSG 1 - abc def"]).text).toBe("abc def");
+  });
+
+  test("no MSG lines → undefined (caller retries rather than pasting junk)", () => {
+    expect(takeAnswer(["ACK 2 - +1"]).text).toBeUndefined();
+    expect(takeAnswer([]).text).toBeUndefined();
+  });
+
+  test("rest is every line NOT taken as the answer, in order", () => {
+    const { text, rest } = takeAnswer(["ACK 1 - +1", "MSG 2 - old", "MSG 3 - new"]);
+    expect(text).toBe("new");
+    expect(rest).toEqual(["ACK 1 - +1", "MSG 2 - old"]);
+  });
+
+  test("two identical lines: only the one read as the answer is removed", () => {
+    // An equality filter would drop both; index-based selection keeps the duplicate as a spare.
+    expect(takeAnswer(["MSG 1 - dup", "MSG 1 - dup"]).rest).toEqual(["MSG 1 - dup"]);
+  });
+
+  // The human sends the code and then a whitespace-only follow-up; both land in ONE poller batch.
+  // Taking the last MSG line unconditionally would read a blank as "no answer", burn an attempt,
+  // and echo the still-live code back into the channel instead of pasting it into the login.
+  test("a later blank-texted MSG does not hide a real answer in the same batch", () => {
+    const { text, rest } = takeAnswer(["MSG 1 - GOODCODE", "MSG 2 -   "]);
+    expect(text).toBe("GOODCODE");
+    expect(rest).toEqual(["MSG 2 -   "]);
+  });
+
+  test("no answer → every line is a spare (nothing is silently eaten)", () => {
+    expect(takeAnswer(["ACK 2 - +1"]).rest).toEqual(["ACK 2 - +1"]);
+    // A blank-texted MSG line is not an answer, so it stays in rest.
+    expect(takeAnswer(["MSG 1 - "]).rest).toEqual(["MSG 1 - "]);
+  });
+});
+
+describe("extractUrl / extractDeviceCode", () => {
+  const URL = "https://claude.com/cai/oauth/authorize?code=true&state=xyz";
+  // Shaped like real `script -qec 'claude auth login'` output: an OSC-8 hyperlink wrapping an
+  // SGR-coloured copy of the same URL. Both copies must resolve to the bare URL.
+  const ptyBanner = `visit: \u001B]8;;${URL}\u0007\u001B[94m${URL}\u001B[39m\u001B]8;;\u0007\r\n`;
+
+  test("pulls the sign-in URL out of pty output wrapped in escape sequences", () => {
+    expect(extractUrl(ptyBanner)).toBe(URL);
+  });
+
+  test("strips trailing sentence punctuation", () => {
+    expect(extractUrl("visit https://example.com/x.")).toBe("https://example.com/x");
+  });
+
+  test("no URL → undefined", () => {
+    expect(extractUrl("nothing here")).toBeUndefined();
+  });
+
+  // CSI sequences with a `?` parameter byte (cursor-hide, alt-screen) are what a TUI emits around
+  // its output. ESC is neither whitespace nor excluded by URL_RE, so an unstripped one sitting
+  // right after the link gets swallowed into the match and the human is sent a dead URL.
+  test("strips private-parameter CSI sequences abutting the URL", () => {
+    expect(extractUrl(`\u001B[?25lvisit ${URL}\u001B[?25h`)).toBe(URL);
+  });
+
+  // A pty can split an escape sequence across chunks, leaving a lone ESC stripAnsi cannot remove.
+  // ESC is not whitespace, so without an explicit exclusion it lands inside the match.
+  test("a lone unstrippable ESC is never part of the URL", () => {
+    expect(extractUrl(`visit ${URL}\u001B[`)).toBe(URL);
+    expect(extractUrl(`visit ${URL}\u001B`)).toBe(URL);
+  });
+
+  test("pulls the codex one-time device code", () => {
+    expect(extractDeviceCode("Enter this one-time code\n   \u001B[94mKK4S-ADG57\u001B[0m")).toBe(
+      "KK4S-ADG57",
+    );
+  });
+
+  test("no device code → undefined", () => {
+    expect(extractDeviceCode("Open this link in your browser")).toBeUndefined();
+  });
+
+  // codex prints the URL BEFORE the code. A `\b…\b` code pattern matches an uppercase
+  // `ABCD-EFGHI` segment inside the link, which would both satisfy the banner-read early (before
+  // the real code arrived) and forward a string that types in but never authorises.
+  test("an uppercase segment inside the sign-in URL is not the device code", () => {
+    const banner = "https://auth.openai.com/device?state=AB3F-9KD2X\n\n  KK4S-ADG57\n";
+    expect(extractDeviceCode(banner)).toBe("KK4S-ADG57");
+    expect(matchComplete("https://auth.openai.com/device?state=AB3F-9KD2X\n", DEVICE_CODE_RE)).toBe(
+      false,
+    );
+  });
+
+  // The pty delivers output in chunks; without this the reader stops on the first regex hit and
+  // forwards a URL that is still arriving — a dead link the human cannot fix.
+  describe("matchComplete", () => {
+    const colour = (s: string) => `\u001B[94m${s}\u001B[39m`;
+
+    test("a URL still arriving is NOT complete; one trailing byte proves it is", () => {
+      const partial = `visit: ${URL.slice(0, 30)}`;
+      expect(matchComplete(partial, URL_RE)).toBe(false);
+      expect(matchComplete(`${partial}\r\n`, URL_RE)).toBe(true);
+    });
+
+    test("trailing bytes that are only escape sequences do not prove completeness", () => {
+      expect(matchComplete(colour(URL), URL_RE)).toBe(false);
+      expect(matchComplete(`${colour(URL)}\r\n`, URL_RE)).toBe(true);
+    });
+
+    test("no match at all is not complete", () => {
+      expect(matchComplete("nothing here\n", URL_RE)).toBe(false);
+    });
   });
 });

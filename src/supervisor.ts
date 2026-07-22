@@ -5,17 +5,18 @@
 
 import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import type { Config } from "./config.ts";
-import { recordEvent, writeStatus } from "./dashboard.ts";
+import { recordEvent, type SupervisorState, writeStatus } from "./dashboard.ts";
 import {
   formatInboxPrompt,
   InboxQueue,
   sendTelegramAck,
   startInboxPoller,
-  waitForInboxMessages,
+  waitForInboxLines,
 } from "./inbox.ts";
 import { usageTotal } from "./protocol.ts";
+import { handBackLines, makeAuthDetector, makeAuthRecovery } from "./relogin.ts";
 import { Session } from "./session.ts";
 import { startWatchdog } from "./watchdog.ts";
 import { ensureWorkspace, syncNotes } from "./workspace.ts";
@@ -41,8 +42,7 @@ export async function supervise(cfg: Config): Promise<void> {
   const softTokens = Math.floor(cfg.contextWindow * cfg.softMark);
 
   // Seed/verify the agent workspace (notes, bin/, state, worktrees) before launch.
-  const home = resolve(import.meta.dir, "..");
-  const workspaceEnv = await ensureWorkspace(cfg, home);
+  const workspaceEnv = await ensureWorkspace(cfg);
 
   // Env for the agent: workspace (PATH + FOREMAN_HOME) on top of the full inherited process
   // env. Session.start() already spreads ...process.env into the child, so every channel cred
@@ -54,7 +54,7 @@ export async function supervise(cfg: Config): Promise<void> {
   // Track for the dashboard: which fresh lifetime we're on, and the last observed usage.
   let life = 0;
   let lastUsed = 0;
-  const stat = (state: string) =>
+  const stat = (state: SupervisorState) =>
     writeStatus(cfg, {
       pid: process.pid,
       state,
@@ -95,10 +95,24 @@ export async function supervise(cfg: Config): Promise<void> {
   // Always-on inbox. ONE poller drains Telegram for the whole harness lifetime (across every
   // agent life), so the agent never goes deaf during a long work turn the way the old parked-only
   // poll did. `io.phase` lets the poller distinguish "agent busy" (auto-ack + queue for the next
-  // boundary) from "agent parked" (the parked wait below wakes it directly, no ack). `io.acked`
+  // boundary) from "agent parked" (the parked wait below wakes it directly, no ack) and "relogin"
+  // (the relay owns the queue and is itself mid-conversation with the human — an "I'm mid-task"
+  // ack on top of "please send me the sign-in code" would be actively misleading). `io.acked`
   // throttles the auto-ack to once per busy stretch so a burst of messages isn't a burst of acks.
   const inbox = new InboxQueue();
-  const io = { phase: "busy" as "busy" | "parked", acked: false };
+  const io = { phase: "busy" as "busy" | "parked" | "relogin", acked: false };
+  // The dashboard state each phase shows, as a table rather than restated at every flip. In
+  // particular the relogin phase must never be stamped with a healthy-looking "working" at the one
+  // moment the human reading the dashboard is the only thing that can unwedge the harness.
+  const PHASE_STATE = {
+    busy: "working",
+    parked: "idle",
+    relogin: "auth-required",
+  } as const satisfies Record<typeof io.phase, SupervisorState>;
+  // Re-stamp the status for whatever phase we are in now. Handed to the poller (so an empty poll
+  // keeps the dashboard fresh) and to the re-login relay, which can block on the human for the
+  // better part of an hour — a status that old reads as "quiet"/wedged.
+  const refresh = () => stat(PHASE_STATE[io.phase]);
   const poller = startInboxPoller(cfg, passthroughEnv, inbox, {
     isBusy: () => io.phase === "busy",
     onBusyMessage: async (lines) => {
@@ -114,8 +128,18 @@ export async function supervise(cfg: Config): Promise<void> {
         detail: `${lines.length} line(s) while busy`,
       });
     },
-    refresh: () => stat(io.phase === "parked" ? "idle" : "working"),
+    refresh,
   });
+
+  // Re-login relay: an expired OAuth token makes every turn fail instantly with a synthetic
+  // "Not logged in · Please run /login" frame, which the loop would otherwise `continue` into
+  // forever with the model never running. Detect it, tear the session down, and hand off to the
+  // Telegram-mediated re-auth below. ONE detector for the whole run: the FOREMAN_FAKE_AUTH_REQUIRED
+  // test injection is one-shot per instance, so a per-life detector would re-inject every life.
+  const authDetector = makeAuthDetector(cfg.fakeAuthRequired);
+  // Owns the rest of the policy (enabled?, hot-loop breaker, which agent to re-auth) — see
+  // makeAuthRecovery. Built once: the breaker's state has to span lives to spot a hot loop.
+  const recoverAuth = makeAuthRecovery(cfg);
 
   // Outer loop: each iteration is one fresh agent lifetime (until a recycle or exit).
   for (;;) {
@@ -130,15 +154,37 @@ export async function supervise(cfg: Config): Promise<void> {
     io.acked = false;
     console.log("[supervisor] agent launched; bootstrap sent");
     await recordEvent(cfg, { who: "supervisor", kind: "launch", detail: `life #${life}` });
-    await stat("working");
+    await refresh();
 
     let awaitingCheckpoint = false;
     let nudgedSoft = false;
-    let recycle = false;
+    // Why this life ended, set at whichever `break` ends it (each also logs/records its own
+    // detail — nothing downstream needs the text again). One variable rather than a flag per
+    // outcome, so the outcomes are visibly exclusive and adding one can't silently overlap an
+    // existing case. "process" is the default: the stream ended on its own (crash or clean stop).
+    let ended: "process" | "recycle" | "auth" = "process";
+    // The detector's verdict for this life, handed to recoverAuth so it can tell a REHEARSAL
+    // (the FOREMAN_FAKE_AUTH_REQUIRED injection) from a real lockout without latching its own copy.
+    let authDetail = "";
+    // Did the model actually complete a turn this life? A life that worked before the token died
+    // is a genuine expiry, not the hot loop the breaker above is guarding against.
+    let sawHealthyTurn = false;
 
     for await (const ev of session.events()) {
       watchdog.touch(); // any frame (thinking, tool use, result) is a sign of life
+      const authFrame = authDetector(ev);
+      if (authFrame) {
+        ended = "auth";
+        authDetail = authFrame;
+        console.log(`[supervisor] auth required (${authFrame}) → re-login relay`);
+        await recordEvent(cfg, { who: "supervisor", kind: "auth-required", detail: authFrame });
+        break;
+      }
       if (ev.type !== "result") continue;
+      // A turn that FAILED is not evidence the session was ever working, so it must not reset the
+      // hot-loop breaker — otherwise a life that errors out and then hits the auth frame looks
+      // healthy every time and the breaker never trips on the spin it exists to catch.
+      if (ev.is_error !== true) sawHealthyTurn = true;
       const used = usageTotal(ev.usage);
       if (used) {
         console.log(`[supervisor] turn complete; context ≈ ${used}/${cfg.contextWindow}`);
@@ -149,14 +195,14 @@ export async function supervise(cfg: Config): Promise<void> {
 
       if (awaitingCheckpoint) {
         console.log("[supervisor] checkpoint turn complete → recycling");
-        recycle = true;
+        ended = "recycle";
         break;
       }
       if (existsSync(clearSentinel)) {
         await rm(clearSentinel, { force: true });
         console.log("[supervisor] agent requested clear → recycling");
         await recordEvent(cfg, { who: "supervisor", kind: "clear" });
-        recycle = true;
+        ended = "recycle";
         break;
       }
       if (used >= hardTokens) {
@@ -198,9 +244,9 @@ export async function supervise(cfg: Config): Promise<void> {
       if (existsSync(idleSentinel)) {
         await rm(idleSentinel, { force: true });
         io.phase = "parked";
-        await stat("idle");
+        await refresh();
         try {
-          nextPrompt = await waitForInboxMessages(inbox, watchdog, () => stat("idle"));
+          nextPrompt = formatInboxPrompt(await waitForInboxLines(inbox, watchdog, refresh));
         } catch (e) {
           console.log(`[supervisor] idle-wait failed (${e}); falling back to continue`);
           nextPrompt = CONTINUE;
@@ -211,7 +257,7 @@ export async function supervise(cfg: Config): Promise<void> {
         // Not parked: drain anything the poller queued while this turn ran, and deliver it.
         const queued = inbox.drain();
         if (queued.length) {
-          nextPrompt = formatInboxPrompt(queued.join("\n"));
+          nextPrompt = formatInboxPrompt(queued);
           io.acked = false;
           await recordEvent(cfg, {
             who: "supervisor",
@@ -232,16 +278,76 @@ export async function supervise(cfg: Config): Promise<void> {
     }
 
     await session.stop();
-    if (recycle) {
+    if (ended === "auth") {
+      // The model is down, so the SUPERVISOR asks the human: it sends the sign-in URL over the
+      // existing channel, blocks on the same inbox watermark the idle-wait uses until the code
+      // arrives, and pastes it in. On success we relaunch fresh; on anything else we exit so the
+      // keeper respawns with backoff (the relay blocks on the human, so this can't spam them).
+      // Flip the phase FIRST, before anything that yields: `isBusy()` still reads "busy" until
+      // this lands, so a message the poller picks up during the awaits below would draw the
+      // "I'm mid-task" auto-ack — the one reply this path must never send.
+      io.phase = "relogin";
+      await refresh();
+      // Same safety net the recycle path takes, for the same reason: whatever happens next —
+      // relaunch fresh, or exit for the keeper — this life's context is gone, so anything the
+      // agent wrote to notes/ since its last push has to reach foreman-state now or not at all.
+      syncNotes(cfg, "checkpoint before re-login");
+      // Hold back whatever the poller queued BEFORE the lockout. Those are ordinary messages for
+      // the agent, sent before the human was ever asked for a code — hand them to the relay and
+      // the LAST of them would be read as the sign-in code (and pasted into the login prompt).
+      // They are not dropped: the queue is restored below on the way back into the loop, and
+      // echoed to the human on the way out. The relay only ever sees lines that arrive after the
+      // sign-in URL was sent.
+      // The relay is now the queue's only reader (the parked wait cannot run — the session is
+      // stopped), which is what keeps InboxQueue's one-waiter rule satisfied.
+      const heldBack = inbox.drain();
+      const outcome = await recoverAuth(
+        watchdog,
+        inbox,
+        passthroughEnv,
+        sawHealthyTurn,
+        authDetail,
+        refresh,
+      );
+      await recordEvent(cfg, { who: "supervisor", kind: "relogin", detail: outcome });
+      if (outcome === "recovered") {
+        io.phase = "busy";
+        io.acked = false;
+        // Put the pre-lockout messages back at the FRONT of the agent's next boundary delivery.
+        // push() appends, so re-queue them AHEAD of anything the poller delivered during the
+        // re-login and the relay left behind — otherwise the older messages arrive last. push()
+        // no-ops on an empty list, and nothing is waiting on the queue right now.
+        inbox.push([...heldBack, ...inbox.drain()]);
+        continue;
+      }
+      // Phase stays "relogin" on the way out: flipping back to "busy" here would let the poller
+      // answer a message arriving during the notify below with the "I'm mid-task, I'll pick this
+      // up at my next checkpoint" auto-ack — a promise the harness is seconds from breaking.
+      console.log(`[supervisor] re-login ${outcome} → exiting for keeper to respawn`);
+      // Stop the poller BEFORE the final drain: it is still filling the queue, and anything it
+      // pushes after the drain has nothing left to read it — the process exits and the watermark
+      // has already moved past those lines (invariant 3).
+      watchdog.stop();
+      await poller.stop();
+      // We are about to exit, so this in-memory copy is the last one: the watermark moved past
+      // these lines when the poller read them, and no future life will ever see them. The relay
+      // hands back its own consumed-but-unused lines the same way; these are the ones it never
+      // saw, so handing them back is on us.
+      await handBackLines(
+        cfg,
+        passthroughEnv,
+        "[harness] I went down for re-authentication before I could handle these, and could " +
+          "not recover — please re-send anything that still needs an answer:",
+        [...heldBack, ...inbox.drain()],
+      );
+      return;
+    }
+    if (ended === "recycle") {
       await recordEvent(cfg, { who: "supervisor", kind: "recycle", detail: `life #${life}` });
       await stat("recycling");
       // Safety net: persist notes to foreman-state before we drop the context, even if the
       // agent didn't push during its checkpoint turn.
-      try {
-        syncNotes(cfg, "checkpoint before context recycle");
-      } catch (e) {
-        console.log(`[supervisor] notes sync on recycle failed: ${e}`);
-      }
+      syncNotes(cfg, "checkpoint before context recycle");
       console.log("[supervisor] relaunching fresh (context recycled)");
       continue;
     }
@@ -250,7 +356,7 @@ export async function supervise(cfg: Config): Promise<void> {
     // clean return so neither's async work outlives the loop (belt-and-suspenders alongside the
     // process.exit path — the timer is unref()ed, but tidy shutdown shouldn't rely on that).
     watchdog.stop();
-    poller.stop();
+    await poller.stop();
     console.log("[supervisor] agent process ended; exiting for keeper to respawn");
     await recordEvent(cfg, { who: "supervisor", kind: "exit", detail: `life #${life}` });
     return;

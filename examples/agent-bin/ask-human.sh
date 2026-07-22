@@ -17,8 +17,12 @@
 # root_id). On Telegram-only it is a generated id embedded as "#id" in the message.
 set -euo pipefail
 
-question="${1:?usage: ask-human \"question\" [--options a,b] [--urgency blocking|background]}"
+question="${1:?usage: ask-human \"question\"|- [--options a,b] [--urgency blocking|background]}"
 shift || true
+# "-" reads the question from stdin instead of argv. Use it whenever the text carries anything
+# sensitive (a sign-in URL, a one-time device code): /proc/<pid>/cmdline is world-readable, so an
+# argv-passed secret is visible to every local user for the life of the process. Matches `reply -`.
+[ "$question" = "-" ] && question="$(cat)"
 options=""; urgency="blocking"
 while [ $# -gt 0 ]; do
   case "$1" in

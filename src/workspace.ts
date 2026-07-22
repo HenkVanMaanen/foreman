@@ -30,7 +30,50 @@ const BIN_SCRIPTS = [
   "second-opinion",
 ] as const;
 
-export async function ensureWorkspace(cfg: Config, home: string): Promise<Record<string, string>> {
+/**
+ * Absolute path to one of the agent's bin/ scripts, resolved the SAME way ensureWorkspace()
+ * seeds it (relative to the harness cwd). Absolute so callers never depend on the child env's
+ * PATH resolution; a missing file makes Bun.spawn throw rather than silently pick another one.
+ * Restricted to BIN_SCRIPTS so a typo (or a script dropped from the list) is a compile error
+ * rather than an ENOENT swallowed by a caller's try/catch.
+ *
+ * Resolved per call, not once at import: freezing it at module-load time would bind every path
+ * to whatever cwd happened to be current when the first import ran.
+ */
+export function binPath(name: (typeof BIN_SCRIPTS)[number]): string {
+  return join(resolve("bin"), name);
+}
+
+/**
+ * Env for a harness-spawned bin/ script. Pins FOREMAN_STATE_DIR from config so the child
+ * reads/advances the SAME watermarks and secret store the agent used; without it a child could
+ * fall back to $HOME/.foreman and drain a different inbox offset.
+ *
+ * `extra` is folded in here rather than spread over the result by the caller: this copies the
+ * whole process env, and a caller that only wants one more variable should not pay for a second
+ * copy of it. It cannot override FOREMAN_STATE_DIR — that pin is the point of the helper.
+ */
+export function harnessChildEnv(
+  cfg: Config,
+  env: Record<string, string>,
+  extra?: Record<string, string>,
+): Record<string, string> {
+  return {
+    ...(process.env as Record<string, string>),
+    ...env,
+    ...extra,
+    FOREMAN_STATE_DIR: resolve(cfg.stateDir),
+  };
+}
+
+/**
+ * The harness root (the checkout holding examples/). Derived once here rather than passed in by
+ * each caller: the invariant used to have to be restated, and restated correctly, at every call
+ * site.
+ */
+const home = resolve(import.meta.dir, "..");
+
+export async function ensureWorkspace(cfg: Config): Promise<Record<string, string>> {
   await mkdir(cfg.stateDir, { recursive: true });
   await mkdir(cfg.worktreesDir, { recursive: true });
 
@@ -120,14 +163,24 @@ export async function ensureWorkspace(cfg: Config, home: string): Promise<Record
   };
 }
 
-/** Commit + push the agent's notes to foreman-state. Harness safety net (e.g. on recycle). */
+/**
+ * Commit + push the agent's notes to foreman-state. Harness safety net (e.g. on recycle).
+ *
+ * NEVER throws — same convention as recordEvent()/writeStatus(): every call site is a
+ * best-effort checkpoint on a path (recycle, auth-required) that must proceed whether or not
+ * the push lands, so swallowing here saves each of them restating the identical try/catch.
+ */
 export function syncNotes(cfg: Config, reason: string): void {
-  if (!cfg.stateRepo) return;
-  const notes = resolve(cfg.notesDir);
-  if (!existsSync(join(notes, ".git"))) return;
-  git(["-C", notes, "add", "-A"]);
-  if (git(["-C", notes, "diff", "--cached", "--quiet"]).ok) return; // nothing staged
-  git(["-C", notes, "commit", "-q", "-m", `notes: ${reason}`]);
-  git(["-C", notes, "branch", "-M", "main"]);
-  git(["-C", notes, "push", "-q", "-u", "origin", "main"]);
+  try {
+    if (!cfg.stateRepo) return;
+    const notes = resolve(cfg.notesDir);
+    if (!existsSync(join(notes, ".git"))) return;
+    git(["-C", notes, "add", "-A"]);
+    if (git(["-C", notes, "diff", "--cached", "--quiet"]).ok) return; // nothing staged
+    git(["-C", notes, "commit", "-q", "-m", `notes: ${reason}`]);
+    git(["-C", notes, "branch", "-M", "main"]);
+    git(["-C", notes, "push", "-q", "-u", "origin", "main"]);
+  } catch (e) {
+    console.log(`[workspace] notes sync failed (${reason}): ${e}`);
+  }
 }

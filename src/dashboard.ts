@@ -17,14 +17,25 @@ import type { Config } from "./config.ts";
 export interface ForemanEvent {
   ts: string; // ISO timestamp
   who: string; // "supervisor" or a worker task id
-  kind: string; // launch | turn | soft-mark | hard-mark | recycle | clear | exit
+  // launch | turn | soft-mark | hard-mark | recycle | clear | watchdog | auth-required |
+  // relogin | exit
+  kind: string;
   detail?: string;
   ctx?: number; // context tokens in use, when relevant
 }
 
+/**
+ * What the supervisor is doing. Named here — next to the `Status` that carries it and the
+ * `healthOf()` that reads it — rather than left as bare strings at each `stat(…)` call site, so a
+ * new state is a compile error at the writer instead of a value the dashboard silently fails to
+ * recognise. (`wedged` is written on a watchdog stall and has no `healthOf` arm; it is in the union
+ * because it is a real state, not because the display handles it.)
+ */
+export type SupervisorState = "working" | "idle" | "recycling" | "auth-required" | "wedged";
+
 export interface Status {
   pid: number; // the harness process, for a liveness check
-  state: string; // "working" | "recycling" — what the supervisor is doing
+  state: SupervisorState;
   ctxUsed: number;
   ctxWindow: number;
   ctxPct: number;
@@ -40,7 +51,7 @@ interface Worker {
   updatedAt: string;
 }
 
-type Health = "working" | "quiet" | "recycling" | "dead" | "offline";
+type Health = "working" | "quiet" | "recycling" | "auth-required" | "dead" | "offline";
 
 const EVENTS_MAX_BYTES = 1_000_000; // bound the log on long runs
 const QUIET_AFTER_MS = 90_000; // no heartbeat this long (but alive) → "quiet"
@@ -101,11 +112,29 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Is a `foreman supervise` loop live right now? Answered from the status file the supervisor
+ * stamps plus a liveness check on the pid it recorded, so it needs no cooperation from the loop.
+ *
+ * Exported for `foreman relogin`: that command starts its own inbox poller, and a SECOND
+ * `wait-reply --inbox` consumer would break inbox.ts invariant 2 — the two pollers would race for
+ * the same Telegram watermark and messages meant for the agent would be eaten by the CLI.
+ */
+export async function supervisorIsRunning(cfg: Config): Promise<boolean> {
+  const status = await readStatus(cfg);
+  return status !== null && pidAlive(status.pid);
+}
+
 /** Derive display health from harness-observable signals only — no agent cooperation. */
 function healthOf(status: Status | null): Health {
   if (!status) return "offline";
   if (!pidAlive(status.pid)) return "dead";
   if (status.state === "recycling") return "recycling";
+  // The re-login relay blocks on the human for up to half an hour while re-stamping the status
+  // between inbox polls (so it never reads "quiet"). Without this arm that block renders as plain
+  // "working" green — the dashboard would look healthiest at the one moment the human watching it
+  // is the only thing that can unwedge the harness.
+  if (status.state === "auth-required") return "auth-required";
   const stale = Date.now() - new Date(status.updatedAt).getTime() > QUIET_AFTER_MS;
   return stale ? "quiet" : "working";
 }
@@ -237,6 +266,7 @@ const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
   .working .dot{background:#3fb950;box-shadow:0 0 7px #3fb950}.working .health{color:#3fb950}
   .quiet .dot{background:#8b949e}.quiet .health{color:#8b949e}
   .recycling .dot{background:#58a6ff;box-shadow:0 0 7px #58a6ff}.recycling .health{color:#58a6ff}
+  .auth-required .dot{background:#d29922;box-shadow:0 0 7px #d29922}.auth-required .health{color:#d29922}
   .dead .dot{background:#f85149;box-shadow:0 0 7px #f85149}.dead .health{color:#f85149}
   .offline .dot{background:#6b7686}.offline .health{color:#6b7686}
   .bar{flex:1;min-width:180px;height:10px;background:#1b222c;border-radius:6px;overflow:hidden}
@@ -275,7 +305,7 @@ const PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 </main>
 <script>
 const $=s=>document.querySelector(s);
-const LABEL={working:"working",quiet:"quiet — no recent turns",recycling:"recycling context",dead:"not responding",offline:"offline"};
+const LABEL={working:"working",quiet:"quiet — no recent turns",recycling:"recycling context","auth-required":"waiting for you to re-authenticate",dead:"not responding",offline:"offline"};
 function ago(iso){if(!iso)return"";const d=(Date.now()-new Date(iso))/1000;
   if(d<60)return Math.floor(d)+"s ago";if(d<3600)return Math.floor(d/60)+"m ago";
   if(d<86400)return Math.floor(d/3600)+"h ago";return Math.floor(d/86400)+"d ago"}
