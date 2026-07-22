@@ -3,6 +3,7 @@
 // preview deployment and to one machine's absolute paths. Override per run, e.g.:
 //   CONSULTATIE_BASE=https://consultatie-main.simulatie.datastelsel.nl node capture-walk.mjs
 //   FOREMAN_STATE_DIR=/tmp/shots node video-walk.mjs
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const BASE = process.env.CONSULTATIE_BASE
@@ -16,3 +17,9 @@ const STATE = process.env.FOREMAN_STATE_DIR || fileURLToPath(new URL('../../stat
 export const SHOTS = `${STATE}/screenshots`;   // .png output
 export const POC = `${STATE}/poc`;             // scraped css/html + the poc mockup
 export const VIDEO_RAW = `${STATE}/video-raw`; // recordVideo dir + run artifacts
+
+// Create the output dirs here, once. Importing this module IS the declaration of intent to write
+// into them, and doing it centrally removes the per-script `fs.mkdirSync(OUT,{recursive:true})` —
+// which two scripts had and the other seven silently omitted, so they threw ENOENT on the first run
+// against a fresh FOREMAN_STATE_DIR.
+for (const d of [SHOTS, POC, VIDEO_RAW]) fs.mkdirSync(d, { recursive: true });

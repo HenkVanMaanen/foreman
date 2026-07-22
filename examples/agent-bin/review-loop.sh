@@ -292,8 +292,9 @@ detect_target_branch() {
   # Pick the forge CLI from origin's HOST, not from a substring of the whole URL (which misroutes
   # github.com/acme/gitlab-migration). When the host identifies the forge, probe ONLY that CLI: the
   # other one cannot answer for this repo anyway, and on a repo with both a github and a gitlab
-  # remote it can answer for the WRONG forge. An unrecognized (self-hosted) host tries both — glab
-  # first, since self-hosted GitLab is the case that reaches here.
+  # remote it can answer for the WRONG forge. An unrecognized (self-hosted) host lists both — glab
+  # first, since self-hosted GitLab is the case that reaches here — but the second is only reached
+  # when the first CLI outright FAILED (see the loop below), not merely when it found no MR.
   host="${remote_url#*://}"; host="${host#*@}"; host="${host%%[:/]*}"
   local order=(glab gh) tool
   case "$host" in
@@ -301,28 +302,35 @@ detect_target_branch() {
     *github*) order=(gh);;
   esac
 
+  local raw field
   for tool in "${order[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || continue
+    # Capture the RAW response separately from the parse so a CLI that FAILED (missing auth, network
+    # error, `timeout` kill) is distinguishable from one that answered fine with no open MR. Only the
+    # former should try the next tool: on an unrecognized self-hosted host `order` is (glab gh), and
+    # treating "answered, no MR" as a failure made every such run pay a SECOND 10s round-trip to a CLI
+    # that cannot speak for this repo anyway.
     case "$tool" in
       # `pr list --state open`, not `pr view <branch>`: pr view also resolves a CLOSED or MERGED PR
       # for the branch, whose base could be a long-dead release branch — a wrong, over-narrow scope
       # is worse than falling back. --limit 1 keeps the response to the one MR/PR we act on.
-      gh)   out="$( (cd "$dir" && _tmo 10 gh pr list --head "$branch" --state open --limit 1 \
-                       --json baseRefName </dev/null 2>/dev/null) \
-                    | _json_str_field baseRefName || true )";;
+      gh)   field="baseRefName"
+            raw="$( (cd "$dir" && _tmo 10 gh pr list --head "$branch" --state open --limit 1 \
+                       --json baseRefName </dev/null 2>/dev/null) )" || continue;;
       # `glab api`, not `glab mr view -F json`: `-F json` only exists on recent glab (on 1.36 it is
       # "unknown shorthand flag: 'F'"), so the mr-view form fails closed on every older install and
       # the GitLab path never derives anything. The REST endpoint is stable across versions and
       # filters to opened MRs the same way the gh call does.
-      glab) out="$( (cd "$dir" && _tmo 10 glab api \
+      glab) field="target_branch"
+            raw="$( (cd "$dir" && _tmo 10 glab api \
                        "projects/:fullpath/merge_requests?source_branch=$branch&state=opened&per_page=1" \
-                       </dev/null 2>/dev/null) \
-                    | _json_str_field target_branch || true )";;
+                       </dev/null 2>/dev/null) )" || continue;;
     esac
-    out="${out%$'\r'}"   # tolerate a CRLF-terminated answer; the regex below rejects the rest
+    out="$(printf '%s' "$raw" | _json_str_field "$field" || true)"
     # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
-    # into git. An unusable answer means "no MR context", i.e. fall back.
-    [[ "$out" =~ $branch_re ]] || continue
+    # into git. This CLI has spoken for the repo, so an unusable answer means "no MR context" for
+    # real: fall back rather than asking the other forge's CLI about a repo that isn't its.
+    [[ "$out" =~ $branch_re ]] || return 1
     printf '%s\n' "$out"; return 0
   done
   return 1
@@ -349,19 +357,21 @@ if [ -z "$base" ] && [ "$target" != "none" ]; then
   else
     target_branch="$target";                         target_src="--target"
   fi
-  if [ -z "$target_branch" ]; then
-    :   # --target auto found no MR context (detect_target_branch already knows every reason)
-  elif ! target_ref="$(resolve_branch_ref "$target_branch")"; then
-    _target_giveup "target branch '$target_branch' does not resolve locally — tried <remote>/$target_branch for every remote, local $target_branch, and $target_branch as a remote-qualified ref (try 'git fetch')"
-  else
-    # Display the short form (origin/main, main) — the full refs/ path is only there to keep
-    # resolution unambiguous, and reads as noise in a log line.
-    target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
-    base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
-    if [ -n "$base" ]; then
-      echo "$prog: scoping the review to $target_src $target_disp"
+  # An empty $target_branch means --target auto found no MR context (detect_target_branch already
+  # knows every reason) — nothing to resolve, so the historical default below takes over.
+  if [ -n "$target_branch" ]; then
+    if ! target_ref="$(resolve_branch_ref "$target_branch")"; then
+      _target_giveup "target branch '$target_branch' does not resolve locally — tried <remote>/$target_branch for every remote, local $target_branch, and $target_branch as a remote-qualified ref (try 'git fetch')"
     else
-      _target_giveup "no merge-base between HEAD and $target_disp — unrelated histories"
+      # Display the short form (origin/main, main) — the full refs/ path is only there to keep
+      # resolution unambiguous, and reads as noise in a log line.
+      target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
+      base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
+      if [ -n "$base" ]; then
+        echo "$prog: scoping the review to $target_src $target_disp"
+      else
+        _target_giveup "no merge-base between HEAD and $target_disp — unrelated histories"
+      fi
     fi
   fi
 fi
@@ -379,18 +389,22 @@ fi
 # prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
 base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
 
-# Scope for the CLAUDE phases. Left to themselves, /code-review and /simplify derive the range
+# THE resolved review range — the single spelling of "what this run reviews", used by every phase:
+# as the <target> argument of the Claude slash commands, and inside the security/codex driver prompts
+# (`git diff $scope_range`). One variable so the range can never drift between the four reviewers.
+#
+# For the CLAUDE phases specifically: left to themselves, /code-review and /simplify derive the range
 # (`git diff @{upstream}...HEAD`, else `main...HEAD`) — exactly the over-scoping the --base/--target
 # resolution above exists to fix. Both take a <target> argument, so hand them the resolved range
 # THERE. Keep it a BARE ref range and nothing else: that is a target form they build the diff command
 # from directly, whereas any added prose turns the whole argument into a free-form instruction that
 # only softly narrows the range they derived anyway. Both already fold in uncommitted changes.
-claude_scope="$base_short...HEAD"
+scope_range="$base_short...HEAD"
 
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
 # cycle, post-security pass), so build it once here — keeping the scope argument attached to the
 # command in one spot instead of three that can drift apart.
-cr_cmd="/code-review $effort --fix $claude_scope"
+cr_cmd="/code-review $effort --fix $scope_range"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -553,7 +567,7 @@ build_security_prompt() {
   cat <<EOF
 You are running an automated SECURITY FIX pass over the pending changes on this git branch.
 
-SCOPE: review ONLY the code this branch changed — the diff \`git diff $base_short...HEAD\` plus any
+SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_range\` plus any
 uncommitted changes (base $base_short). Do the same analysis Claude Code's /security-review does:
 find REAL, exploitable security vulnerabilities that these changes introduce. Do not audit or
 "improve" pre-existing code you did not touch. Concentrate on:
@@ -676,7 +690,7 @@ ALONGSIDE Claude (which reviews the same diff). Your value is catching what the 
 Review the code THIS branch changed for correctness BUGS and clear, low-risk SIMPLIFICATIONS, and
 APPLY the fixes you are confident about (you can edit files directly).
 
-SCOPE: review ONLY the changes on this branch — the diff \`git diff $base_short...HEAD\` plus any
+SCOPE: review ONLY the changes on this branch — the diff \`git diff $scope_range\` plus any
 uncommitted changes (base $base_short). Do NOT review or "improve" pre-existing code you did not
 touch. Do NOT modify files outside this diff, and never touch logs, state/, notes/, generated
 artifacts, or anything under a gitignored path. Do NOT add dependencies, do NOT reformat or refactor
@@ -797,7 +811,7 @@ run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
-run_fix_phase "simplify" "/simplify $claude_scope" "chore(review): simplify"
+run_fix_phase "simplify" "/simplify $scope_range" "chore(review): simplify"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
