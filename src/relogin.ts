@@ -335,18 +335,24 @@ async function notifyQuietly(childEnv: Record<string, string>, text: string) {
 }
 
 /**
- * The above, for callers outside this module that hold the raw workspace env (the supervisor's
- * give-up path, which has its own consumed-but-unused inbox lines to hand back). Exported rather
- * than left to sendTelegramAck(): that helper is a no-op unless TELEGRAM_* is in the harness's own
- * env, so on a Mattermost-only box it would silently DROP lines the watermark has already moved
- * past — the one thing inbox.ts invariant 3 forbids.
+ * Echo consumed-but-undelivered inbox lines back to the human under `lead`, for the callers
+ * outside this module that hold the raw workspace env (the supervisor's give-up path and the
+ * `foreman relogin` CLI's finally). The empty-list guard and the join live here rather than at
+ * each call site: inbox.ts invariant 3 is the kind of rule that should be obeyed in one place,
+ * and a bare notice with nothing to hand back adds nothing a mid-lockout human can act on.
+ *
+ * Delivered through notify() rather than sendTelegramAck(): that helper is a no-op unless
+ * TELEGRAM_* is in the harness's own env, so on a Mattermost-only box it would silently DROP
+ * lines the watermark has already moved past — the one thing invariant 3 forbids.
  */
-export async function notifyHuman(
+export async function handBackLines(
   cfg: Config,
   env: Record<string, string>,
-  text: string,
+  lead: string,
+  lines: string[],
 ): Promise<void> {
-  await notifyQuietly(harnessChildEnv(cfg, env), text);
+  if (!lines.length) return;
+  await notifyQuietly(harnessChildEnv(cfg, env), `${lead}\n${lines.join("\n")}`);
 }
 
 /**
@@ -527,6 +533,58 @@ async function codexLoggedIn(cfg: Config, childEnv: Record<string, string>): Pro
 }
 
 /**
+ * Block one attempt's worth of time for the human to send the sign-in code back, appending every
+ * line consumed but NOT taken as the code to `spare` (see the caller's declaration of it).
+ *
+ * Reads the SAME queue — and so the same watermark (state/wait-reply/inbox.tg.offset) — the
+ * idle-wait drains, so a line can never be double-consumed by the agent's own poll. The always-on
+ * poller keeps filling that queue while we block; we are simply its reader for the duration (see
+ * inbox.ts invariants).
+ *
+ * Throws rather than returning undefined: the caller's catch is what kills the login child, and
+ * every way out of here that has no code is a failed attempt. The governing cost is that ending
+ * this wait early kills the child and with it the live URL the human may be signing in with RIGHT
+ * NOW — hence the wake counter bounds TEXT-LESS wakes only. 👍-ing the "needs re-authentication"
+ * message is the most natural thing a human does and arrives as an ACK line with no text, so it
+ * must not read as a bad answer, while a channel that somehow streams reaction-acks still has to
+ * fall through.
+ */
+async function waitForCode(
+  inbox: InboxQueue,
+  watchdog: Heartbeat,
+  refresh: () => void | Promise<void>,
+  spare: string[],
+): Promise<string> {
+  const deadline = Date.now() + HUMAN_TIMEOUT_MS;
+  let code: string | undefined;
+  let textlessWakes = 0;
+  while (!code && textlessWakes < MAX_TEXTLESS_WAKES && Date.now() < deadline) {
+    // Throws once the deadline passes. Nothing else here can fail: reading the queue is
+    // in-memory, and the poller absorbs channel errors itself rather than surfacing them to its
+    // readers.
+    const lines = await waitForInboxLines(inbox, watchdog, refresh, deadline);
+    // Everything we consumed except the ONE line taken as the code is a spare — ACK lines
+    // included. takeAnswer() splits both halves in inbox.ts, so the "which line was the answer"
+    // rule is not restated here.
+    const { text, rest } = takeAnswer(lines);
+    code = text;
+    spare.push(...rest);
+    if (!code) textlessWakes++;
+  }
+  if (code) return code;
+  // The two OTHER ways out of the loop, named apart because they call for different responses
+  // from whoever reads the log after a lockout: "stop replying with a bare 👍" versus "you never
+  // answered". A text-less wake consumes real time, so an attempt can hit BOTH counters — report
+  // whichever actually ended the loop rather than always blaming the reaction-acks.
+  throw new Error(
+    Date.now() >= deadline
+      ? `no code from the human within ${Math.round(HUMAN_TIMEOUT_MS / 60_000)} min` +
+          `${textlessWakes ? ` (${textlessWakes} text-less wake(s) meanwhile)` : ""}`
+      : `${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`,
+  );
+}
+
+/**
  * Re-authenticate claude with the human relaying the code over Telegram.
  *
  * `claude auth login` reads the pasted code from /dev/tty, not stdin — a plain pipe is ignored
@@ -622,45 +680,7 @@ export async function reloginClaude(
       // after this point can be the answer.
       spare.push(...inbox.drain());
 
-      // Wait for the code on the SAME queue — and so the same watermark
-      // (state/wait-reply/inbox.tg.offset) — the idle-wait drains, so it can never be
-      // double-consumed by the agent's own poll. The always-on poller keeps filling that queue
-      // while we block here; we are simply the reader for the duration (see inbox.ts invariants).
-      //
-      // The governing cost below: ending this wait early kills the login child and with it the
-      // live URL the human may be signing in with RIGHT NOW. Hence the wake counter bounds
-      // text-less wakes only — 👍-ing the "needs re-authentication" message is the most natural
-      // thing a human does and arrives as an ACK line with no text, so it must not read as a bad
-      // answer, while a channel that somehow streams reaction-acks still has to fall through.
-      const deadline = Date.now() + HUMAN_TIMEOUT_MS;
-      let code: string | undefined;
-      let textlessWakes = 0;
-      while (!code && textlessWakes < MAX_TEXTLESS_WAKES && Date.now() < deadline) {
-        // Throws once the deadline passes — caught by the attempt's own catch, which kills the
-        // login child so the next attempt can send a fresh (non-expired) link. Nothing else here
-        // can fail: reading the queue is in-memory, and the poller absorbs channel errors itself
-        // rather than surfacing them to its readers.
-        const lines = await waitForInboxLines(inbox, watchdog, refresh, deadline);
-        // Everything we consumed except the ONE line taken as the code is a spare — ACK lines
-        // included. takeAnswer() splits both halves in inbox.ts, so the "which line was the
-        // answer" rule is not restated here.
-        const { text, rest } = takeAnswer(lines);
-        code = text;
-        spare.push(...rest);
-        if (!code) textlessWakes++;
-      }
-      // The two OTHER ways out of the loop, named apart because they call for different responses
-      // from whoever reads the log after a lockout: "stop replying with a bare 👍" versus "you
-      // never answered". A text-less wake consumes real time, so an attempt can hit BOTH counters
-      // — report whichever actually ended the loop rather than always blaming the reaction-acks.
-      if (!code) {
-        throw new Error(
-          Date.now() >= deadline
-            ? `no code from the human within ${Math.round(HUMAN_TIMEOUT_MS / 60_000)} min` +
-                `${textlessWakes ? ` (${textlessWakes} text-less wake(s) meanwhile)` : ""}`
-            : `${textlessWakes} inbox wake(s) carried no text (reaction-acks only)`,
-        );
-      }
+      const code = await waitForCode(inbox, watchdog, refresh, spare);
 
       tried.add(code); // never echo it back — see `tried`
       proc.stdin.write(`${code}\n`);

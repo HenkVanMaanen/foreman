@@ -192,10 +192,9 @@ export function startInboxPoller(
   // harnessChildEnv pins FOREMAN_STATE_DIR from config so wait-reply reads/advances the SAME inbox
   // watermark the agent's own bin/ used; otherwise a $HOME/.foreman fallback would drain a
   // different watermark.
-  const childEnv = {
-    ...harnessChildEnv(cfg, env),
+  const childEnv = harnessChildEnv(cfg, env, {
     FOREMAN_WAIT_TIMEOUT: String(WAIT_TIMEOUT_S),
-  };
+  });
 
   let stopped = false;
   // The `wait-reply` currently running, so stop() can end it rather than wait out its ~250s poll.
@@ -360,15 +359,6 @@ export async function waitForInboxLines(
       console.error(`[inbox] status refresh failed: ${e}`);
     }
   }
-}
-
-/** The idle-wait's view of the above: block until the human writes, return the agent's prompt. */
-export async function waitForInboxMessages(
-  queue: InboxQueue,
-  watchdog: Heartbeat,
-  refresh: () => void | Promise<void>,
-): Promise<string> {
-  return formatInboxPrompt(await waitForInboxLines(queue, watchdog, refresh));
 }
 
 /**

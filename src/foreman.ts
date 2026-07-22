@@ -12,7 +12,7 @@
 import { type Config, loadConfig } from "./config.ts";
 import { runDashboard, supervisorIsRunning } from "./dashboard.ts";
 import { InboxQueue, startInboxPoller } from "./inbox.ts";
-import { notifyHuman, RELOGIN_AGENTS } from "./relogin.ts";
+import { handBackLines, RELOGIN_AGENTS } from "./relogin.ts";
 import { runWithSecrets, secretSetFromStdin } from "./secrets.ts";
 import { supervise } from "./supervisor.ts";
 import { NO_HEARTBEAT } from "./watchdog.ts";
@@ -77,13 +77,12 @@ async function runRelogin(cfg: Config, rest: string[]): Promise<number> {
   const force = rest.includes("--force");
   // Every argument is accounted for. A typo'd flag must not be silently ignored: `relogin claude
   // --forse` would otherwise run WITHOUT force, hit the "already logged in?" guard, and exit 0
-  // having done nothing — which reads as "the rehearsal passed".
-  const agents = rest.filter((a) => !a.startsWith("-"));
-  const unknown = rest.filter((a) => a.startsWith("-") && a !== "--force");
-  const which = agents[0] ?? "claude";
+  // having done nothing — which reads as "the rehearsal passed". Anything left after --force is
+  // removed must be the one agent name, so a stray token and a typo'd flag fail the same way.
+  const [which = "claude", ...extra] = rest.filter((a) => a !== "--force");
   // A Map, so an inherited member name (`foreman relogin constructor`) is simply a miss
   // rather than something that resolves off Object.prototype and gets called as a flow.
-  const flow = agents.length > 1 || unknown.length ? undefined : RELOGIN_AGENTS.get(which);
+  const flow = extra.length ? undefined : RELOGIN_AGENTS.get(which);
   if (!flow) {
     console.error(`usage: foreman relogin [${[...RELOGIN_AGENTS.keys()].join("|")}] [--force]`);
     return 2;
@@ -138,16 +137,13 @@ async function runRelogin(cfg: Config, rest: string[]): Promise<number> {
     // leaves behind anything that landed after its last wait, so exiting without this
     // silently eats every message the human sent while they were re-authenticating. Hand
     // them back. (No-op for a flow that never started a poller — nothing was consumed.)
-    const leftover = inbox.drain();
-    if (leftover.length) {
-      await notifyHuman(
-        cfg,
-        env,
-        "[harness] I consumed these off the inbox while re-authenticating and never " +
-          "delivered them — please re-send anything that still needs an answer:\n" +
-          leftover.join("\n"),
-      );
-    }
+    await handBackLines(
+      cfg,
+      env,
+      "[harness] I consumed these off the inbox while re-authenticating and never " +
+        "delivered them — please re-send anything that still needs an answer:",
+      inbox.drain(),
+    );
   }
 }
 

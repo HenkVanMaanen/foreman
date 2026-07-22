@@ -48,11 +48,20 @@ export function binPath(name: (typeof BIN_SCRIPTS)[number]): string {
  * Env for a harness-spawned bin/ script. Pins FOREMAN_STATE_DIR from config so the child
  * reads/advances the SAME watermarks and secret store the agent used; without it a child could
  * fall back to $HOME/.foreman and drain a different inbox offset.
+ *
+ * `extra` is folded in here rather than spread over the result by the caller: this copies the
+ * whole process env, and a caller that only wants one more variable should not pay for a second
+ * copy of it. It cannot override FOREMAN_STATE_DIR — that pin is the point of the helper.
  */
-export function harnessChildEnv(cfg: Config, env: Record<string, string>): Record<string, string> {
+export function harnessChildEnv(
+  cfg: Config,
+  env: Record<string, string>,
+  extra?: Record<string, string>,
+): Record<string, string> {
   return {
     ...(process.env as Record<string, string>),
     ...env,
+    ...extra,
     FOREMAN_STATE_DIR: resolve(cfg.stateDir),
   };
 }
