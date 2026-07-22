@@ -18,26 +18,25 @@
 # with `worker-status <name>`.
 set -euo pipefail
 
-# Definition-of-done footer appended to EVERY worker brief. This is what makes the
-# review→fix→re-review loop automatic for all future workers: a worker must self-review with
-# bin/review-loop and must not mark itself done until it reports CLEAN (or surfaces a security
-# issue / non-convergence for the human). Edit this constant to change the standard; it is applied
-# additively, so the existing `spawn-worker <name> <brief-file>` interface is unchanged.
+# Definition-of-done footer appended to EVERY worker brief. Policy: a worker produces a REVIEWABLE
+# DRAFT fast and stops for the human — it does NOT run the heavy multi-round review loop. That
+# review (/code-review + /simplify + Codex + /security-review) is a PRE-MERGE gate foreman runs once
+# the human approves the MR content (see the review policy in prompts/bootstrap.md), so human↔foreman
+# iteration on the MR stays fast. Edit this constant to change the standard; it is applied additively,
+# so the existing `spawn-worker <name> <brief-file>` interface is unchanged.
 read -r -d '' DOD_FOOTER <<'EOF' || true
 
 ## Definition of done (mandatory — appended by spawn-worker)
-Before you mark yourself done / exit:
+Produce a reviewable change FAST, then stop for the human. Before you mark yourself done / exit:
 1. Complete your change and COMMIT it on your branch.
-2. Run the auto-review loop on your working dir:  `bin/review-loop --dir .`
-   (it runs /code-review and /simplify to convergence, committing each round's fixes, plus an
-   independent OpenAI Codex reviewer that auto-fixes what it is confident about and escalates
-   risky findings — pass --no-codex to skip it — and a conditional /security-review).
-3. Do NOT mark done / exit until review-loop prints `review-loop: CLEAN` and exits 0.
-   - If it reports NOT-CLEAN (hit the round cap with findings still, or a review invocation
-     failed), or the security review escalates, DO NOT proceed — report that clearly to the human
-     (via bin/ask-human / bin/reply) and stop, rather than silently marking the task done.
-4. After any auto-fixes, sanity-check your change still builds / passes `bash -n` (or the repo's
-   equivalent) before finishing.
+2. Sanity-check only: make sure it builds and the repo's QUICK checks pass (unit tests, `bash -n`,
+   typecheck — whatever is fast). Fix obvious breakage. Do NOT start a multi-round review.
+3. Push and open a **draft** MR/PR against the agreed base branch.
+4. Write your status + the MR/PR URL + a one-line summary to notes/tasks/<id>.md, then exit. Foreman
+   collects that and takes the MR to the human; the human then iterates with foreman on it.
+5. Do NOT run `bin/review-loop` — it is NOT part of definition-of-done. The full review is a
+   pre-merge gate foreman runs later, only after the human approves the MR content. Running it here
+   is exactly the slow-iteration problem this policy removes.
 EOF
 
 name="${1:?usage: spawn-worker <name> <brief-file>}"
