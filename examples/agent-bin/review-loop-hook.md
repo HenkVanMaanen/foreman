@@ -81,11 +81,10 @@ re-run the loop. Options:
 ## Review scope (`--base` / `--target`)
 
 Every phase reviews the diff from a single resolved **base**, derived by default (`--target auto`)
-from the open MR/PR of the current branch. Per-flag semantics live in `review-loop --help` and the
-rationale in the script's header comment — not restated here, so this doc cannot drift from either.
+from the open MR/PR of the current branch — see `review-loop --help` for the flags.
 
-Hook-specific, and the only part that is: in `--stop-hook` mode the derivation runs **after** the
-marker check, so a stop that is skipped never pays the forge round-trip.
+Hook-specific: in `--stop-hook` mode the derivation runs **after** the marker check, so a stop that
+is skipped never pays the forge round-trip.
 
 ## Codex — an independent second reviewer (default ON)
 
