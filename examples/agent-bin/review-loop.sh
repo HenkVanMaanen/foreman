@@ -58,14 +58,13 @@
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
 #
-# Defaults and per-flag semantics: `--help` (usage() below) — the single copy, so they cannot drift
-# from what the script actually does.
+# Defaults and --base/--target semantics: `--help` (usage() below) is the only copy — this header
+# carries WHY they exist, not what they do.
 #
 # WHY --base / --target exist: a review should cover exactly what the MR/PR changes — no more. The
 # diff base therefore has to be the merge-base with the branch this work MERGES INTO, not with
 # origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
 # origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
-# Historical default (the fallback): merge-base of HEAD with origin/main, else origin/HEAD, else HEAD.
 #
 # --codex / --no-codex:
 #   on   — (default) run the Codex independent-reviewer phase and the joint reconciliation. If the
@@ -271,11 +270,22 @@ fi
 # Rationale for the scope rule: see the SCOPE block in the header comment.
 # Resolution order: --base (verbatim) > --target REF > --target auto (derived) > historical default.
 
+# Echo the first of the given refs/-relative candidates that names a commit; 1 if none does.
+_first_ref() {
+  local c
+  for c in "$@"; do
+    if git -C "$dir" rev-parse --verify --quiet "refs/$c^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "refs/$c"; return 0
+    fi
+  done
+  return 1
+}
+
 # Resolve a branch NAME to a ref we can merge-base against. Echoes the ref; returns 1 if no form
 # exists. Candidates are matched as full refs/remotes|refs/heads paths, NOT as a bare `NAME^{commit}`
 # — the bare form also resolves TAGS, so a tag named like the target branch could win over it.
 resolve_branch_ref() {
-  local b="$1" cand r
+  local b="$1" r
   # HEAD is not a branch, and the refs/ prefixing alone does NOT reject it: `git clone` creates
   # refs/remotes/origin/HEAD, so `--target HEAD` would quietly resolve to origin's default branch
   # instead of erroring — and any candidate ending in /HEAD is that same pseudo-ref. Reject up front.
@@ -286,17 +296,14 @@ resolve_branch_ref() {
   # remotes are only reached when origin does not carry the branch, so on a fork that mirrors it the
   # fork's own copy wins — pass `--target upstream/<b>` when the canonical remote must be used. The
   # already-qualified form is tried LAST so `--target origin/main` still works.
-  local cands=("remotes/origin/$b")
+  # origin/<b> is probed on its OWN first, so the overwhelmingly common case never forks `git remote`
+  # just to enumerate the others.
+  _first_ref "remotes/origin/$b" && return 0
+  local cands=()
   while IFS= read -r r; do
     [ "$r" != "origin" ] && cands+=("remotes/$r/$b")
   done < <(git -C "$dir" remote 2>/dev/null || true)
-  cands+=("heads/$b" "remotes/$b")
-  for cand in "${cands[@]}"; do
-    if git -C "$dir" rev-parse --verify --quiet "refs/$cand^{commit}" >/dev/null 2>&1; then
-      printf '%s\n' "refs/$cand"; return 0
-    fi
-  done
-  return 1
+  _first_ref "${cands[@]}" "heads/$b" "remotes/$b"
 }
 
 # Extract a top-level "key": "value" string field from JSON on stdin (both forges answer with a
@@ -424,46 +431,47 @@ fi
 # fail to run, while the security-auto heuristic's `git diff --name-only <junk> HEAD` comes back
 # empty and skips the phase: the whole run then reports CLEAN having read zero lines. Resolve ONCE,
 # loudly, and reuse the sha below.
-base_sha="$(git -C "$dir" rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null || true)"
-[ -n "$base_sha" ] || die "base ref '$base' does not resolve to a commit (pass an existing --base REF)"
-# $base is immutable from here on, so resolve its short form ONCE and reuse it (the header + both
-# prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
-base_short="$(git -C "$dir" rev-parse --short "$base_sha" 2>/dev/null || echo "$base_sha")"
+base_resolved="$(git -C "$dir" rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null || true)"
+[ -n "$base_resolved" ] || die "base ref '$base' does not resolve to a commit (pass an existing --base REF)"
+# From here on $base IS that commit — ONE name for the base, so no later call site has to pick between
+# a raw ref and its sha. It is immutable from here on, so resolve the short display form ONCE too (the
+# header + both prompt builders would otherwise fork `git rev-parse --short` on every call).
+base="$base_resolved"
+base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
 
-# ONE decision — "what does this run review?" — rendered in the two forms the reviewer families need,
-# so the scope can never drift between the four reviewers:
-#   $scope_arg      — the <target> argument of the Claude slash commands (/code-review, /simplify).
-#                     A BARE ref range and nothing else: that is the form they build the diff command
-#                     from directly, where added prose would become a free-form instruction instead.
-#                     EMPTY ⇒ pass no target and let them self-derive (`git diff @{upstream}...HEAD`,
-#                     else `main...HEAD`), exactly as before --target existed. Both fold in `git diff
-#                     HEAD`, so uncommitted work is covered either way.
+# ONE decision — "what does this run review?" — as a single range, so the scope cannot drift between
+# the four reviewers. $range is EMPTY exactly when base IS HEAD, where `$base...HEAD` would be an
+# empty range and a reviewer handed it reviews NOTHING. Compared on the RESOLVED sha, not on the ref
+# the caller typed (`--base HEAD`) — the very case this guard exists to catch.
+range=""
+[ "$base" = "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" ] || range="$base_short...HEAD"
+
+# The two forms the reviewer families need:
 #   $scope_diff_ref — what the security/codex driver prompts spell out as `git diff <ref>`. Free-form
-#                     prose with no self-derive fallback, so it must always name something real.
-# The split matters only when base IS HEAD: `$base...HEAD` is then EMPTY, and a reviewer handed it
-# reviews NOTHING. Compared on the RESOLVED full shas, not on $base, which can still be a symbolic
-# ref the caller typed (`--base HEAD`) — the very case this guard exists to catch.
-if [ "$base_sha" = "$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)" ]; then
-  scope_arg=""            # no <target> ⇒ the Claude commands self-derive
-  scope_diff_ref="HEAD"   # the working tree, named outright
-  # Warn only when someone PINNED this scope (--base REF, or a --target that resolved to an ancestor
-  # of HEAD) — there an empty committed range is nearly always a mistake. On the fallback path it is
-  # the ordinary "no commits ahead yet" state, so warning every such run would be noise. Word it per
-  # family: the Claude commands self-derive, which can land WIDER than the base that was pinned, so
-  # "only uncommitted changes will be reviewed" would be false for half the reviewers.
-  if [ "$base_pinned" -eq 1 ]; then
-    echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases see UNCOMMITTED changes only, and /code-review + /simplify fall back to self-deriving their own range" >&2
-  fi
-else
-  scope_arg=" $base_short...HEAD"
-  scope_diff_ref="$base_short...HEAD"
+#                     prose with no self-derive fallback, so it must always name something real; with
+#                     no range that is HEAD, i.e. the working tree.
+#   the Claude slash-command <target> (below) — a BARE ref range and nothing else: that is the form
+#                     they build the diff command from directly, where added prose would become a
+#                     free-form instruction instead. OMITTED when there is no range, letting them
+#                     self-derive (`git diff @{upstream}...HEAD`, else `main...HEAD`) exactly as
+#                     before --target existed. Both fold in `git diff HEAD`, so uncommitted work is
+#                     covered either way.
+scope_diff_ref="${range:-HEAD}"
+
+# Warn only when someone PINNED an empty range (--base REF, or a --target that resolved to HEAD) —
+# there it is nearly always a mistake. On the fallback path it is the ordinary "no commits ahead yet"
+# state, so warning every such run would be noise. Worded per family: the Claude commands self-derive,
+# which can land WIDER than the base that was pinned, so "only uncommitted changes will be reviewed"
+# would be false for half the reviewers.
+if [ -z "$range" ] && [ "$base_pinned" -eq 1 ]; then
+  echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases see UNCOMMITTED changes only, and /code-review + /simplify fall back to self-deriving their own range" >&2
 fi
 
 # Both Claude invocations are built ONCE here (code-review alone runs in three places: initial phase,
 # reconcile cycle, post-security pass), so the scope argument stays attached to its command in one
 # spot instead of four that can drift apart.
-cr_cmd="/code-review $effort --fix$scope_arg"
-si_cmd="/simplify$scope_arg"
+cr_cmd="/code-review $effort --fix${range:+ $range}"
+si_cmd="/simplify${range:+ $range}"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -683,7 +691,7 @@ run_security_phase() {
       # `status --porcelain | awk '{print $NF}'` truncated any path containing a space (e.g.
       # "src/session store.js" -> "store.js"), dropping the sensitive token so auto-mode wrongly
       # skipped the security review for exactly the files it exists to catch.
-      changed="$( { git -C "$dir" diff --name-only "$base_sha" HEAD 2>/dev/null || true; \
+      changed="$( { git -C "$dir" diff --name-only "$base" HEAD 2>/dev/null || true; \
                     git -C "$dir" diff --name-only HEAD 2>/dev/null || true; \
                     git -C "$dir" ls-files --others --exclude-standard 2>/dev/null || true; } | sort -u )"
       # here-string, not `printf … | grep`: under `set -o pipefail`, when the path list exceeds the
