@@ -309,7 +309,11 @@ detect_target_branch() {
   # remote it can answer for the WRONG forge. An unrecognized (self-hosted) host lists both — glab
   # first, since self-hosted GitLab is the case that reaches here — but the second is only reached
   # when the first CLI outright FAILED (see the loop below), not merely when it found no MR.
-  host="${remote_url#*://}"; host="${host#*@}"; host="${host%%[:/]*}"
+  # Strip scheme, then the PATH, then userinfo, then the port — in that order. Dropping the path
+  # first is what makes the userinfo strip safe to make GREEDY (##*@), which it must be: `#*@` stops
+  # at the FIRST '@', so a URL like https://bot@corp.com:TOKEN@gitlab.example.org/g/r.git would
+  # yield `corp.com` and route to the wrong CLI (or, unmatched, to both).
+  host="${remote_url#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%%:*}"
   local order=(glab gh) tool
   case "$host" in
     *gitlab*) order=(glab);;
@@ -412,10 +416,20 @@ base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base
 # uncommitted changes.
 scope_range="$base_short...HEAD"
 
+# ...but only hand that range to the Claude commands when it names something. When the fallback chain
+# bottomed out at `rev-parse HEAD` (no origin/main, no origin/HEAD — a local-only repo), base IS HEAD,
+# so `$base...HEAD` is EMPTY. Passing an empty range as an explicit target tells /code-review and
+# /simplify to review NOTHING, and a session's uncommitted work would ship reported CLEAN having been
+# read by nobody; with no target they self-derive and fold in `git diff HEAD`. So: empty ⇒ pass no
+# target, exactly as before --target existed. (The security/codex prompts keep using $scope_range
+# unchanged — they always spelled the range out, degenerate base included.)
+scope_arg=""
+[ "$base_short" = "$(git -C "$dir" rev-parse --short HEAD 2>/dev/null || true)" ] || scope_arg=" $scope_range"
+
 # The /code-review invocation is byte-identical in all THREE places it runs (initial phase, reconcile
 # cycle, post-security pass), so build it once here — keeping the scope argument attached to the
 # command in one spot instead of three that can drift apart.
-cr_cmd="/code-review $effort --fix $scope_range"
+cr_cmd="/code-review $effort --fix$scope_arg"
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -822,7 +836,7 @@ run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes"
 CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
 echo
 
-run_fix_phase "simplify" "/simplify $scope_range" "chore(review): simplify"
+run_fix_phase "simplify" "/simplify$scope_arg" "chore(review): simplify"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
