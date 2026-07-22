@@ -125,6 +125,11 @@ stop_hook=0
 
 prog="review-loop"
 
+# The one charset a branch NAME may use anywhere in this script: --target's value, a name derived
+# from the forge CLI, and the branch we hand to that CLI. Leading-dash-free (so git/gh/glab can
+# never read it as an option) and URL-query-safe (so it can go into a `glab api` query verbatim).
+branch_re='^[A-Za-z0-9._/-]+$'
+
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
   cat <<'EOF'
@@ -184,12 +189,12 @@ done
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
 case "$effort" in low|medium|high|max) ;; *) die_usage "--effort must be low|medium|high|max (got '$effort')";; esac
 case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$codex')";; esac
-# --target is either a mode word or a branch name we hand to git. Restrict the branch form to a
-# leading-dash-free ref charset so it can never be read by git as an option.
+# --target is either a mode word or a branch name we hand to git ($branch_re keeps it a
+# leading-dash-free ref token that git can never read as an option).
 case "$target" in
   auto|none) ;;
   -*) die_usage "--target REF must not start with '-' (got '$target')";;
-  *) [[ "$target" =~ ^[A-Za-z0-9._/-]+$ ]] || die_usage "--target must be auto|none or a branch name matching ^[A-Za-z0-9._/-]+$ (got '$target')";;
+  *) [[ "$target" =~ $branch_re ]] || die_usage "--target must be auto|none or a branch name matching $branch_re (got '$target')";;
 esac
 # --codex-model is interpolated into the `codex -m` command; restrict its charset (mirrors the
 # <name>/<id> posture in spawn-worker.sh / wait-reply.sh) to keep it a single safe token.
@@ -205,6 +210,36 @@ command -v claude >/dev/null 2>&1 || die_usage "claude not found on PATH"
 dir="$(cd "$dir" && pwd)"
 git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is not a git repository"
 
+# --- stop-hook guard (loop-safety for the Stop-hook entrypoint) -------------------------------
+# A Claude Code Stop hook re-fires every time the session would end, so a hook that does work and
+# lets the session continue can recurse. Guard with a marker file: run the loop at most once per
+# marker lifetime. The marker lives in the runtime state dir (gitignored) and should be cleared at
+# session start (documented in review-loop-hook.md). We ALSO honor `stop_hook_active` from the
+# hook's stdin JSON when present, as a second belt.
+#
+# This runs BEFORE base/target resolution on purpose: --target auto shells out to gh/glab, which is
+# a network round-trip (up to the 25s timeout, twice) — paying that on every Stop fire just to hit
+# the marker and exit would stall the end of every single session.
+state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
+marker="$state_dir/.review-loop-ran"
+if [ "$stop_hook" -eq 1 ]; then
+  hook_stdin=""
+  if [ ! -t 0 ]; then hook_stdin="$(cat 2>/dev/null || true)"; fi
+  # here-string, not `printf … | grep`: under `set -o pipefail` an early-matching `grep -q` closes
+  # the pipe and the still-writing producer takes SIGPIPE (141), which pipefail would surface as a
+  # non-zero pipeline — flipping this guard to the wrong branch. A here-string has no producer pipe.
+  if grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' <<<"$hook_stdin"; then
+    echo "$prog: stop_hook_active=true — already in a stop cycle, skipping to avoid recursion"
+    exit 0
+  fi
+  if [ -f "$marker" ]; then
+    echo "$prog: marker $marker present — already ran this session cycle, skipping"
+    exit 0
+  fi
+  mkdir -p "$state_dir" 2>/dev/null || true
+  : > "$marker" 2>/dev/null || true
+fi
+
 # --- base / target resolution -----------------------------------------------------------------
 # The review scope must equal the MR/PR: diff from the merge-base with the branch this work merges
 # INTO. Diffing from the merge-base with origin/main over-scopes a branch STACKED on another
@@ -214,11 +249,14 @@ git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is no
 # Resolve a branch NAME to a ref we can merge-base against, preferring the remote-tracking copy
 # (origin/NAME is what the MR actually targets; a stale local NAME may sit far behind). Echoes the
 # ref; returns 1 if neither form exists.
+# Matched against the full refs/remotes|refs/heads paths, NOT a bare `NAME^{commit}`: the bare form
+# also resolves tags and pseudo-refs, so `--target HEAD` would silently "succeed" with
+# merge-base(HEAD,HEAD)=HEAD — an empty diff that makes every phase converge CLEAN vacuously.
 resolve_branch_ref() {
   local b="$1" cand
-  for cand in "origin/$b" "$b"; do
-    if git -C "$dir" rev-parse --verify --quiet "$cand^{commit}" >/dev/null 2>&1; then
-      printf '%s\n' "$cand"; return 0
+  for cand in "remotes/origin/$b" "heads/$b"; do
+    if git -C "$dir" rev-parse --verify --quiet "refs/$cand^{commit}" >/dev/null 2>&1; then
+      printf '%s\n' "refs/$cand"; return 0
     fi
   done
   return 1
@@ -236,28 +274,48 @@ _json_str_field() {
 # MR/PR, auth/network failure, junk output) so the caller can fall back cleanly. Every invocation is
 # stdin-closed and `timeout`-wrapped where available, so it can never hang the loop.
 detect_target_branch() {
-  local branch remote_url out="" probe=()
+  local branch remote_url host out="" run=()
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
   [ -n "$branch" ] || return 1                      # detached HEAD ⇒ no MR to look up
+  # The branch goes into a CLI argument and (for glab) a URL query, so hold it to the same charset
+  # we accept back. An exotic branch name just means "no MR context" — fall back, don't improvise.
+  [[ "$branch" =~ $branch_re ]] || return 1
   remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
 
   # Try the forge that matches origin first, then the other — a repo can have both CLIs installed.
+  # Match on the HOST only: a substring test over the whole URL misroutes a GitHub repo that merely
+  # has "gitlab" in its path (github.com/acme/gitlab-migration).
+  host="${remote_url#*://}"; host="${host#*@}"; host="${host%%[:/]*}"
   local order=(gh glab) tool
-  case "$remote_url" in *gitlab*) order=(glab gh);; esac
+  case "$host" in *gitlab*) order=(glab gh);; esac
+
+  # Probe wrapper (hoisted: the timeout lookup does not vary per tool).
+  local wrap=()
+  if command -v timeout >/dev/null 2>&1; then wrap=(timeout 25); fi
 
   for tool in "${order[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || continue
-    if command -v timeout >/dev/null 2>&1; then probe=(timeout 25 "$tool"); else probe=("$tool"); fi
+    run=("${wrap[@]}" "$tool")
     case "$tool" in
-      gh)   out="$( (cd "$dir" && "${probe[@]}" pr view "$branch" --json baseRefName </dev/null 2>/dev/null) \
+      # `pr list --state open`, not `pr view <branch>`: pr view also resolves a CLOSED or MERGED PR
+      # for the branch, whose base could be a long-dead release branch — a wrong, over-narrow scope
+      # is worse than falling back. --limit 1 keeps the response to the one MR/PR we act on.
+      gh)   out="$( (cd "$dir" && "${run[@]}" pr list --head "$branch" --state open --limit 1 \
+                       --json baseRefName </dev/null 2>/dev/null) \
                     | _json_str_field baseRefName || true )";;
-      glab) out="$( (cd "$dir" && "${probe[@]}" mr view "$branch" -F json </dev/null 2>/dev/null) \
+      # `glab api`, not `glab mr view -F json`: `-F json` only exists on recent glab (on 1.36 it is
+      # "unknown shorthand flag: 'F'"), so the mr-view form fails closed on every older install and
+      # the GitLab path never derives anything. The REST endpoint is stable across versions and
+      # filters to opened MRs the same way the gh call does.
+      glab) out="$( (cd "$dir" && "${run[@]}" api \
+                       "projects/:fullpath/merge_requests?source_branch=$branch&state=opened&per_page=1" \
+                       </dev/null 2>/dev/null) \
                     | _json_str_field target_branch || true )";;
     esac
     out="${out//[$'\r\n\t ']/}"
     # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
     # into git. An unusable answer means "no MR context", i.e. fall back.
-    [[ "$out" =~ ^[A-Za-z0-9._/-]+$ ]] || { out=""; continue; }
+    [[ "$out" =~ $branch_re ]] || { out=""; continue; }
     printf '%s\n' "$out"; return 0
   done
   return 1
@@ -272,13 +330,16 @@ if [ -z "$base" ]; then
   esac
   if [ -n "$target_branch" ]; then
     if target_ref="$(resolve_branch_ref "$target_branch")"; then
+      # Display the short form (origin/main, main) — the full refs/ path is only there to keep
+      # resolution unambiguous, and reads as noise in a log line.
+      target_disp="${target_ref#refs/remotes/}"; target_disp="${target_disp#refs/heads/}"
       base="$(git -C "$dir" merge-base HEAD "$target_ref" 2>/dev/null || true)"
       if [ -n "$base" ]; then
-        echo "$prog: scoping the review to the MR/PR target branch $target_ref"
+        echo "$prog: scoping the review to the MR/PR target branch $target_disp"
       else
         # Unrelated histories: no shared commit to diff from. Only reachable for an explicit
         # --target (auto only yields a branch the forge says we merge into), so tell the user.
-        echo "$prog: no merge-base between HEAD and $target_ref — falling back to the default base" >&2
+        echo "$prog: no merge-base between HEAD and $target_disp — falling back to the default base" >&2
       fi
     elif [ "$target" = "auto" ]; then
       # Derived a name but have no local copy of it (unfetched target branch) — stay silent-ish and
@@ -302,32 +363,6 @@ fi
 # $base is immutable from here on, so resolve its short form ONCE and reuse it (the header + both
 # prompt builders would otherwise fork `git rev-parse --short` on every call / every reconcile cycle).
 base_short="$(git -C "$dir" rev-parse --short "$base" 2>/dev/null || echo "$base")"
-
-# --- stop-hook guard (loop-safety for the Stop-hook entrypoint) -------------------------------
-# A Claude Code Stop hook re-fires every time the session would end, so a hook that does work and
-# lets the session continue can recurse. Guard with a marker file: run the loop at most once per
-# marker lifetime. The marker lives in the runtime state dir (gitignored) and should be cleared at
-# session start (documented in review-loop-hook.md). We ALSO honor `stop_hook_active` from the
-# hook's stdin JSON when present, as a second belt.
-state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
-marker="$state_dir/.review-loop-ran"
-if [ "$stop_hook" -eq 1 ]; then
-  hook_stdin=""
-  if [ ! -t 0 ]; then hook_stdin="$(cat 2>/dev/null || true)"; fi
-  # here-string, not `printf … | grep`: under `set -o pipefail` an early-matching `grep -q` closes
-  # the pipe and the still-writing producer takes SIGPIPE (141), which pipefail would surface as a
-  # non-zero pipeline — flipping this guard to the wrong branch. A here-string has no producer pipe.
-  if grep -q '"stop_hook_active"[[:space:]]*:[[:space:]]*true' <<<"$hook_stdin"; then
-    echo "$prog: stop_hook_active=true — already in a stop cycle, skipping to avoid recursion"
-    exit 0
-  fi
-  if [ -f "$marker" ]; then
-    echo "$prog: marker $marker present — already ran this session cycle, skipping"
-    exit 0
-  fi
-  mkdir -p "$state_dir" 2>/dev/null || true
-  : > "$marker" 2>/dev/null || true
-fi
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
