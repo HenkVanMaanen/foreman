@@ -174,6 +174,86 @@ export interface PollerHooks {
   refresh?: () => void | Promise<void>;
 }
 
+/** A process as reported by `ps -eo pid=,ppid=,args=`. */
+export interface ProcInfo {
+  pid: number;
+  ppid: number;
+  cmd: string;
+}
+
+/** Parse `ps -eo pid=,ppid=,args=` output into rows, skipping any that don't start with two ints. */
+export function parseProcTable(out: string): ProcInfo[] {
+  const rows: ProcInfo[] = [];
+  for (const line of out.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*\S)\s*$/);
+    if (m) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] as string });
+  }
+  return rows;
+}
+
+/**
+ * Pure: from a snapshot of every process, the pids of stray inbox-poller trees to kill — each
+ * `wait-reply --inbox` process AND all its descendants (its self-spawned child poll and the curl
+ * that holds the getUpdates connection). `self` and anything not descended from a stray are left
+ * alone.
+ *
+ * WHY this exists: invariant 2 (file header) says `wait-reply --inbox` has exactly ONE consumer,
+ * enforced by there being one poller. The graceful InboxPoller.stop() kills its in-flight child, but
+ * an UNgraceful supervisor exit — SIGKILL, a watchdog force-exit, a crash — never runs stop(), so
+ * that child is reparented to init and keeps long-polling getUpdates. Telegram permits only one
+ * getUpdates consumer, so the orphan 409-conflicts with the next life's poller and BOTH silently
+ * drop the human's messages until it times out (~250s) — or forever, if it keeps getting re-spawned.
+ * The successor poller calls this once before its first poll: at that instant it has not spawned its
+ * own wait-reply, so every `wait-reply --inbox` alive is by definition an orphan and safe to kill.
+ * (`wait-reply <id>` single-thread waits carry no `--inbox` and are never matched.)
+ */
+export function strayInboxPollerPids(procs: ProcInfo[], self: number): number[] {
+  const childrenByPpid = new Map<number, ProcInfo[]>();
+  for (const p of procs) {
+    const arr = childrenByPpid.get(p.ppid);
+    if (arr) arr.push(p);
+    else childrenByPpid.set(p.ppid, [p]);
+  }
+  const out = new Set<number>();
+  const stack = procs
+    .filter((p) => p.pid !== self && p.cmd.includes("wait-reply --inbox"))
+    .map((p) => p.pid);
+  while (stack.length) {
+    const pid = stack.pop() as number;
+    if (pid === self || out.has(pid)) continue;
+    out.add(pid);
+    for (const c of childrenByPpid.get(pid) ?? []) stack.push(c.pid);
+  }
+  return [...out];
+}
+
+/**
+ * Kill any stray inbox-poller trees a prior life leaked (see strayInboxPollerPids). SIGKILL, not
+ * TERM: an inbox poll sets no cleanup sentinel (that is the single-thread path), and killing the
+ * curl outright frees the getUpdates slot at once instead of after its ~25s long-poll. Best-effort
+ * and never throws — if `ps` is missing or a pid is already gone, the worst case is the successor
+ * eating a few transient 409s, strictly better than not trying. Returns how many pids were signalled.
+ */
+export async function reapStrayInboxPollers(): Promise<number> {
+  let procs: ProcInfo[];
+  try {
+    const proc = Bun.spawn(["ps", "-eo", "pid=,ppid=,args="], { stdout: "pipe", stderr: "ignore" });
+    procs = parseProcTable(await new Response(proc.stdout).text());
+    await proc.exited;
+  } catch {
+    return 0;
+  }
+  const pids = strayInboxPollerPids(procs, process.pid);
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone / not ours to kill — nothing to do
+    }
+  }
+  return pids.length;
+}
+
 /**
  * Start the ONE always-on inbox poller. Loops `wait-reply --inbox` for the harness's lifetime,
  * pushing new lines into `queue` and auto-acking (via `onBusyMessage`) when the agent is busy.
@@ -200,6 +280,17 @@ export function startInboxPoller(
   // The `wait-reply` currently running, so stop() can end it rather than wait out its ~250s poll.
   let inflight: { kill: () => void } | undefined;
   const loop = (async () => {
+    // Before our first poll, reap any inbox poller a prior life orphaned on an ungraceful exit —
+    // left alive it holds getUpdates and 409-conflicts with us (see reapStrayInboxPollers). Guarding
+    // on `stopped` keeps a stop() that lands during the reap from starting the loop anyway.
+    if (!stopped) {
+      const reaped = await reapStrayInboxPollers();
+      if (reaped > 0) {
+        console.error(
+          `[inbox] reaped ${reaped} orphaned poller process(es) leaked by a prior life`,
+        );
+      }
+    }
     let fastEmpties = 0;
     while (!stopped) {
       const started = Date.now();

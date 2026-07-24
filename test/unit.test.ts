@@ -10,6 +10,8 @@ import {
   extractInboxLines,
   formatInboxPrompt,
   InboxQueue,
+  parseProcTable,
+  strayInboxPollerPids,
   takeAnswer,
   waitForInboxLines,
 } from "../src/inbox.ts";
@@ -610,5 +612,66 @@ describe("extractUrl / extractDeviceCode", () => {
     test("no match at all is not complete", () => {
       expect(matchComplete("nothing here\n", URL_RE)).toBe(false);
     });
+  });
+});
+
+describe("parseProcTable", () => {
+  test("parses pid/ppid/args rows and keeps spaces in the command", () => {
+    const out =
+      "  100   1 bash /home/dev/foreman/bin/wait-reply --inbox\n 101 100 curl -fsS -K -\n";
+    expect(parseProcTable(out)).toEqual([
+      { pid: 100, ppid: 1, cmd: "bash /home/dev/foreman/bin/wait-reply --inbox" },
+      { pid: 101, ppid: 100, cmd: "curl -fsS -K -" },
+    ]);
+  });
+
+  test("skips blank and malformed lines", () => {
+    expect(parseProcTable("\n  garbage\n42 7 real cmd\n")).toEqual([
+      { pid: 42, ppid: 7, cmd: "real cmd" },
+    ]);
+  });
+});
+
+describe("strayInboxPollerPids", () => {
+  // A leaked poller from a prior life: reparented to init (ppid 1), self-spawned child, and the
+  // curl holding getUpdates. The whole tree must be reaped.
+  const orphanTree = (): { pid: number; ppid: number; cmd: string }[] => [
+    { pid: 200, ppid: 1, cmd: "bash /home/dev/foreman/bin/wait-reply --inbox" },
+    { pid: 201, ppid: 200, cmd: "bash /home/dev/foreman/bin/wait-reply --inbox" },
+    { pid: 202, ppid: 201, cmd: "curl -fsS -K -" },
+  ];
+
+  test("returns the whole orphaned poller tree (roots + child poll + curl)", () => {
+    const pids = strayInboxPollerPids(orphanTree(), 999).sort((a, b) => a - b);
+    expect(pids).toEqual([200, 201, 202]);
+  });
+
+  test("never returns self, even if it somehow matches the pattern", () => {
+    const procs = [{ pid: 200, ppid: 1, cmd: "bun ... wait-reply --inbox" }];
+    expect(strayInboxPollerPids(procs, 200)).toEqual([]);
+  });
+
+  test("ignores single-thread waits (no --inbox) and unrelated processes", () => {
+    const procs = [
+      { pid: 300, ppid: 5, cmd: "bash /home/dev/foreman/bin/wait-reply abc123" }, // ask-human
+      { pid: 301, ppid: 5, cmd: "bun run src/foreman.ts supervise" },
+      { pid: 302, ppid: 5, cmd: "claude -p --input-format stream-json" },
+    ];
+    expect(strayInboxPollerPids(procs, 301)).toEqual([]);
+  });
+
+  test("no strays → empty", () => {
+    expect(strayInboxPollerPids([], 1)).toEqual([]);
+  });
+
+  test("two independent orphan trees are both fully collected", () => {
+    const procs = [
+      ...orphanTree(),
+      { pid: 400, ppid: 1, cmd: "bash bin/wait-reply --inbox" },
+      { pid: 401, ppid: 400, cmd: "curl -fsS -K -" },
+    ];
+    expect(strayInboxPollerPids(procs, 999).sort((a, b) => a - b)).toEqual([
+      200, 201, 202, 400, 401,
+    ]);
   });
 });
