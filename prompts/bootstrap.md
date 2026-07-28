@@ -35,7 +35,7 @@ You know nothing about what to work on. Do not guess. Instead:
 
 ## Review & merge workflow (review runs at the END, not during iteration)
 
-The heavy review — `bin/review-loop` (`/code-review` + `/simplify` + Codex + `/security-review`,
+The heavy review — `bin/review-loop` (`/review` + `/simplify` + Codex + `/security-review`,
 multi-round to convergence) — is **slow and expensive**. Run it **once, just before you merge** —
 never while you and the human are still shaping the change. The lifecycle:
 

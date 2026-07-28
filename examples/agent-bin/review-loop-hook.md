@@ -43,7 +43,7 @@ to `bin/review-loop` for your checkout.
         "hooks": [
           {
             "type": "command",
-            "command": "bin/review-loop --stop-hook --dir . --max-rounds 3 --effort high"
+            "command": "bin/review-loop --stop-hook --dir . --max-rounds 3"
           }
         ]
       }
@@ -95,14 +95,14 @@ risky/uncertain — exactly like the security phase, but for general correctness
 It runs through the *same* digest/convergence machinery and the *same* round cap as the Claude
 phases; every finding (fixed or not) is surfaced in the summary.
 
-- **Ordering:** Claude `/code-review` → Claude `/simplify` → **Codex review** → security → final
+- **Ordering:** Claude code-review → Claude `/simplify` → **Codex review** → security → final
   convergence. Codex runs *before* security so security keeps the final word over the exact code
   that ships (including anything Codex changed).
 - **Joint fixpoint:** when Codex is active, the gated final pass is a bounded **Claude↔Codex
-  reconciliation** — it alternates a Claude `/code-review` pass and a Codex recheck and is CLEAN only
-  when a full alternation applies nothing on *both* models (so a Codex fix Claude would flag, and a
-  Claude fix Codex would flag, are both caught). The alternation is capped at `--max-rounds` cycles
-  and each pass is itself round-capped — no infinite ping-pong.
+  reconciliation** — it alternates a Claude review pass (report + apply) and a Codex recheck and is
+  CLEAN only when a full alternation applies nothing on *both* models (so a Codex fix Claude would
+  flag, and a Claude fix Codex would flag, are both caught). The alternation is capped at
+  `--max-rounds` cycles — no infinite ping-pong.
 - **Disagreement / escalation:** a Codex finding it judges too risky to auto-fix is left UNAPPLIED
   and surfaced as an escalation (`review-loop: NOT-CLEAN`, WHY printed) — the same human-decides
   channel as security escalations. Nothing risky is silently applied.
@@ -123,10 +123,16 @@ Same graceful behavior when codex is missing/not-logged-in (warns, exits nonzero
 
 ## Notes
 
-- The hook runs `claude -p` **and `codex exec`** sub-invocations (`/code-review`, `/simplify`, the
-  Codex review loop, the security fix loop, and — only if Codex or security changed code — a final
-  reconciliation / `/code-review`). Each costs tokens/time; keep `--max-rounds` modest for
-  interactive use, or pass `--no-codex` to run Claude-only.
+- The hook runs `claude -p` **and `codex exec`** sub-invocations (the code-review report+apply
+  pair, `/simplify`, the Codex review loop, the security fix loop, and — only if simplify, Codex or
+  security changed code — a final reconciliation / code-review pass). Each costs tokens/time; keep
+  `--max-rounds` modest for interactive use, or pass `--no-codex` to run Claude-only.
+- **The code-review phase is deliberately not a loop.** It runs the built-in `/review <PR>` once to
+  REPORT (resolving the open GitHub PR for the branch via `gh`; with no PR it uses a diff-scoped
+  review prompt instead), then ONE apply pass for the findings it is confident about. It replaced an
+  up-to-`--max-rounds` loop of `/code-review high --fix`, whose per-round multi-agent review of the
+  whole diff was by far this script's biggest token cost. Anything the apply pass will not touch is
+  escalated as a RISKY finding, not re-reviewed. `--effort` is gone with it — nothing took it.
 - The security phase **auto-fixes** the findings it is confident about (auth / input / secrets /
   network scope) and loops to convergence like the other phases. It escalates (NOT-CLEAN) only if it
   can't converge within the cap or it found a finding too risky to auto-fix (surfaced with WHY). In

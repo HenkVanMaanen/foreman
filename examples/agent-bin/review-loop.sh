@@ -9,8 +9,14 @@
 # Phases run IN ORDER on the git repo at DIR. The order is deliberate and confirmed optimal: fix
 # correctness first, shrink the surface second, and let security have the final word over the exact
 # code that ships.
-#   1. code-review loop  — up to --max-rounds of `/code-review <effort> --fix`, committing each
-#                          round's auto-fixes, until a round applies NO changes (CLEAN) or the cap.
+#   1. code-review       — TWO fixed passes, not a loop. Pass 1 REPORTS via the built-in `/review
+#                          <PR>` (the open GitHub PR found via gh; a diff-scoped review prompt when
+#                          there is none), pass 2 APPLIES the findings it is confident about and
+#                          commits, flagging the rest RISKY for a human. WHY it is bounded: `/review`
+#                          does not fix, so "loop until a round applies nothing" has no fixpoint here
+#                          — and the loop it replaces (six `/code-review high --fix` rounds, each a
+#                          multi-agent review of the whole diff) is the cost this script was eating.
+#                          Findings the apply pass will not touch are ESCALATED, not ground down.
 #   2. simplify loop     — same structure with `/simplify` (quality-only, no bug-hunting).
 #   2.5 codex review loop — conditional (see --codex, DEFAULT ON). An INDEPENDENT second model
 #                          (OpenAI Codex, default gpt-5.6-sol) reviews the diff vs --base for
@@ -34,13 +40,12 @@
 #   4. final convergence — GATED: runs ONLY if the simplify, codex, or security phase applied changes
 #                          (there is code that a later reviewer has not re-blessed). When Codex is active it
 #                          is a bounded Claude<->Codex RECONCILIATION loop: it alternates a Claude
-#                          `/code-review --fix` pass and a Codex recheck and stops only when a full
-#                          alternation applies nothing on BOTH — so a Codex fix Claude would flag,
-#                          and a Claude fix Codex would flag, are both caught. The alternation is
-#                          capped at --max-rounds cycles and each pass is itself round-capped. When
-#                          Codex is inactive it degrades to the original single gated `/code-review`
-#                          pass (catch a bug a security fix introduced). Skipped when nothing changed
-#                          after the codex phase.
+#                          review pass (phase 1's report+apply pair) and a Codex recheck and stops
+#                          only when a full alternation applies nothing on BOTH — so a Codex fix
+#                          Claude would flag, and a Claude fix Codex would flag, are both caught. The
+#                          alternation is capped at --max-rounds cycles. When Codex is inactive it
+#                          degrades to a single gated Claude review pass (catch a bug a security fix
+#                          introduced). Skipped when nothing changed after the codex phase.
 #
 # Convergence per round is detected structurally: we digest the working tree before and after the
 # review invocation; identical digest ⇒ the round applied nothing ⇒ that phase converged. Each
@@ -53,7 +58,7 @@
 #
 # Usage:
 #   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
-#               [--security auto|on|off] [--effort low|medium|high|max]
+#               [--security auto|on|off]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --help
@@ -83,12 +88,13 @@
 #          that merely mentions these words does not self-trigger.)
 #
 # Exit codes / final line:
-#   0  CLEAN     — every phase (including Codex, if active) converged and neither the security nor
-#                  the Codex phase escalated a risky finding.
+#   0  CLEAN     — every phase (including Codex, if active) converged and no phase escalated a risky
+#                  finding.
 #   3  NOT-CLEAN — a phase hit the round cap with changes still applying, a review invocation failed,
-#                  and/or the security OR codex phase needs a human (ESCALATE): it could not converge
-#                  within the cap OR it found a finding it judged too risky to auto-fix (flagged with
-#                  WHY). WHY is printed.
+#                  and/or a phase needs a human (ESCALATE): it could not converge within the cap OR
+#                  it found a finding it judged too risky to auto-fix (flagged with WHY). The
+#                  code-review phase reaches this the same way: its apply pass leaves anything
+#                  uncertain UNAPPLIED and RISKY rather than re-reviewing it. WHY is printed.
 #   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never in
 #                  --stop-hook mode: a blocking code there would wedge the session (see below).
 #
@@ -109,7 +115,6 @@ base=""
 target="auto"     # default: best-effort derive the MR/PR target branch, else the historical base
 max_rounds=6
 security="on"     # default: always run security-review; the command scopes itself to real findings
-effort="high"
 codex="on"        # default: run the Codex independent-reviewer phase (skips gracefully if unavailable)
 codex_model="gpt-5.6-sol"
 stop_hook=0
@@ -138,11 +143,11 @@ _tmo() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeou
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
   cat <<'EOF'
-review-loop — run code-review + simplify + security (all auto-fixing) to convergence.
+review-loop — run code-review + simplify + codex + security over this branch's changes.
 
 Usage:
   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
-              [--security auto|on|off] [--effort low|medium|high|max]
+              [--security auto|on|off]
               [--codex|--no-codex] [--codex-model MODEL]
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
@@ -156,16 +161,18 @@ from the open MR/PR via glab/gh and IS best-effort: it falls back to the merge-b
 (with a stderr note when a branch was derived but turned out unusable). --target none skips
 derivation.
 
-Phases run in order, each capped at --max-rounds and committing per round:
-  1. /code-review <effort> --fix loop   (fix correctness)
+Phases run in order, committing per round; the auto-fixing loops are capped at --max-rounds:
+  1. code-review                        (2 fixed passes: `/review <PR>` REPORTS — or a diff-scoped
+                                         review prompt when the branch has no open GitHub PR — then
+                                         ONE apply pass; risky findings surfaced, not looped on)
   2. /simplify loop                     (shrink surface)
   3. codex review loop                  (independent 2nd model; auto-applies confident fixes,
                                          escalates risky ones; skipped if codex unavailable)
   4. security fix loop                  (auto-applies confident in-scope fixes; risky ones surfaced)
   5. final convergence                  (ONLY if simplify/codex/security changed code — bounded Claude<->Codex
-                                         reconciliation, or a single /code-review pass if codex off)
+                                         reconciliation, or a single code-review pass if codex off)
 
-Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, effort=high, codex=on,
+Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, codex=on,
           codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch if derivable,
           else with origin/main.
 
@@ -203,7 +210,6 @@ while [ "$#" -gt 0 ]; do
     --target)     [ "$#" -ge 2 ] || die_usage "--target needs REF|auto|none"; target="$2"; shift 2;;
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
-    --effort)     [ "$#" -ge 2 ] || die_usage "--effort needs a level"; effort="$2"; shift 2;;
     --codex)      codex="on"; shift;;
     --no-codex)   codex="off"; shift;;
     --codex-model) [ "$#" -ge 2 ] || die_usage "--codex-model needs MODEL"; codex_model="$2"; shift 2;;
@@ -215,7 +221,6 @@ done
 
 # --- validation -------------------------------------------------------------------------------
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
-case "$effort" in low|medium|high|max) ;; *) die_usage "--effort must be low|medium|high|max (got '$effort')";; esac
 case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$codex')";; esac
 # --target is either a mode word or a branch name we hand to git.
 case "$target" in
@@ -306,7 +311,7 @@ resolve_branch_ref() {
   _first_ref "${cands[@]}" "heads/$b" "remotes/$b"
 }
 
-# Extract a top-level "key": "value" string field from JSON on stdin (both forges answer with a
+# Extract a top-level "key": <scalar> field from JSON on stdin (both forges answer with a
 # one-element ARRAY, so unwrap that first). jq only — it reads the field STRUCTURALLY, where any
 # grep/sed approximation takes the first TEXTUAL match anywhere in the payload and so lets a nested
 # occurrence of the same key win over the real one. No jq ⇒ empty output ⇒ the caller reads that as
@@ -316,18 +321,27 @@ _json_str_field() {
   jq -r --arg k "$1" 'if type == "array" then .[0] else . end | .[$k]? // empty' 2>/dev/null
 }
 
-# Best-effort: the target branch of the OPEN MR/PR for the checked-out branch, via glab or gh.
-# Echoes the branch NAME; returns 1 when there is no MR context (detached HEAD, no CLI, no open
-# MR/PR, auth/network failure, junk output) so the caller can fall back cleanly. Every invocation is
-# stdin-closed and hang-guarded via _tmo, and at most two CLIs are asked — the second only if the
-# first outright failed.
-detect_target_branch() {
+# Best-effort MR/PR context for the checked-out branch, via glab or gh. Two consumers need it now —
+# the diff-scope derivation (--target auto) and the code-review phase (`/review <PR>`) — so it sets
+# GLOBALS and memoizes, rather than echoing: the caller needs TWO values, and `$(...)` would both
+# lose the second one and pay the forge round-trip twice.
+#   MR_TARGET_BRANCH — the branch this work merges INTO; "" when there is no MR context (detached
+#                      HEAD, no CLI, no open MR/PR, auth/network failure, junk output).
+#   MR_PR_NUMBER     — the GitHub PR number, set ONLY on the gh path; "" otherwise. GitLab MRs
+#                      deliberately do not set it: `/review` drives `gh pr view` / `gh pr diff` and
+#                      cannot read an MR, so the GitLab path must take the diff-scoped fallback.
+# Every invocation is stdin-closed and hang-guarded via _tmo, and at most two CLIs are asked — the
+# second only if the first outright failed.
+MR_CTX_DONE=0; MR_TARGET_BRANCH=""; MR_PR_NUMBER=""
+detect_mr_context() {
+  [ "$MR_CTX_DONE" -eq 1 ] && return 0
+  MR_CTX_DONE=1
   local branch remote_url host out=""
   branch="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
-  [ -n "$branch" ] || return 1                      # detached HEAD ⇒ no MR to look up
+  [ -n "$branch" ] || return 0                      # detached HEAD ⇒ no MR to look up
   # The branch goes into a CLI argument and (for glab) a URL query, so hold it to the same charset
   # we accept back. An exotic branch name just means "no MR context" — fall back, don't improvise.
-  [[ "$branch" =~ $branch_re ]] || return 1
+  [[ "$branch" =~ $branch_re ]] || return 0
   remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
 
   # Pick the forge CLI from origin's HOST, not from a substring of the whole URL (which misroutes
@@ -346,7 +360,7 @@ detect_target_branch() {
     *github*) order=(gh);;
   esac
 
-  local raw field
+  local raw field num=""
   for tool in "${order[@]}"; do
     command -v "$tool" >/dev/null 2>&1 || continue
     # Capture the RAW response separately from the parse so a CLI that FAILED (missing auth, network
@@ -360,7 +374,7 @@ detect_target_branch() {
       # is worse than falling back. --limit 1 keeps the response to the one MR/PR we act on.
       gh)   field="baseRefName"
             raw="$(cd "$dir" && _tmo 10 gh pr list --head "$branch" --state open --limit 1 \
-                     --json baseRefName </dev/null 2>/dev/null)" || continue;;
+                     --json baseRefName,number </dev/null 2>/dev/null)" || continue;;
       # `glab api`, not `glab mr view -F json`: `-F json` only exists on recent glab (on 1.36 it is
       # "unknown shorthand flag: 'F'"), so the mr-view form fails closed on every older install and
       # the GitLab path never derives anything. The REST endpoint is stable across versions and
@@ -375,10 +389,17 @@ detect_target_branch() {
     # Only accept a plausible branch name — never feed CLI error prose or an option-looking string
     # into git. This CLI has spoken for the repo, so an unusable answer means "no MR context" for
     # real: fall back rather than asking the other forge's CLI about a repo that isn't its.
-    [[ "$out" =~ $branch_re ]] || return 1
-    printf '%s\n' "$out"; return 0
+    [[ "$out" =~ $branch_re ]] || return 0
+    MR_TARGET_BRANCH="$out"
+    # The PR number is interpolated into a `/review <N>` slash command, so accept digits ONLY —
+    # anything else (empty field, jq absent, error prose) leaves it unset and takes the fallback.
+    if [ "$tool" = "gh" ]; then
+      num="$(_json_str_field number <<<"$raw" || true)"
+      [[ "$num" =~ ^[0-9]+$ ]] && MR_PR_NUMBER="$num"
+    fi
+    return 0
   done
-  return 1
+  return 0
 }
 
 # A resolved ref in its short display form (origin/main, main) — the full refs/ path exists only to
@@ -397,12 +418,13 @@ if [ -z "$base" ] && [ "$target" != "none" ]; then
   # $target_src names the SOURCE for the log line: an explicit --target REF consulted no MR/PR at
   # all, so calling it "the MR/PR target branch" would misdirect anyone debugging a wrong scope.
   if [ "$target" = "auto" ]; then
-    target_branch="$(detect_target_branch || true)"; target_src="the MR/PR target branch"
+    detect_mr_context
+    target_branch="$MR_TARGET_BRANCH";              target_src="the MR/PR target branch"
   else
     target_branch="$target";                         target_src="the --target branch"
   fi
-  # An empty $target_branch means --target auto found no MR context (detect_target_branch already
-  # knows every reason) — nothing to resolve, so the historical default below takes over.
+  # An empty $target_branch means --target auto found no MR context (detect_mr_context already
+  # already knows every reason) — nothing to resolve, so the historical default below takes over.
   if [ -n "$target_branch" ]; then
     if ! target_ref="$(resolve_branch_ref "$target_branch")"; then
       _target_giveup "target branch '$target_branch' does not resolve locally — tried <remote>/$target_branch for every remote, local $target_branch, and $target_branch as a remote-qualified ref (try 'git fetch'; note that HEAD and */HEAD are refused outright — they are not branches)"
@@ -464,14 +486,60 @@ scope_diff_ref="${range:-HEAD}"
 # which can land WIDER than the base that was pinned, so "only uncommitted changes will be reviewed"
 # would be false for half the reviewers.
 if [ -z "$range" ] && [ "$base_pinned" -eq 1 ]; then
-  echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases see UNCOMMITTED changes only, and /code-review + /simplify fall back to self-deriving their own range" >&2
+  echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases and the diff-scoped code-review fallback see UNCOMMITTED changes only, /simplify falls back to self-deriving its own range, and '/review <PR>' reviews the whole PR regardless" >&2
 fi
 
-# Both Claude invocations are built ONCE here (code-review alone runs in three places: initial phase,
-# reconcile cycle, post-security pass), so the scope argument stays attached to its command in one
-# spot instead of four that can drift apart.
-cr_cmd="/code-review $effort --fix${range:+ $range}"
 si_cmd="/simplify${range:+ $range}"
+
+# --- what the code-review phase reviews --------------------------------------------------------
+# The report pass used to be `/code-review <effort> --fix`, which fans out a multi-agent review of
+# the working diff on EVERY round — six of those per loop ate a whole session's quota. It is
+# replaced by the built-in `/review <PR>`, a single-agent review that reads the PR's own diff via
+# `gh pr view` / `gh pr diff` and REPORTS (it has no --fix).
+#
+# `/review` needs a PR NUMBER: called bare its prompt is "run `gh pr list` … then ask the user which
+# one to review", which never resolves under headless `claude -p`. It is also GitHub-only. So we use
+# it only when detect_mr_context found an open PR via gh, and otherwise fall back to a diff-scoped
+# review prompt in the same shape as the security/codex drivers — NOT back to /code-review.
+#
+# The extra words after the PR number land in `/review`'s "Additional instructions from the user"
+# slot. They must stay on ONE line: the command splits its argument on whitespace and rejoins with
+# single spaces, so a multi-line instruction would be flattened anyway.
+review_report_contract="Do NOT edit any files — this pass only REPORTS. After the review, emit machine-readable lines LAST, one per finding, each on its own line, in exactly this format: REVIEWFINDING: <severity> | <file:line-or-area> | <one line: the issue and the fix you recommend>. Report only real defects in the changed code — no style preferences, no speculative refactors, nothing about code the branch did not touch. If you found nothing worth fixing, emit exactly this single line instead: REVIEWFINDING: NONE"
+
+# The diff-scoped fallback: the same review, self-driven, for a branch with no open GitHub PR.
+build_review_prompt() {
+  cat <<EOF
+You are performing a CODE REVIEW of the changes on this git branch. This pass only REPORTS — do NOT
+edit any files.
+
+SCOPE: review ONLY the code this branch changed — the diff \`git diff $scope_diff_ref\` plus any
+uncommitted changes. Do not audit or "improve" pre-existing code you did not touch.
+
+Look for, in this order of importance:
+  - correctness bugs: logic errors, wrong conditionals, off-by-one, unhandled error/edge cases,
+    resource leaks, races, broken control flow, quoting/escaping bugs.
+  - contract violations: a change that breaks an existing caller, test, or documented behaviour.
+  - missing or wrong test coverage for the behaviour this branch adds.
+  - clear violations of the conventions the surrounding code already follows.
+
+Do NOT report style preferences, speculative refactors, or issues in code the branch did not touch.
+
+OUTPUT — emit these machine-readable lines LAST, one per finding, each on its own line:
+  REVIEWFINDING: <severity> | <file:line-or-area> | <one line: the issue and the fix you recommend>
+If you found nothing worth fixing, emit exactly this single line instead:
+  REVIEWFINDING: NONE
+EOF
+}
+
+detect_mr_context   # memoized: free if --target auto already ran it above
+if [ -n "$MR_PR_NUMBER" ]; then
+  cr_cmd="/review $MR_PR_NUMBER $review_report_contract"
+  cr_display="/review $MR_PR_NUMBER"
+else
+  cr_cmd="$(build_review_prompt)"
+  cr_display="diff-scoped review of ${scope_diff_ref} (no open GitHub PR for this branch)"
+fi
 
 # --- helpers ----------------------------------------------------------------------------------
 _hash() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
@@ -547,15 +615,17 @@ run_codex() {
 # run_codex runner). $display overrides the (possibly long) prompt shown in the per-round header.
 # $runner is the reviewer function to call (default run_claude; run_codex for the Codex phase) — it
 # is passed EXPLICITLY rather than via a mutable global so a phase can never leak its runner into the
-# next. Sets globals: PHASE_STATUS (CLEAN|NOT-CONVERGED|ERROR), PHASE_ROUNDS, PHASE_CHANGED (0|1).
+# next. $cap overrides the round cap (default --max-rounds) for a phase that is deliberately bounded
+# tighter — the code-review apply pass passes 1, since there is nothing to converge towards there.
+# Sets globals: PHASE_STATUS (CLEAN|NOT-CONVERGED|ERROR), PHASE_ROUNDS, PHASE_CHANGED (0|1).
 run_fix_phase() {
-  local label="$1" slash="$2" commit_prefix="$3" display="${4:-$2}" runner="${5:-run_claude}"
+  local label="$1" slash="$2" commit_prefix="$3" display="${4:-$2}" runner="${5:-run_claude}" cap="${6:-$max_rounds}"
   PHASE_STATUS="CLEAN"; PHASE_ROUNDS=0; PHASE_CHANGED=0
   local round before after rc
-  for ((round = 1; round <= max_rounds; round++)); do
+  for ((round = 1; round <= cap; round++)); do
     PHASE_ROUNDS="$round"
     before="$(_tree_digest)"
-    echo ">>> $label: round $round/$max_rounds — $runner \"$display\""
+    echo ">>> $label: round $round/$cap — $runner \"$display\""
     rc=0
     "$runner" "$slash" || rc=$?
     after="$(_tree_digest)"
@@ -596,8 +666,8 @@ run_fix_phase() {
       return 0
     fi
 
-    if [ "$round" -eq "$max_rounds" ]; then
-      echo "    $label: still applying changes at round cap ($max_rounds) — NOT CONVERGED"
+    if [ "$round" -eq "$cap" ]; then
+      echo "    $label: still applying changes at round cap ($cap) — NOT CONVERGED"
       PHASE_STATUS="NOT-CONVERGED"
     fi
   done
@@ -607,16 +677,139 @@ run_fix_phase() {
 # Parse a captured review phase's output for its FINDING lines. Echoes the surfaced findings (every
 # APPLIED/RISKY line, deduped across rounds, with the NONE sentinel dropped) to stdout, and RETURNS 0
 # iff at least one RISKY (deliberately-unapplied) finding is present so the caller can escalate.
-# Shared verbatim by the security and codex phases — only the token (SECFINDING|CODEXFINDING) differs.
+# Shared verbatim by the code-review, security and codex phases — only the token
+# (REVIEWFINDING|SECFINDING|CODEXFINDING) differs.
 # Call it in a conditional so its risky-return status is consumed rather than tripping `set -e`:
 #   if FINDINGS="$(parse_findings SECFINDING "$cap")"; then RISKY=1; fi
 parse_findings() {  # $1=token  $2=capture-file
-  local token="$1" cap="$2"
-  # We extract from the token onward so leading markdown/indent doesn't matter.
-  grep -aoiE "$token:.*" "$cap" 2>/dev/null \
-    | grep -viE "^$token:[[:space:]]*NONE[[:space:]]*$" | sort -u || true
-  # Last command → the function's return status: 0 if a RISKY finding exists, 1 otherwise.
-  grep -aiqE "$token:[[:space:]]*RISKY([[:space:]]|\|)" "$cap" 2>/dev/null
+  local token="$1" cap="$2" out
+  # We extract from the token onward so leading markdown/indent doesn't matter — which also matches
+  # the OUTPUT-contract lines inside the prompt itself whenever the reviewer echoes or quotes its
+  # instructions back, turning an empty template into a phantom "finding" (and, for the security
+  # contract, whose RISKY template reads `SECFINDING: RISKY | <severity> | …`, into a phantom
+  # ESCALATION). Every contract writes the location as the literal placeholder `<file:line-or-area>`,
+  # so dropping lines that still contain it removes the templates and nothing a reviewer would ever
+  # emit for a real finding.
+  out="$(grep -aoiE "$token:.*" "$cap" 2>/dev/null \
+         | grep -viE "^$token:[[:space:]]*NONE[[:space:]]*$" \
+         | grep -vF '<file:line-or-area>' | sort -u || true)"
+  [ -n "$out" ] && printf '%s\n' "$out"
+  # Last command → the function's return status: 0 if a RISKY finding exists, 1 otherwise. Judged on
+  # the FILTERED list, never the raw capture, so a quoted-back template cannot force an escalation.
+  grep -aiqE "^$token:[[:space:]]*RISKY([[:space:]]|\|)" <<<"$out"
+}
+
+# --- code-review phase (report → apply; deliberately NOT a convergence loop) -------------------
+# Build the APPLY pass's prompt from the findings the REPORT pass produced.
+build_review_apply_prompt() {  # $1 = the REVIEWFINDING lines from the report pass
+  cat <<EOF
+A code review of the changes on this git branch produced the findings below. Act on them. This is a
+SINGLE pass — there is no second round, so do not defer work to one.
+
+FINDINGS:
+$1
+
+For each finding:
+  - If you agree it is REAL and its fix is minimal, localized, and does NOT change intended
+    behaviour, APPLY the fix by editing the file(s) directly. Touch only what the finding requires.
+  - If it is wrong, already fixed, or a matter of taste, DO NOT edit code — mark it DISMISSED with
+    the reason. A dismissal is a judgement call you are making; be specific about why.
+  - If it is real but its fix is uncertain, architectural, high-blast-radius, or could change
+    behaviour / break functionality, DO NOT edit code — leave it UNAPPLIED and flag it RISKY so a
+    human decides. When in doubt between APPLIED and RISKY, choose RISKY.
+
+Do not add dependencies, do not refactor or reformat unrelated code, and do not fix anything that is
+not in the list above. Do NOT run \`git commit\` or \`git add\` — the caller commits. Do not create
+new files unless a fix strictly requires one.
+
+OUTPUT — emit these machine-readable lines LAST, one per finding from the list above, each on its
+own line:
+  REVIEWFINDING: <APPLIED|RISKY|DISMISSED> | <file:line-or-area> | <one-line issue and action>
+For RISKY findings end the final field with: -- NOT APPLIED: <why>
+For DISMISSED findings end the final field with: -- DISMISSED: <why>
+EOF
+}
+
+# Run ONE code-review phase: pass 1 REPORTS, pass 2 APPLIES what pass 1 found.
+#
+# WHY this is two fixed passes and not a loop. The old phase ran up to --max-rounds of
+# `/code-review <effort> --fix` and stopped when a round applied nothing. `/review` does not fix, so
+# that loop has no fixpoint to find here: pass 1 would report the same findings round after round
+# forever. And the loop is exactly the cost we are removing — six multi-agent review rounds per
+# review-loop, twice, drained a full session quota in one morning.
+#
+# So: report once, apply once. The apply pass runs through run_fix_phase (capped at 1) purely to
+# reuse the digest/commit machinery every other phase uses. Anything the apply pass will not touch
+# is surfaced as a RISKY finding for a human instead of being ground down by more rounds — the same
+# posture the security and codex phases already take. The phases that genuinely DO auto-fix
+# (simplify, codex, security) still converge; only this one is bounded.
+#
+# Sets globals: REVIEW_STATUS (CLEAN|RISKY|ERROR), REVIEW_PASSES, REVIEW_CHANGED (0|1),
+# REVIEW_FINDINGS (surfaced lines, one per line).
+run_review_phase() {
+  local label="$1" commit_prefix="$2"
+  local rc=0 report=""
+  REVIEW_STATUS="CLEAN"; REVIEW_PASSES=0; REVIEW_CHANGED=0; REVIEW_FINDINGS=""
+
+  CR_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-cr.XXXXXX" 2>/dev/null)" \
+    || { REVIEW_STATUS="ERROR"; echo "    $label: could not create temp capture file"; return 0; }
+  : > "$CR_CAP"
+
+  echo ">>> $label: pass 1/2 REPORT — $cr_display"
+  REVIEW_PASSES=1
+  RUN_CLAUDE_CAPTURE="$CR_CAP"
+  run_claude "$cr_cmd" || rc=$?
+  RUN_CLAUDE_CAPTURE=""
+  if [ "$rc" -ne 0 ]; then
+    echo "    $label: report pass exited $rc — ending phase (soft error)"
+    REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
+  fi
+  # No REVIEWFINDING line AT ALL (not even the NONE sentinel) means the pass never actually reviewed:
+  # `/review` bailing out (gh missing, PR closed since we looked it up) prints prose and exits 0, and
+  # so does a model that ignored the output contract. Treating that as "no findings" would report
+  # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
+  if ! grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
+    echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
+    REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
+  fi
+  # Pass 1 emits no RISKY lines (that verdict only exists in pass 2's contract), so parse_findings'
+  # risky-return is always 1 here — consume it rather than letting `set -e` trip on it.
+  report="$(parse_findings REVIEWFINDING "$CR_CAP" || true)"
+  rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""
+
+  if [ -z "$report" ]; then
+    echo "    $label: review reported no findings — CLEAN"
+    return 0
+  fi
+  REVIEW_FINDINGS="$report"
+  echo "    $label: review reported $(printf '%s\n' "$report" | wc -l | tr -d ' ') finding(s)"
+
+  CR_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-cr.XXXXXX" 2>/dev/null)" \
+    || { REVIEW_STATUS="ERROR"; echo "    $label: could not create temp capture file"; return 0; }
+  : > "$CR_CAP"
+  echo ">>> $label: pass 2/2 APPLY — applying the fixes it is confident about"
+  REVIEW_PASSES=2
+  RUN_CLAUDE_CAPTURE="$CR_CAP"
+  run_fix_phase "$label (apply)" "$(build_review_apply_prompt "$report")" "$commit_prefix" \
+                "apply the confident fixes from the review report" run_claude 1
+  RUN_CLAUDE_CAPTURE=""
+  REVIEW_CHANGED="$PHASE_CHANGED"
+
+  # Prefer pass 2's APPLIED/RISKY/DISMISSED verdicts over pass 1's bare findings — same issues, but
+  # each now carries what was actually DONE about it. Keep pass 1's list if pass 2 emitted nothing.
+  local applied risky=0
+  if applied="$(parse_findings REVIEWFINDING "$CR_CAP")"; then risky=1; fi
+  [ -n "$applied" ] && REVIEW_FINDINGS="$applied"
+  rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""
+
+  # run_fix_phase reports NOT-CONVERGED whenever the last allowed round still applied changes — which
+  # at cap=1 is the ORDINARY success path here (the apply pass is meant to change code exactly once).
+  # Only a real ERROR carries over; escalation is driven by RISKY findings instead.
+  [ "$PHASE_STATUS" = "ERROR" ] && REVIEW_STATUS="ERROR"
+  if [ "$risky" -eq 1 ] && [ "$REVIEW_STATUS" = "CLEAN" ]; then
+    REVIEW_STATUS="RISKY"
+  fi
+  return 0
 }
 
 # --- security phase (auto-fixing) -------------------------------------------------------------
@@ -859,7 +1052,8 @@ finalize_codex_findings() {
 # --- drive the phases -------------------------------------------------------------------------
 echo "== $prog =="
 codex_disp="$codex"; [ "$codex" = "on" ] && codex_disp="on ($codex_model)"
-echo "dir=$dir  base=$base_short  max-rounds=$max_rounds  effort=$effort  security=$security  codex=$codex_disp"
+echo "dir=$dir  base=$base_short  max-rounds=$max_rounds  security=$security  codex=$codex_disp"
+echo "code-review: $cr_display"
 echo
 
 # Init all codex/reconcile globals up front so `set -u` is happy on every path (e.g. codex disabled).
@@ -867,15 +1061,21 @@ CODEX_CAP=""; CODEX_PROMPT=""   # CODEX_PROMPT: the codex driver prompt, built o
 CODEX_STATUS="SKIPPED"; CODEX_REASON="--no-codex (disabled)"; CODEX_ROUNDS=0
 CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 
-# Belt against a temp-file leak: the security/codex phases mktemp capture files that they rm on the
-# normal path, but an unexpected error under `set -e` (or a Ctrl-C) between mktemp and that rm would
-# otherwise strand them in TMPDIR. An EXIT trap removes both regardless of how we leave. Both vars are
-# initialized above/below before any phase can create a file, so `set -u` is satisfied when it fires.
-SEC_CAP=""
-trap 'rm -f "$SEC_CAP" "$CODEX_CAP" 2>/dev/null || true' EXIT
+# Belt against a temp-file leak: the code-review/security/codex phases mktemp capture files that they
+# rm on the normal path, but an unexpected error under `set -e` (or a Ctrl-C) between mktemp and that
+# rm would otherwise strand them in TMPDIR. An EXIT trap removes them regardless of how we leave. All
+# three vars are initialized before any phase can create a file, so `set -u` is satisfied when it fires.
+SEC_CAP=""; CR_CAP=""
+trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" 2>/dev/null || true' EXIT
 
-run_fix_phase "code-review" "$cr_cmd" "chore(review): code-review auto-fixes"
-CR_STATUS="$PHASE_STATUS"; CR_ROUNDS="$PHASE_ROUNDS"; CR_CHANGED="$PHASE_CHANGED"
+# Accumulates the code-review findings across the initial phase AND any reconcile / post-security
+# pass, so a finding raised late still reaches the summary.
+CR_FINDINGS=""
+_note_cr_findings() { [ -n "$REVIEW_FINDINGS" ] && CR_FINDINGS="${CR_FINDINGS:+$CR_FINDINGS$'\n'}$REVIEW_FINDINGS"; return 0; }
+
+run_review_phase "code-review" "chore(review): code-review fixes"
+CR_STATUS="$REVIEW_STATUS"; CR_PASSES="$REVIEW_PASSES"; CR_CHANGED="$REVIEW_CHANGED"
+_note_cr_findings
 echo
 
 run_fix_phase "simplify" "$si_cmd" "chore(review): simplify"
@@ -896,19 +1096,20 @@ echo
 # (simplify is included because it reworks code AFTER the code-review pass and only shrinks the
 # surface; a correctness regression it introduces would otherwise ship un-reviewed whenever codex and
 # security both change nothing, e.g. under --no-codex with a clean security run.)
-#   * Codex active  → a bounded Claude<->Codex RECONCILIATION: alternate a Claude /code-review pass
-#                     and a Codex recheck; the tree is clean only when a full alternation applies
-#                     nothing on BOTH (so a Codex fix Claude would flag AND a Claude fix Codex would
-#                     flag are caught). Capped at --max-rounds cycles; each pass is itself round-capped.
-#   * Codex inactive→ the original single gated /code-review pass (catch a bug a security fix made).
-# RECONCILE_STATUS is the umbrella convergence verdict for this phase (CLEAN|NOT-CONVERGED|ERROR).
-FCR_RAN=0; FCR_CHANGED=0; FCR_ROUNDS=0     # Claude side of the final phase (for the summary)
+#   * Codex active  → a bounded Claude<->Codex RECONCILIATION: alternate a Claude review pass (report
+#                     + apply, see run_review_phase) and a Codex recheck; the tree is clean only when
+#                     a full alternation applies nothing on BOTH (so a Codex fix Claude would flag AND
+#                     a Claude fix Codex would flag are caught). Capped at --max-rounds cycles.
+#   * Codex inactive→ the original single gated Claude review pass (catch a bug a security fix made).
+# RECONCILE_STATUS is the umbrella convergence verdict for this phase (CLEAN|NOT-CONVERGED|RISKY|ERROR).
+FCR_RAN=0; FCR_CHANGED=0; FCR_PASSES=0     # Claude side of the final phase (for the summary)
 FCC_RAN=0; FCC_CHANGED=0                    # Codex side of the reconciliation (for the summary)
 RECON_CYCLES=0; RECONCILE_STATUS="CLEAN"
-_recon_note() {  # fold a per-pass status into the umbrella verdict (ERROR dominates NOT-CONVERGED)
+_recon_note() {  # fold a per-pass status into the umbrella verdict (ERROR > NOT-CONVERGED > RISKY)
   case "$1" in
     ERROR)         RECONCILE_STATUS="ERROR";;
     NOT-CONVERGED) [ "$RECONCILE_STATUS" = "ERROR" ] || RECONCILE_STATUS="NOT-CONVERGED";;
+    RISKY)         [ "$RECONCILE_STATUS" = "CLEAN" ] && RECONCILE_STATUS="RISKY";;
   esac
   return 0   # never let this bookkeeping helper's exit status trip `set -e` at the call site
 }
@@ -919,9 +1120,9 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
-      run_fix_phase "code-review (reconcile)" "$cr_cmd" "chore(review): reconcile code-review"
-      FCR_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCR_CHANGED=1
-      c_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"
+      run_review_phase "code-review (reconcile)" "chore(review): reconcile code-review"
+      FCR_RAN=1; [ "$REVIEW_CHANGED" -eq 1 ] && FCR_CHANGED=1
+      c_changed="$REVIEW_CHANGED"; _recon_note "$REVIEW_STATUS"; _note_cr_findings
 
       RUN_CLAUDE_CAPTURE="$CODEX_CAP"
       run_fix_phase "codex-review (reconcile)" "$CODEX_PROMPT" "chore(review): reconcile codex" \
@@ -960,8 +1161,9 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     done
   else
     echo ">>> final code-review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
-    run_fix_phase "code-review (post-security)" "$cr_cmd" "chore(review): post-security code-review"
-    FCR_RAN=1; FCR_ROUNDS="$PHASE_ROUNDS"; FCR_CHANGED="$PHASE_CHANGED"; RECONCILE_STATUS="$PHASE_STATUS"
+    run_review_phase "code-review (post-security)" "chore(review): post-security code-review"
+    FCR_RAN=1; FCR_PASSES="$REVIEW_PASSES"; FCR_CHANGED="$REVIEW_CHANGED"; RECONCILE_STATUS="$REVIEW_STATUS"
+    _note_cr_findings
   fi
 else
   echo ">>> final convergence pass — skipped (nothing changed after the initial code-review)"
@@ -974,7 +1176,11 @@ echo
 # --- summary + verdict ------------------------------------------------------------------------
 yn() { [ "$1" -eq 1 ] && echo yes || echo no; }
 echo "== summary =="
-printf '  code-review : rounds=%s changed=%s status=%s\n' "$CR_ROUNDS" "$(yn "$CR_CHANGED")" "$CR_STATUS"
+printf '  code-review : passes=%s changed=%s status=%s (%s)\n' "$CR_PASSES" "$(yn "$CR_CHANGED")" "$CR_STATUS" "$cr_display"
+if [ -n "$CR_FINDINGS" ]; then
+  echo "  code-review findings (surfaced — APPLIED/DISMISSED included; RISKY ones need a human):"
+  printf '%s\n' "$CR_FINDINGS" | sort -u | sed 's/^/    - /'
+fi
 printf '  simplify    : rounds=%s changed=%s status=%s\n' "$SI_ROUNDS" "$(yn "$SI_CHANGED")" "$SI_STATUS"
 printf '  codex       : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$CODEX_STATUS" "$CODEX_REASON"
 if [ -n "$CODEX_FINDINGS" ]; then
@@ -990,7 +1196,7 @@ if [ "$FCC_RAN" -eq 1 ]; then   # FCC_RAN=1 only on the reconcile path (implies 
   printf '  final-recon : cycles=%s status=%s (claude changed=%s / codex changed=%s)\n' \
     "$RECON_CYCLES" "$RECONCILE_STATUS" "$(yn "$FCR_CHANGED")" "$(yn "$FCC_CHANGED")"
 elif [ "$FCR_RAN" -eq 1 ]; then
-  printf '  final-review: rounds=%s changed=%s status=%s (ran: code changed after review)\n' "$FCR_ROUNDS" "$(yn "$FCR_CHANGED")" "$RECONCILE_STATUS"
+  printf '  final-review: passes=%s changed=%s status=%s (ran: code changed after review)\n' "$FCR_PASSES" "$(yn "$FCR_CHANGED")" "$RECONCILE_STATUS"
 else
   printf '  final-recon : skipped (no code changed after the initial code-review)\n'
 fi
