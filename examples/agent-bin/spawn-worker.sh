@@ -37,10 +37,29 @@ Produce a reviewable change FAST, then stop for the human. Before you mark yours
 5. Do NOT run `bin/review-loop` — it is NOT part of definition-of-done. The full review is a
    pre-merge gate foreman runs later, only after the human approves the MR content. Running it here
    is exactly the slow-iteration problem this policy removes.
+6. As your VERY LAST act before you exit, write a machine-readable result file so foreman can collect
+   your outcome without parsing your log: write to `${FOREMAN_STATE_DIR:-state}/<id>.result.json`
+   (where <id> is the name spawn-worker was given) exactly one JSON object:
+   `{"status":"done|blocked|needs-verify","branch":"","mr_url":"","summary":"","follow_ups":[]}`
+   Fill status honestly, branch = your work branch, mr_url = the draft MR/PR URL, summary = one line,
+   follow_ups = any deferred items. spawn-worker synthesises a needs-verify stub if you forget, but
+   write it yourself so the recorded status/branch/mr_url are accurate.
 EOF
 
-name="${1:?usage: spawn-worker <name> <brief-file>}"
-brief="${2:?usage: spawn-worker <name> <brief-file>}"
+# Parse args: an optional `--force` flag may appear ANYWHERE; the two positionals are <name> <brief>.
+# --force bypasses the concurrency cap (see below).
+force=0
+positional=()
+for a in "$@"; do
+  case "$a" in
+    --force) force=1;;
+    *) positional+=("$a");;
+  esac
+done
+set -- ${positional[@]+"${positional[@]}"}
+
+name="${1:?usage: spawn-worker [--force] <name> <brief-file>}"
+brief="${2:?usage: spawn-worker [--force] <name> <brief-file>}"
 
 # Validate <name>: it is interpolated into the log file path, so restrict to a safe charset to
 # block path-traversal (mirrors wait-reply.sh's <id> posture).
@@ -52,6 +71,40 @@ fi
 state="${FOREMAN_STATE_DIR:-state}"
 mkdir -p "$state" 2>/dev/null || true
 log="$state/$name-worker.log"
+registry="$state/workers.jsonl"
+done_file="$state/$name.done"
+result_file="$state/$name.result.json"
+
+# --- concurrency cap --------------------------------------------------------------------------
+# A worker is a full `claude -p` instance (its own context window, its own token spend); too many
+# at once thrash the machine and the budget. Cap ACTIVE workers at FOREMAN_MAX_WORKERS (default 2).
+# ACTIVE = a name that appears as a launch entry in workers.jsonl whose `<name>.done` marker does
+# NOT yet exist (the wrapper touches `<name>.done` when `claude -p` returns). `--force` bypasses.
+max_workers="${FOREMAN_MAX_WORKERS:-2}"
+[[ "$max_workers" =~ ^[0-9]+$ ]] || max_workers=2
+if [ "$force" -ne 1 ] && [ -f "$registry" ]; then
+  # Distinct worker names ever launched. Prefer jq; fall back to a grep/sed extraction of the first
+  # "name":"…" on each line (launch and exit entries both carry it — de-duped by sort -u).
+  if command -v jq >/dev/null 2>&1; then
+    names="$(jq -r '.name // empty' "$registry" 2>/dev/null | sort -u)"
+  else
+    names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$registry" 2>/dev/null \
+             | sed -E 's/.*"([^"]*)"$/\1/' | sort -u)"
+  fi
+  active=0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ -e "$state/$n.done" ] || active=$((active + 1))
+  done <<EOF
+$names
+EOF
+  if [ "$active" -ge "$max_workers" ]; then
+    echo "spawn-worker: $active active worker(s) >= cap $max_workers (FOREMAN_MAX_WORKERS)." >&2
+    echo "spawn-worker: refusing to spawn '$name'. Wait for one to finish (worker-list), stop one" >&2
+    echo "spawn-worker: (worker-stop <name>), raise FOREMAN_MAX_WORKERS, or pass --force to override." >&2
+    exit 3
+  fi
+fi
 
 # Compose the brief the worker actually receives: the caller's brief followed by the standard
 # definition-of-done footer (which wires in the auto-review loop). Written to a file so multi-line
@@ -64,11 +117,34 @@ full_brief="$state/$name-brief.composed.txt"
 brief_body="$(cat -- "$brief")"
 { printf '%s\n' "$brief_body"; printf '%s\n' "$DOD_FOOTER"; } > "$full_brief"
 
-# Detach so the worker outlives this turn; capture its exit into the log so worker-status can
-# tell done-vs-running. $(cat …) expands in the child at launch, so the full brief is passed as
-# one argument regardless of quotes/newlines in it.
-nohup bash -c "claude -p --dangerously-skip-permissions \"\$(cat $(printf '%q' "$full_brief"))\" > $(printf '%q' "$log") 2>&1; echo \"WORKER_EXIT=\$?\" >> $(printf '%q' "$log")" >/dev/null 2>&1 &
+# Pre-quote the paths the detached wrapper interpolates; %q makes each a single shell-safe token.
+qbrief="$(printf '%q' "$full_brief")"
+qlog="$(printf '%q' "$log")"
+qdone="$(printf '%q' "$done_file")"
+qresult="$(printf '%q' "$result_file")"
+qreg="$(printf '%q' "$registry")"
+
+# Detach so the worker outlives this turn. $(cat …) expands in the child at launch, so the full brief
+# is passed as one argument regardless of quotes/newlines in it (unchanged from before). AFTER
+# `claude -p` returns, the wrapper — in the order the done-marker contract requires — (1) appends the
+# WORKER_EXIT marker to the log, (2) touches `<name>.done` (the single-stat done signal the supervisor
+# polls), (3) appends an exit line to the registry, and (4) synthesises a minimal result.json if the
+# worker forgot to write one, so `<name>.result.json` always exists once `.done` does. `$name` is
+# charset-guarded (A-Za-z0-9_-), so inlining it into the JSON below is safe.
+nohup bash -c "claude -p --dangerously-skip-permissions \"\$(cat $qbrief)\" > $qlog 2>&1; code=\$?; echo \"WORKER_EXIT=\$code\" >> $qlog; touch $qdone; printf '{\"name\":\"$name\",\"ended_at\":\"%s\",\"exit\":%s}\\n' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)\" \"\$code\" >> $qreg; [ -f $qresult ] || printf '{\"status\":\"needs-verify\",\"summary\":\"exited %s, no result.json\"}\\n' \"\$code\" > $qresult" >/dev/null 2>&1 &
 pid=$!
+
+# Registry launch line (append-only). started_at is ISO-8601 UTC, or epoch seconds if `date -u` with
+# that format is unavailable. Prefer jq to encode the paths safely; fall back to printf.
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)"
+if command -v jq >/dev/null 2>&1; then
+  jq -cn --arg name "$name" --argjson pid "$pid" --arg log "$log" --arg brief "$brief" \
+        --arg started_at "$started_at" \
+    '{name:$name,pid:$pid,log:$log,brief:$brief,started_at:$started_at}' >> "$registry" 2>/dev/null || true
+else
+  printf '{"name":"%s","pid":%s,"log":"%s","brief":"%s","started_at":"%s"}\n' \
+    "$name" "$pid" "$log" "$brief" "$started_at" >> "$registry" 2>/dev/null || true
+fi
 
 echo "spawned worker '$name' (pid $pid)"
 echo "log: $log"

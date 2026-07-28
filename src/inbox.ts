@@ -85,11 +85,46 @@ export function extractInboxLines(stdout: string): string[] {
  */
 export function formatInboxPrompt(msgLines: string[]): string {
   return (
-    "[inbox] New message(s) from the human since you parked:\n" +
+    "[inbox] New message(s) from the human since your last turn:\n" +
     `${msgLines.join("\n")}\n\n` +
     "Handle them (reply in the correct thread; a leading '-' in the 2nd field means a new root). " +
     "An `ACK <post_id> <root_or_-> +1` line means the human approved that post with a 👍 (no reply " +
     "text) — treat it as their go-ahead on that post."
+  );
+}
+
+/** Leading-token urgency markers a human can use to force a mid-turn interrupt. */
+export function isUrgentText(text: string): boolean {
+  const s = text.trimStart().toLowerCase();
+  return (
+    s.startsWith("!") ||
+    s.startsWith("/now") ||
+    s.startsWith("/interrupt") ||
+    s.startsWith("/urgent")
+  );
+}
+
+/**
+ * Should a batch that arrived WHILE THE AGENT IS BUSY preempt the current turn? Pure so the
+ * policy is unit-testable. Urgent when either the human explicitly flagged a message (isUrgentText)
+ * or this is a follow-up in the same busy stretch — `ackedThisStretch` means the agent already
+ * auto-acked once, so a second message is the human pressing again and should not wait out the turn.
+ * ACK (👍) lines carry no text and never count as urgent on their own.
+ */
+export function classifyUrgency(lines: string[], ackedThisStretch: boolean): boolean {
+  const texts = lines.map(inboxMsgText).filter((t) => t !== "");
+  if (texts.length === 0) return false;
+  if (texts.some(isUrgentText)) return true;
+  return ackedThisStretch;
+}
+
+/** The prompt delivered when the supervisor wakes a parked agent because a worker it was waiting
+ *  on has finished (as opposed to a human message). */
+export function formatWorkerWakePrompt(done: string[]): string {
+  return (
+    `[wake] Worker(s) finished while you were parked: ${done.join(", ")}.\n` +
+    "Check each with `worker-status <name>` (it reads the worker's result.json), collect the " +
+    "result, take the MR to the human if it is ready, then continue — start or wait on the next task."
   );
 }
 
@@ -444,6 +479,45 @@ export async function waitForInboxLines(
     // the wait: for the re-login relay this wait IS a login in progress, and throwing out of it
     // kills the login child mid-sign-in. Same guard, same reason, as awaitSliced()'s onTick in
     // relogin.ts.
+    try {
+      await refresh();
+    } catch (e) {
+      console.error(`[inbox] status refresh failed: ${e}`);
+    }
+  }
+}
+
+/** Why a parked wait ended: a human wrote, or a worker the agent was blocked on finished. */
+export type Wakeup = { kind: "human"; lines: string[] } | { kind: "worker"; done: string[] };
+
+/** How often the parked wait re-checks worker-done sentinels between inbox polls. Cheap (a few
+ *  stats, no model turn), so a short interval keeps worker-completion latency low. */
+export const WAKE_POLL_MS = 5_000;
+
+/**
+ * Block (cheaply, off the model) until EITHER a human message arrives OR one of the `workers` the
+ * agent parked on has finished — `isDone(name)` reports the latter (the supervisor passes an
+ * existsSync check on `state/<name>.done`). With no workers this is exactly waitForInboxLines (the
+ * human-only park, unchanged). Worker sentinels are checked BEFORE the first block, so a worker
+ * that already finished wakes the agent immediately. Touches the heartbeat on every tick so a long
+ * legitimate wait is never mistaken for a wedge; refreshes the dashboard between ticks.
+ */
+export async function waitForWakeup(
+  queue: InboxQueue,
+  watchdog: Heartbeat,
+  refresh: () => void | Promise<void>,
+  isDone: (name: string) => boolean,
+  workers: string[],
+): Promise<Wakeup> {
+  if (workers.length === 0) {
+    return { kind: "human", lines: await waitForInboxLines(queue, watchdog, refresh) };
+  }
+  for (;;) {
+    const done = workers.filter(isDone);
+    if (done.length) return { kind: "worker", done };
+    const lines = await queue.take(WAKE_POLL_MS);
+    watchdog.touch();
+    if (lines.length) return { kind: "human", lines };
     try {
       await refresh();
     } catch (e) {

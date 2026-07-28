@@ -16,10 +16,27 @@ fi
 
 state="${FOREMAN_STATE_DIR:-state}"
 log="$state/$name-worker.log"
+result="$state/$name.result.json"
+
+# Structured result first: the worker writes `<name>.result.json` as its last act, and the
+# spawn-worker wrapper synthesises a minimal one if the worker forgot — so once the worker is DONE
+# this file exists and is the authoritative status. Show its parsed fields (jq), or the raw file if
+# jq is unavailable, BEFORE falling through to the WORKER_EXIT/RUNNING log signal and the tail.
+if [ -f "$result" ]; then
+  echo "worker '$name': result.json"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '"  status : \(.status // "?")\n  branch : \(.branch // "")\n  mr_url : \(.mr_url // "")\n  summary: \(.summary // "")"' \
+       "$result" 2>/dev/null || cat -- "$result"
+  else
+    cat -- "$result"
+  fi
+fi
+
 [ -f "$log" ] || { echo "worker-status: no log for '$name' at $log" >&2; exit 1; }
 
 # WORKER_EXIT= is appended by spawn-worker only after `claude -p` returns, so its presence is the
-# done signal; grab the last one and report its code.
+# done signal; grab the last one and report its code. This stays as the fallback when result.json is
+# absent (worker still running, or launched by an older spawn-worker).
 exit_line="$(grep -E '^WORKER_EXIT=' "$log" | tail -n1 || true)"
 if [ -n "$exit_line" ]; then
   echo "worker '$name': DONE (${exit_line#WORKER_EXIT=} exit code)"

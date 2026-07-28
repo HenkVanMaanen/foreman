@@ -1,8 +1,9 @@
 // Owns one long-lived `claude -p` subprocess and speaks the stream-json protocol.
 
+import { randomUUID } from "node:crypto";
 import type { Subprocess } from "bun";
 import type { Config } from "./config.ts";
-import { type StreamEvent, userMessage } from "./protocol.ts";
+import { interruptMessage, type StreamEvent, userMessage } from "./protocol.ts";
 
 export interface StartOptions {
   /** extra env for the subprocess (e.g. channel creds passed through to the agent). */
@@ -11,6 +12,12 @@ export interface StartOptions {
 
 export class Session {
   private proc: Subprocess<"pipe", "pipe", "inherit"> | undefined;
+  // Serialise stdin writes. There are now TWO writers: the main loop (send) and the always-on
+  // inbox poller (interrupt, from its own async context). A half-written line would corrupt the
+  // stream, so every write chains onto the previous one. The chain swallows its own rejections so
+  // one failed write (EPIPE on a dead child) does not permanently poison later writes — the
+  // failure is still surfaced to the caller that issued it.
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(private cfg: Config) {}
 
@@ -37,12 +44,33 @@ export class Session {
     });
   }
 
+  /** One serialised stdin write. The chain keeps ordering even if a write rejects. */
+  private write(line: string): Promise<void> {
+    const run = this.writeChain.then(async () => {
+      if (!this.proc) throw new Error("session not started");
+      const writer = this.proc.stdin;
+      writer.write(line);
+      await writer.flush();
+    });
+    this.writeChain = run.catch(() => {});
+    return run;
+  }
+
   /** Send a user turn to the subprocess. */
   async send(text: string): Promise<void> {
-    if (!this.proc) throw new Error("session not started");
-    const writer = this.proc.stdin;
-    writer.write(`${userMessage(text)}\n`);
-    await writer.flush();
+    await this.write(`${userMessage(text)}\n`);
+  }
+
+  /**
+   * Interrupt the in-flight turn via the stdin control protocol (see interruptMessage). Returns the
+   * request_id so a caller can correlate the `control_response`. The current turn then ends with an
+   * `error_during_execution` result frame, at which point the supervisor's turn-boundary path
+   * delivers whatever the poller has queued — turning "wait out a 1h turn" into "seconds".
+   */
+  async interrupt(): Promise<string> {
+    const id = randomUUID();
+    await this.write(`${interruptMessage(id)}\n`);
+    return id;
   }
 
   /** Async iterator over stream-json frames until the process exits. */

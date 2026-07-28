@@ -42,6 +42,12 @@ export interface Status {
   life: number; // fresh agent lifetimes so far (recycle count + 1)
   softMark: number; // fraction
   hardMark: number; // fraction
+  // human messages buffered by the inbox poller, waiting for the next turn boundary to be
+  // delivered. Non-zero while the agent is heads-down means someone is waiting on a reply.
+  queued?: number;
+  // when the current model turn began, or null between turns / while parked — lets a viewer see
+  // "47 min into this turn with 2 messages queued" without guessing from the event feed.
+  turnStartedAt?: string | null;
   updatedAt: string;
 }
 

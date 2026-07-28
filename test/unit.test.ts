@@ -7,16 +7,20 @@ import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
 import {
   classifyInbox,
+  classifyUrgency,
   extractInboxLines,
   formatInboxPrompt,
+  formatWorkerWakePrompt,
   InboxQueue,
+  isUrgentText,
   parseProcTable,
   strayInboxPollerPids,
   takeAnswer,
   waitForInboxLines,
+  waitForWakeup,
 } from "../src/inbox.ts";
 import type { StreamEvent } from "../src/protocol.ts";
-import { usageTotal, userMessage } from "../src/protocol.ts";
+import { interruptMessage, promptTokens, usageTotal, userMessage } from "../src/protocol.ts";
 import {
   DEVICE_CODE_RE,
   detectAuthRequired,
@@ -673,5 +677,121 @@ describe("strayInboxPollerPids", () => {
     expect(strayInboxPollerPids(procs, 999).sort((a, b) => a - b)).toEqual([
       200, 201, 202, 400, 401,
     ]);
+  });
+});
+
+describe("promptTokens", () => {
+  test("undefined usage is zero", () => {
+    expect(promptTokens(undefined)).toBe(0);
+  });
+
+  test("is input + cached prefix, and EXCLUDES output (output is not part of the next prompt)", () => {
+    // occupancy = 10 + 20 + 5 = 35; the 999 output tokens must not count.
+    expect(
+      promptTokens({
+        input_tokens: 10,
+        output_tokens: 999,
+        cache_read_input_tokens: 20,
+        cache_creation_input_tokens: 5,
+      }),
+    ).toBe(35);
+  });
+
+  test("a mostly-cached turn reports the cache as occupancy (the real fill of the window)", () => {
+    expect(promptTokens({ input_tokens: 2, cache_read_input_tokens: 26243 })).toBe(26245);
+  });
+});
+
+describe("interruptMessage", () => {
+  test("is a control_request with subtype interrupt echoing the request_id", () => {
+    const obj = JSON.parse(interruptMessage("req-42"));
+    expect(obj).toEqual({
+      type: "control_request",
+      request_id: "req-42",
+      request: { subtype: "interrupt" },
+    });
+  });
+});
+
+describe("isUrgentText", () => {
+  test("recognizes the leading urgency tokens, case- and whitespace-insensitively", () => {
+    expect(isUrgentText("!answer me")).toBe(true);
+    expect(isUrgentText("  /NOW stop")).toBe(true);
+    expect(isUrgentText("/interrupt")).toBe(true);
+    expect(isUrgentText("/Urgent please")).toBe(true);
+  });
+  test("ordinary text is not urgent", () => {
+    expect(isUrgentText("can you take a look when free")).toBe(false);
+    expect(isUrgentText("")).toBe(false);
+  });
+});
+
+describe("classifyUrgency", () => {
+  test("empty batch is never urgent", () => {
+    expect(classifyUrgency([], true)).toBe(false);
+  });
+  test("an explicit urgency token is urgent regardless of prior ack", () => {
+    expect(classifyUrgency(["MSG 1 - ! wake up"], false)).toBe(true);
+  });
+  test("a plain message is urgent only as a follow-up (already acked this stretch)", () => {
+    expect(classifyUrgency(["MSG 1 - status?"], false)).toBe(false);
+    expect(classifyUrgency(["MSG 1 - status?"], true)).toBe(true);
+  });
+  test("ACK-only (👍, no text) lines never count as urgent, even after an ack", () => {
+    expect(classifyUrgency(["ACK 7 - +1"], true)).toBe(false);
+  });
+});
+
+describe("formatWorkerWakePrompt", () => {
+  test("names the finished workers and points at worker-status", () => {
+    const p = formatWorkerWakePrompt(["nilaway", "doc-cls"]);
+    expect(p.startsWith("[wake]")).toBe(true);
+    expect(p).toContain("nilaway, doc-cls");
+    expect(p).toContain("worker-status");
+  });
+});
+
+describe("waitForWakeup", () => {
+  const beat = () => {
+    let n = 0;
+    return { touch: () => n++, count: () => n };
+  };
+
+  test("with no workers it blocks on the inbox and returns a human wake", async () => {
+    const q = new InboxQueue();
+    const p = waitForWakeup(
+      q,
+      beat(),
+      () => {},
+      () => false,
+      [],
+    );
+    q.push(["MSG a - hi"]);
+    expect(await p).toEqual({ kind: "human", lines: ["MSG a - hi"] });
+  });
+
+  test("a worker already finished before the wait wakes immediately, untouched queue", async () => {
+    const q = new InboxQueue();
+    const done = (n: string) => n === "w1";
+    expect(await waitForWakeup(q, beat(), () => {}, done, ["w1", "w2"])).toEqual({
+      kind: "worker",
+      done: ["w1"],
+    });
+    expect(q.size()).toBe(0);
+  });
+
+  test("a human message wins while waiting on a not-yet-done worker", async () => {
+    const q = new InboxQueue();
+    const hb = beat();
+    const p = waitForWakeup(
+      q,
+      hb,
+      () => {},
+      () => false,
+      ["w1"],
+    );
+    q.push(["MSG a - urgent"]);
+    expect(await p).toEqual({ kind: "human", lines: ["MSG a - urgent"] });
+    expect(hb.count()).toBeGreaterThan(0);
   });
 });

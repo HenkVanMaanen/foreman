@@ -109,6 +109,10 @@
 # best-effort add-on: if codex is unavailable it is skipped with a warning, never failing the loop.
 set -euo pipefail
 
+# Preserve the ORIGINAL argv before the parse loop consumes it, so the edit-while-running snapshot
+# (see below) can re-exec itself with exactly the same arguments. Empty-array-safe for old bash.
+orig_args=("$@")
+
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
@@ -253,6 +257,29 @@ git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is no
 # the marker and exit would stall the end of every single session.
 state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
 marker="$state_dir/.review-loop-ran"
+
+# --- edit-while-running safety (self-snapshot + re-exec) --------------------------------------
+# HAZARD: bash reads a script lazily, by BYTE OFFSET, as it runs — not all at once. This loop runs
+# for minutes, and it reviews/edits the very git repo an agent may `git pull`/checkout concurrently.
+# If THIS file is overwritten in place mid-run, bash resumes at its old byte offset in the NEW bytes
+# and executes garbage (a subtly different command, or a syntax error). Defuse it by copying ourselves
+# to a private snapshot under $STATE and re-execing from there exactly ONCE: the running bytes then
+# live at a path nothing else writes. REVIEW_LOOP_SNAPSHOT guards against infinite re-exec; the child
+# removes the snapshot on exit via a trap (and the late EXIT trap below also lists it, since a later
+# `trap … EXIT` replaces this one). Best-effort: if the copy fails (read-only $STATE), run in place.
+if [ "${REVIEW_LOOP_SNAPSHOT:-0}" != "1" ]; then
+  snap="$state_dir/.review-loop.$$"
+  if mkdir -p "$state_dir" 2>/dev/null && cp -- "$0" "$snap" 2>/dev/null; then
+    export REVIEW_LOOP_SNAPSHOT=1 REVIEW_LOOP_SNAPSHOT_FILE="$snap"
+    exec bash "$snap" ${orig_args[@]+"${orig_args[@]}"}
+  fi
+fi
+# In the snapshot child, remove the snapshot however we exit. Replaced by the richer EXIT trap later
+# in the script (which also lists REVIEW_LOOP_SNAPSHOT_FILE), so cleanup holds across both traps.
+if [ -n "${REVIEW_LOOP_SNAPSHOT_FILE:-}" ]; then
+  trap 'rm -f "${REVIEW_LOOP_SNAPSHOT_FILE:-}" 2>/dev/null || true' EXIT
+fi
+
 if [ "$stop_hook" -eq 1 ]; then
   hook_stdin=""
   if [ ! -t 0 ]; then hook_stdin="$(cat 2>/dev/null || true)"; fi
@@ -757,21 +784,36 @@ run_review_phase() {
 
   echo ">>> $label: pass 1/2 REPORT — $cr_display"
   REVIEW_PASSES=1
-  RUN_CLAUDE_CAPTURE="$CR_CAP"
-  run_claude "$cr_cmd" || rc=$?
-  RUN_CLAUDE_CAPTURE=""
-  if [ "$rc" -ne 0 ]; then
-    echo "    $label: report pass exited $rc — ending phase (soft error)"
-    REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
-  fi
-  # No REVIEWFINDING line AT ALL (not even the NONE sentinel) means the pass never actually reviewed:
-  # `/review` bailing out (gh missing, PR closed since we looked it up) prints prose and exits 0, and
-  # so does a model that ignored the output contract. Treating that as "no findings" would report
-  # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
-  if ! grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
-    echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
-    REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
-  fi
+  # Empty-output is a known transient flake: a dropped headless response, or a model that skipped the
+  # output contract on ONE try, yields a capture with no REVIEWFINDING line. That was declared a hard
+  # soft-error, failing the whole loop. Retry the single report pass ONCE before giving up; only a
+  # SECOND empty result keeps today's fail-soft behaviour. A non-zero exit is not retried (it is a real
+  # failure, not an empty flake).
+  local report_try=0
+  while : ; do
+    rc=0
+    : > "$CR_CAP"
+    RUN_CLAUDE_CAPTURE="$CR_CAP"
+    run_claude "$cr_cmd" || rc=$?
+    RUN_CLAUDE_CAPTURE=""
+    if [ "$rc" -ne 0 ]; then
+      echo "    $label: report pass exited $rc — ending phase (soft error)"
+      REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
+    fi
+    # No REVIEWFINDING line AT ALL (not even the NONE sentinel) means the pass never actually reviewed:
+    # `/review` bailing out (gh missing, PR closed since we looked it up) prints prose and exits 0, and
+    # so does a model that ignored the output contract. Treating that as "no findings" would report
+    # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
+    if grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
+      break
+    fi
+    report_try=$((report_try + 1))
+    if [ "$report_try" -ge 2 ]; then
+      echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
+      REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
+    fi
+    echo "    $label: report pass emitted no REVIEWFINDING line — retrying the report pass once (transient flake?)"
+  done
   # Pass 1 emits no RISKY lines (that verdict only exists in pass 2's contract), so parse_findings'
   # risky-return is always 1 here — consume it rather than letting `set -e` trip on it.
   report="$(parse_findings REVIEWFINDING "$CR_CAP" || true)"
@@ -1066,7 +1108,9 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 # rm would otherwise strand them in TMPDIR. An EXIT trap removes them regardless of how we leave. All
 # three vars are initialized before any phase can create a file, so `set -u` is satisfied when it fires.
 SEC_CAP=""; CR_CAP=""
-trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" 2>/dev/null || true' EXIT
+# Also lists REVIEW_LOOP_SNAPSHOT_FILE so the self-snapshot (see the edit-while-running block near
+# the top) is still removed: this trap REPLACES the early snapshot-cleanup trap, so it must carry it.
+trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" 2>/dev/null || true' EXIT
 
 # Accumulates the code-review findings across the initial phase AND any reconcile / post-security
 # pass, so a finding raised late still reaches the summary.

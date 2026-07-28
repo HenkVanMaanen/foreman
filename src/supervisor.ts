@@ -9,13 +9,15 @@ import { join } from "node:path";
 import type { Config } from "./config.ts";
 import { recordEvent, type SupervisorState, writeStatus } from "./dashboard.ts";
 import {
+  classifyUrgency,
   formatInboxPrompt,
+  formatWorkerWakePrompt,
   InboxQueue,
   sendTelegramAck,
   startInboxPoller,
-  waitForInboxLines,
+  waitForWakeup,
 } from "./inbox.ts";
-import { usageTotal } from "./protocol.ts";
+import { promptTokens, usageTotal } from "./protocol.ts";
 import { handBackLines, makeAuthDetector, makeAuthRecovery } from "./relogin.ts";
 import { Session } from "./session.ts";
 import { startWatchdog } from "./watchdog.ts";
@@ -32,12 +34,35 @@ const HARD_MSG =
   "journal in notes/journal/ capturing current state, decisions, open threads, and " +
   "in-flight worker task-ids. Then reply exactly DONE. I will restart you fresh.";
 
+/**
+ * Parse the wait-on sentinel: newline-separated worker names the parked agent is blocking on.
+ * Missing file or any read error → [] (the agent then parks human-only). Names are charset-
+ * validated to match spawn-worker's guard, so the derived `state/<name>.done` path is always safe.
+ */
+async function readWaitOn(path: string): Promise<string[]> {
+  try {
+    const body = await readFile(path, "utf8");
+    return body
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => /^[A-Za-z0-9_-]+$/.test(l));
+  } catch {
+    return [];
+  }
+}
+
 export async function supervise(cfg: Config): Promise<void> {
   const bootstrap = await readFile(cfg.bootstrapPromptPath, "utf8");
   const clearSentinel = join(cfg.stateDir, "clear-request");
   // Written by bin/park when the agent goes idle: the supervisor (not the model) then owns the
   // wait for the next human message. See the idle-aware keep-alive at the bottom of the loop.
   const idleSentinel = join(cfg.stateDir, "idle-wait");
+  // Written by bin/wait-on alongside idle-wait: newline-separated worker names the agent is
+  // blocking on. While parked the supervisor also wakes on any of their done-markers, not only on
+  // a human message — so the agent no longer re-arms a 10-min bash waiter across an hours-long run.
+  const waitOnSentinel = join(cfg.stateDir, "wait-on");
+  // A parked-on worker has finished iff spawn-worker's wrapper has touched its done-marker.
+  const workerDone = (name: string) => existsSync(join(cfg.stateDir, `${name}.done`));
   const hardTokens = Math.floor(cfg.contextWindow * cfg.hardMark);
   const softTokens = Math.floor(cfg.contextWindow * cfg.softMark);
 
@@ -54,6 +79,9 @@ export async function supervise(cfg: Config): Promise<void> {
   // Track for the dashboard: which fresh lifetime we're on, and the last observed usage.
   let life = 0;
   let lastUsed = 0;
+  // When the current model turn began (null between turns / while parked), surfaced on the status
+  // so a viewer can see how long the agent has been heads-down.
+  let turnStartedAt: string | null = null;
   const stat = (state: SupervisorState) =>
     writeStatus(cfg, {
       pid: process.pid,
@@ -64,6 +92,8 @@ export async function supervise(cfg: Config): Promise<void> {
       life,
       softMark: cfg.softMark,
       hardMark: cfg.hardMark,
+      queued: inbox.size(),
+      turnStartedAt,
     });
 
   // Watchdog: if the supervisor makes no progress for watchdogTimeoutMs (no stream event,
@@ -100,7 +130,15 @@ export async function supervise(cfg: Config): Promise<void> {
   // ack on top of "please send me the sign-in code" would be actively misleading). `io.acked`
   // throttles the auto-ack to once per busy stretch so a burst of messages isn't a burst of acks.
   const inbox = new InboxQueue();
-  const io = { phase: "busy" as "busy" | "parked" | "relogin", acked: false };
+  // `awaitingCheckpoint` mirrors the per-life local so the poller's urgent-interrupt hook (created
+  // once, before the loop) can see it: never interrupt a turn that is already checkpointing to
+  // recycle. `currentSession` is the live session the hook interrupts; reset each life.
+  const io = {
+    phase: "busy" as "busy" | "parked" | "relogin",
+    acked: false,
+    awaitingCheckpoint: false,
+  };
+  let currentSession: Session | undefined;
   // The dashboard state each phase shows, as a table rather than restated at every flip. In
   // particular the relogin phase must never be stamped with a healthy-looking "working" at the one
   // moment the human reading the dashboard is the only thing that can unwedge the harness.
@@ -116,11 +154,36 @@ export async function supervise(cfg: Config): Promise<void> {
   const poller = startInboxPoller(cfg, passthroughEnv, inbox, {
     isBusy: () => io.phase === "busy",
     onBusyMessage: async (lines) => {
+      // Urgent (an explicit !/​/now token, or a follow-up after we already acked once): preempt the
+      // in-flight turn so the human is answered in seconds instead of after the whole (maybe
+      // hour-long) turn. The interrupt ends the current turn with an error result; the turn-boundary
+      // path below then drains and delivers these very lines. Never interrupt a turn that is already
+      // checkpointing to recycle, or one that isn't actually running (parked/relogin).
+      if (
+        cfg.urgentInterrupt &&
+        io.phase === "busy" &&
+        !io.awaitingCheckpoint &&
+        classifyUrgency(lines, io.acked)
+      ) {
+        try {
+          await currentSession?.interrupt();
+          await recordEvent(cfg, {
+            who: "supervisor",
+            kind: "inbox-interrupt",
+            detail: `${lines.length} urgent line(s) — preempting turn`,
+          });
+          return;
+        } catch (e) {
+          // interrupt failed (child gone / protocol refused) — fall through to the ordinary ack so
+          // the human is not met with silence, and let the normal boundary path deliver the lines.
+          console.log(`[supervisor] urgent interrupt failed (${e}); falling back to ack`);
+        }
+      }
       if (io.acked) return; // already acked this busy stretch — don't spam
       io.acked = true;
       await sendTelegramAck(
-        "👀 Got it — I'm mid-task right now. I'll pick this up at my next checkpoint; " +
-          "no need to resend.",
+        "👀 Got it — I'm mid-task right now. I'll pick this up at my next checkpoint (or send " +
+          "'!' / '/now' to interrupt me). No need to resend.",
       );
       await recordEvent(cfg, {
         who: "supervisor",
@@ -145,6 +208,7 @@ export async function supervise(cfg: Config): Promise<void> {
   for (;;) {
     watchdog.touch();
     const session = new Session(cfg);
+    currentSession = session; // the poller's urgent-interrupt hook targets this
     session.start({ env: passthroughEnv });
     await session.send(bootstrap);
     watchdog.touch();
@@ -152,12 +216,17 @@ export async function supervise(cfg: Config): Promise<void> {
     lastUsed = 0;
     io.phase = "busy";
     io.acked = false;
+    io.awaitingCheckpoint = false;
+    turnStartedAt = new Date().toISOString();
     console.log("[supervisor] agent launched; bootstrap sent");
     await recordEvent(cfg, { who: "supervisor", kind: "launch", detail: `life #${life}` });
     await refresh();
 
     let awaitingCheckpoint = false;
     let nudgedSoft = false;
+    // Did any assistant frame this turn carry usage? If so it is the authoritative occupancy and
+    // the result frame's (cumulative) total is ignored; if not, we fall back to the clamped result.
+    let sawUsageThisTurn = false;
     // Why this life ended, set at whichever `break` ends it (each also logs/records its own
     // detail — nothing downstream needs the text again). One variable rather than a flag per
     // outcome, so the outcomes are visibly exclusive and adding one can't silently overlap an
@@ -180,15 +249,33 @@ export async function supervise(cfg: Config): Promise<void> {
         await recordEvent(cfg, { who: "supervisor", kind: "auth-required", detail: authFrame });
         break;
       }
+      if (ev.type === "assistant") {
+        // Per-turn occupancy: an assistant frame's message.usage is the actual prompt size (input +
+        // cached prefix) = current window fill. Clamp — a reading above the window is a counting
+        // artifact, never real occupancy, so ignore it rather than trip a spurious recycle.
+        const occ = promptTokens(ev.message?.usage);
+        if (occ > 0 && occ <= cfg.contextWindow) {
+          lastUsed = occ;
+          sawUsageThisTurn = true;
+        }
+        continue;
+      }
       if (ev.type !== "result") continue;
       // A turn that FAILED is not evidence the session was ever working, so it must not reset the
       // hot-loop breaker — otherwise a life that errors out and then hits the auth frame looks
       // healthy every time and the breaker never trips on the spin it exists to catch.
       if (ev.is_error !== true) sawHealthyTurn = true;
-      const used = usageTotal(ev.usage);
+      // Occupancy came from this turn's assistant frames (above). If none carried usage (an older
+      // CLI, or the mock), fall back to the result frame's total, clamped — a result total above
+      // the window is the known cumulative-usage artifact and must never drive recycling.
+      if (!sawUsageThisTurn) {
+        const rt = usageTotal(ev.usage);
+        if (rt > 0 && rt <= cfg.contextWindow) lastUsed = rt;
+      }
+      sawUsageThisTurn = false;
+      const used = lastUsed;
       if (used) {
         console.log(`[supervisor] turn complete; context ≈ ${used}/${cfg.contextWindow}`);
-        lastUsed = used;
         await recordEvent(cfg, { who: "supervisor", kind: "turn", ctx: used });
         await stat("working");
       }
@@ -217,6 +304,7 @@ export async function supervise(cfg: Config): Promise<void> {
           break;
         }
         awaitingCheckpoint = true;
+        io.awaitingCheckpoint = true; // the poller must not interrupt a checkpoint-in-progress turn
         continue;
       }
       if (used >= softTokens && !nudgedSoft) {
@@ -243,12 +331,27 @@ export async function supervise(cfg: Config): Promise<void> {
       let nextPrompt = CONTINUE;
       if (existsSync(idleSentinel)) {
         await rm(idleSentinel, { force: true });
+        // bin/wait-on may also have listed detached workers to block on; consume that sentinel too
+        // and wake on EITHER a human message or any of those workers finishing.
+        const workers = await readWaitOn(waitOnSentinel);
+        await rm(waitOnSentinel, { force: true });
         io.phase = "parked";
+        turnStartedAt = null; // no model turn runs while parked
         await refresh();
         try {
-          nextPrompt = formatInboxPrompt(await waitForInboxLines(inbox, watchdog, refresh));
+          const wake = await waitForWakeup(inbox, watchdog, refresh, workerDone, workers);
+          if (wake.kind === "worker") {
+            nextPrompt = formatWorkerWakePrompt(wake.done);
+            await recordEvent(cfg, {
+              who: "supervisor",
+              kind: "worker-wake",
+              detail: wake.done.join(", "),
+            });
+          } else {
+            nextPrompt = formatInboxPrompt(wake.lines);
+          }
         } catch (e) {
-          console.log(`[supervisor] idle-wait failed (${e}); falling back to continue`);
+          console.log(`[supervisor] parked wait failed (${e}); falling back to continue`);
           nextPrompt = CONTINUE;
         }
         io.phase = "busy";
@@ -269,6 +372,7 @@ export async function supervise(cfg: Config): Promise<void> {
       // If the child died right after the last result, the write can throw EPIPE; treat that as
       // "process ended" and fall through to the tidy keeper-respawn path rather than surfacing
       // an uncaught error. (Same handling as before — only the prompt is now idle-aware.)
+      turnStartedAt = new Date().toISOString(); // a fresh turn begins with this prompt
       try {
         await session.send(nextPrompt);
       } catch (e) {
