@@ -11,6 +11,7 @@ import {
   extractInboxLines,
   formatInboxPrompt,
   formatWorkerWakePrompt,
+  freshAfterInjection,
   InboxQueue,
   isUrgentText,
   parseProcTable,
@@ -793,5 +794,23 @@ describe("waitForWakeup", () => {
     q.push(["MSG a - urgent"]);
     expect(await p).toEqual({ kind: "human", lines: ["MSG a - urgent"] });
     expect(hb.count()).toBeGreaterThan(0);
+  });
+});
+
+describe("freshAfterInjection", () => {
+  test("drops lines already streamed into the turn, keeps the rest", () => {
+    const injected = new Set(["MSG 1 - a", "MSG 2 - b"]);
+    expect(freshAfterInjection(["MSG 1 - a", "MSG 2 - b", "MSG 3 - c"], injected)).toEqual([
+      "MSG 3 - c",
+    ]);
+  });
+  test("empty injected set is a pass-through (streamed injection off)", () => {
+    expect(freshAfterInjection(["MSG 1 - a", "ACK 2 - +1"], new Set())).toEqual([
+      "MSG 1 - a",
+      "ACK 2 - +1",
+    ]);
+  });
+  test("all injected → nothing fresh to deliver at the boundary", () => {
+    expect(freshAfterInjection(["MSG 1 - a"], new Set(["MSG 1 - a"]))).toEqual([]);
   });
 });

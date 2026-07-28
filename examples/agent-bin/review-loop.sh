@@ -97,6 +97,8 @@
 #                  uncertain UNAPPLIED and RISKY rather than re-reviewing it. WHY is printed.
 #   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never in
 #                  --stop-hook mode: a blocking code there would wedge the session (see below).
+#   4  BUDGET     — the shared-budget admission gate waited FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds
+#                  for a slot (LOAD+2 <= FOREMAN_MAX_WORKERS) and never got one. `--force` skips it.
 #
 # In --stop-hook mode the process still runs the loop once (guarded by a marker file so a
 # re-firing Stop hook cannot recurse), but ALWAYS exits 0 so the session is allowed to end; the
@@ -122,6 +124,8 @@ security="on"     # default: always run security-review; the command scopes itse
 codex="on"        # default: run the Codex independent-reviewer phase (skips gracefully if unavailable)
 codex_model="gpt-5.6-sol"
 stop_hook=0
+force=0                # --force: bypass the shared-budget admission wait (human override, see below)
+review_loop_marker=""  # our review-loops/<pid> marker, set once ADMITTED; removed by the EXIT trap
 
 # Learn --stop-hook BEFORE the parse loop reaches it, so `die`'s exit-code softening (see below)
 # holds for an error raised at ANY argument position — not only after --stop-hook was reached.
@@ -152,9 +156,14 @@ review-loop — run code-review + simplify + codex + security over this branch's
 Usage:
   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
               [--security auto|on|off]
-              [--codex|--no-codex] [--codex-model MODEL]
+              [--codex|--no-codex] [--codex-model MODEL] [--force]
   review-loop --stop-hook [ ...same opts... ]
   review-loop --help
+
+--force bypasses the shared-budget admission WAIT (see below) and starts immediately — a human
+override for when you knowingly want to exceed FOREMAN_MAX_WORKERS. Without it, a review-loop counts
+as 2 slots against FOREMAN_MAX_WORKERS (shared with spawn-worker) and blocks until 2 slots are free,
+or until FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds elapse (default 3600 → exit 4).
 
 Scope: --base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
 commit or it is a usage error. --target REF diffs from the merge-base with the branch this work
@@ -217,6 +226,7 @@ while [ "$#" -gt 0 ]; do
     --codex)      codex="on"; shift;;
     --no-codex)   codex="off"; shift;;
     --codex-model) [ "$#" -ge 2 ] || die_usage "--codex-model needs MODEL"; codex_model="$2"; shift 2;;
+    --force)      force=1; shift;;
     --stop-hook)  stop_hook=1; shift;;
     -h|--help)    usage; exit 0;;
     *)            die_usage "unknown arg '$1'";;
@@ -296,6 +306,102 @@ if [ "$stop_hook" -eq 1 ]; then
   fi
   mkdir -p "$state_dir" 2>/dev/null || true
   : > "$marker" 2>/dev/null || true
+fi
+
+# --- admission gate (shared FOREMAN_MAX_WORKERS budget) ---------------------------------------
+# A review-loop is a HEAVY consumer: it drives its own review agents (`claude -p`/`codex exec`), so
+# it counts as 2 slots drawn from the SAME FOREMAN_MAX_WORKERS budget spawn-worker draws from. With
+# the default cap of 2 that means one review-loop SATURATES the budget: a 2nd review-loop — or a
+# worker launched while one runs — WAITS for a slot instead of blindly piling more agents on (the
+# token blow-up this prevents). This runs before the network-y base/target resolution below so we do
+# not pay that work until admitted.
+#
+# LOAD = (active workers) + 2*(active review-loops), where active workers = launch entries in
+# workers.jsonl with no <name>.done marker, and active review-loops = LIVE pid markers under
+# $state_dir/review-loops. This process may proceed once LOAD + 2 <= cap; otherwise it BLOCK-POLLS
+# every 15s (cleaning stale markers + recomputing) until it fits, or exits 4 at the wait timeout.
+review_cap="${FOREMAN_MAX_WORKERS:-2}"
+[[ "$review_cap" =~ ^[0-9]+$ ]] || review_cap=2   # non-integer ⇒ coerce to the default (2)
+review_loops_dir="$state_dir/review-loops"
+mkdir -p "$review_loops_dir" 2>/dev/null || true
+
+# Count LIVE review-loop pid markers under $1, deleting any whose pid is dead (stale). A review-loop
+# registers an empty file named for its pid under review-loops/ while it runs; "live" = the pid still
+# answers `kill -0`. Optional $2 = a pid to EXCLUDE (a review-loop skips its own marker). Echoes the
+# live count. Kept in sync verbatim with the copy in spawn-worker.sh (small, so duplicated not sourced).
+_review_loop_load() {
+  local rl_dir="$1" self="${2:-}" n=0 f pid
+  [ -d "$rl_dir" ] || { printf '0'; return 0; }
+  for f in "$rl_dir"/*; do
+    [ -e "$f" ] || continue                        # empty dir ⇒ the glob stays literal
+    pid="${f##*/}"
+    case "$pid" in ''|*[!0-9]*) continue;; esac     # not a pid marker we own — leave it untouched
+    if kill -0 "$pid" 2>/dev/null; then
+      [ "$pid" = "$self" ] && continue              # our own live marker — do not count it
+      n=$((n + 1))
+    else
+      rm -f "$f" 2>/dev/null || true                # dead pid — clean the stale marker
+    fi
+  done
+  printf '%s' "$n"
+}
+
+# Count ACTIVE workers: distinct names ever launched in workers.jsonl whose <name>.done is absent
+# (mirrors spawn-worker's cap check). 0 when there is no registry yet.
+_active_workers() {
+  local reg="$state_dir/workers.jsonl" names n active=0
+  [ -f "$reg" ] || { printf '0'; return 0; }
+  if command -v jq >/dev/null 2>&1; then
+    names="$(jq -r '.name // empty' "$reg" 2>/dev/null | sort -u)"
+  else
+    names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$reg" 2>/dev/null \
+             | sed -E 's/.*"([^"]*)"$/\1/' | sort -u)"
+  fi
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ -e "$state_dir/$n.done" ] || active=$((active + 1))
+  done <<EOF
+$names
+EOF
+  printf '%s' "$active"
+}
+
+# LOAD excluding THIS process (its own marker is skipped via $$).
+_current_load() { printf '%s' "$(( $(_active_workers) + 2 * $(_review_loop_load "$review_loops_dir" "$$") ))"; }
+
+review_loop_marker="$review_loops_dir/$$"
+# Register the marker-cleanup EXIT trap NOW (it also carries the snapshot file this replaces the
+# early trap for). The richer EXIT trap set later ALSO lists $review_loop_marker, so the marker is
+# removed however/whenever we exit — verified below by the two traps both naming it.
+trap 'rm -f "${review_loop_marker:-}" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" 2>/dev/null || true' EXIT
+
+if [ "$force" -eq 1 ]; then
+  # Human override: skip the wait and register immediately.
+  : > "$review_loop_marker" 2>/dev/null || true
+else
+  review_wait_timeout="${FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT:-3600}"
+  [[ "$review_wait_timeout" =~ ^[0-9]+$ ]] || review_wait_timeout=3600
+  review_waited=0; review_announced=0
+  while : ; do
+    review_load="$(_current_load)"
+    if [ "$((review_load + 2))" -le "$review_cap" ]; then
+      if [ "$review_announced" -eq 1 ]; then
+        echo "[review-loop] slot free (load $review_load/cap $review_cap) — proceeding" >&2
+      fi
+      break
+    fi
+    if [ "$review_waited" -ge "$review_wait_timeout" ]; then
+      echo "[review-loop] budget still full (load $review_load/cap $review_cap) after ${review_wait_timeout}s — giving up" >&2
+      exit 4
+    fi
+    if [ "$review_announced" -eq 0 ]; then
+      echo "[review-loop] budget full (load $review_load/cap $review_cap) — waiting for a slot…" >&2
+      review_announced=1
+    fi
+    sleep 15
+    review_waited=$((review_waited + 15))
+  done
+  : > "$review_loop_marker" 2>/dev/null || true
 fi
 
 # --- base / target resolution -----------------------------------------------------------------
@@ -1108,9 +1214,11 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 # rm would otherwise strand them in TMPDIR. An EXIT trap removes them regardless of how we leave. All
 # three vars are initialized before any phase can create a file, so `set -u` is satisfied when it fires.
 SEC_CAP=""; CR_CAP=""
-# Also lists REVIEW_LOOP_SNAPSHOT_FILE so the self-snapshot (see the edit-while-running block near
-# the top) is still removed: this trap REPLACES the early snapshot-cleanup trap, so it must carry it.
-trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" 2>/dev/null || true' EXIT
+# Also lists REVIEW_LOOP_SNAPSHOT_FILE (the self-snapshot, see the edit-while-running block near the
+# top) and $review_loop_marker (our admission-budget marker, see the admission gate): this trap
+# REPLACES both the early snapshot-cleanup trap and the gate's marker-cleanup trap, so it must carry
+# BOTH — otherwise a marker/snapshot would leak past this point.
+trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" "${review_loop_marker:-}" 2>/dev/null || true' EXIT
 
 # Accumulates the code-review findings across the initial phase AND any reconcile / post-security
 # pass, so a finding raised late still reaches the summary.

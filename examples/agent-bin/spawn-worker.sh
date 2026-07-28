@@ -75,31 +75,63 @@ registry="$state/workers.jsonl"
 done_file="$state/$name.done"
 result_file="$state/$name.result.json"
 
+# Count LIVE review-loop pid markers under $1, deleting any whose pid is dead (stale). A review-loop
+# registers an empty file named for its pid under review-loops/ while it runs; "live" = the pid still
+# answers `kill -0`. Optional $2 = a pid to EXCLUDE (a review-loop skips its own marker). Echoes the
+# live count. Kept in sync verbatim with the copy in review-loop.sh (small, so duplicated not sourced).
+_review_loop_load() {
+  local rl_dir="$1" self="${2:-}" n=0 f pid
+  [ -d "$rl_dir" ] || { printf '0'; return 0; }
+  for f in "$rl_dir"/*; do
+    [ -e "$f" ] || continue                        # empty dir ⇒ the glob stays literal
+    pid="${f##*/}"
+    case "$pid" in ''|*[!0-9]*) continue;; esac     # not a pid marker we own — leave it untouched
+    if kill -0 "$pid" 2>/dev/null; then
+      [ "$pid" = "$self" ] && continue              # our own live marker — do not count it
+      n=$((n + 1))
+    else
+      rm -f "$f" 2>/dev/null || true                # dead pid — clean the stale marker
+    fi
+  done
+  printf '%s' "$n"
+}
+
 # --- concurrency cap --------------------------------------------------------------------------
 # A worker is a full `claude -p` instance (its own context window, its own token spend); too many
-# at once thrash the machine and the budget. Cap ACTIVE workers at FOREMAN_MAX_WORKERS (default 2).
-# ACTIVE = a name that appears as a launch entry in workers.jsonl whose `<name>.done` marker does
-# NOT yet exist (the wrapper touches `<name>.done` when `claude -p` returns). `--force` bypasses.
+# at once thrash the machine and the budget. A review-loop is HEAVIER still (it drives its own review
+# agents), so it counts as 2 slots against the SAME FOREMAN_MAX_WORKERS budget. Cap the combined LOAD
+# at FOREMAN_MAX_WORKERS (default 2), where:
+#   LOAD = (active workers) + 2*(active review-loops).
+#   active workers      = a name that appears as a launch entry in workers.jsonl whose `<name>.done`
+#                         marker does NOT yet exist (the wrapper touches it when `claude -p` returns).
+#   active review-loops = LIVE pid markers under $state/review-loops (dead-pid markers are cleaned).
+# `--force` bypasses the whole check.
 max_workers="${FOREMAN_MAX_WORKERS:-2}"
 [[ "$max_workers" =~ ^[0-9]+$ ]] || max_workers=2
-if [ "$force" -ne 1 ] && [ -f "$registry" ]; then
-  # Distinct worker names ever launched. Prefer jq; fall back to a grep/sed extraction of the first
-  # "name":"…" on each line (launch and exit entries both carry it — de-duped by sort -u).
-  if command -v jq >/dev/null 2>&1; then
-    names="$(jq -r '.name // empty' "$registry" 2>/dev/null | sort -u)"
-  else
-    names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$registry" 2>/dev/null \
-             | sed -E 's/.*"([^"]*)"$/\1/' | sort -u)"
-  fi
-  active=0
-  while IFS= read -r n; do
-    [ -n "$n" ] || continue
-    [ -e "$state/$n.done" ] || active=$((active + 1))
-  done <<EOF
+if [ "$force" -ne 1 ]; then
+  active_workers=0
+  if [ -f "$registry" ]; then
+    # Distinct worker names ever launched. Prefer jq; fall back to a grep/sed extraction of the first
+    # "name":"…" on each line (launch and exit entries both carry it — de-duped by sort -u).
+    if command -v jq >/dev/null 2>&1; then
+      names="$(jq -r '.name // empty' "$registry" 2>/dev/null | sort -u)"
+    else
+      names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$registry" 2>/dev/null \
+               | sed -E 's/.*"([^"]*)"$/\1/' | sort -u)"
+    fi
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      [ -e "$state/$n.done" ] || active_workers=$((active_workers + 1))
+    done <<EOF
 $names
 EOF
-  if [ "$active" -ge "$max_workers" ]; then
-    echo "spawn-worker: $active active worker(s) >= cap $max_workers (FOREMAN_MAX_WORKERS)." >&2
+  fi
+  rl_load="$(_review_loop_load "$state/review-loops")"
+  active_total=$((active_workers + 2 * rl_load))
+  if [ "$active_total" -ge "$max_workers" ]; then
+    detail="$active_workers active worker(s)"
+    [ "$rl_load" -gt 0 ] && detail="$detail + $rl_load review-loop(s) at 2 slots each"
+    echo "spawn-worker: load $active_total ($detail) >= cap $max_workers (FOREMAN_MAX_WORKERS)." >&2
     echo "spawn-worker: refusing to spawn '$name'. Wait for one to finish (worker-list), stop one" >&2
     echo "spawn-worker: (worker-stop <name>), raise FOREMAN_MAX_WORKERS, or pass --force to override." >&2
     exit 3

@@ -118,6 +118,17 @@ export function classifyUrgency(lines: string[], ackedThisStretch: boolean): boo
   return ackedThisStretch;
 }
 
+/**
+ * Boundary delivery under streamed injection: the lines still worth delivering at the turn end are
+ * those NOT already streamed into the turn mid-flight. MSG lines carry a unique post id, so equal
+ * strings are genuinely the same message and a set membership test is exact (two distinct messages
+ * with identical text still differ by id). An interrupted turn bypasses this filter entirely — its
+ * injected-but-unconsumed lines must be redelivered — so this is only called on a clean boundary.
+ */
+export function freshAfterInjection(queued: string[], injected: Set<string>): string[] {
+  return queued.filter((l) => !injected.has(l));
+}
+
 /** The prompt delivered when the supervisor wakes a parked agent because a worker it was waiting
  *  on has finished (as opposed to a human message). */
 export function formatWorkerWakePrompt(done: string[]): string {

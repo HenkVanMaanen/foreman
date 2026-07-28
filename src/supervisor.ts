@@ -12,6 +12,7 @@ import {
   classifyUrgency,
   formatInboxPrompt,
   formatWorkerWakePrompt,
+  freshAfterInjection,
   InboxQueue,
   sendTelegramAck,
   startInboxPoller,
@@ -137,6 +138,12 @@ export async function supervise(cfg: Config): Promise<void> {
     phase: "busy" as "busy" | "parked" | "relogin",
     acked: false,
     awaitingCheckpoint: false,
+    // Streamed-injection bookkeeping (only used when cfg.streamInject). `injectedThisTurn` is the
+    // set of lines already streamed into the current turn, so the boundary does not re-deliver
+    // them; `interrupted` records that the turn was preempted, in which case injected-but-maybe-
+    // unconsumed lines MUST be re-delivered (the interrupt can cancel the CLI's queued input).
+    injectedThisTurn: new Set<string>(),
+    interrupted: false,
   };
   let currentSession: Session | undefined;
   // The dashboard state each phase shows, as a table rather than restated at every flip. In
@@ -167,6 +174,7 @@ export async function supervise(cfg: Config): Promise<void> {
       ) {
         try {
           await currentSession?.interrupt();
+          io.interrupted = true; // the boundary must re-deliver any injected-but-cancelled lines
           await recordEvent(cfg, {
             who: "supervisor",
             kind: "inbox-interrupt",
@@ -177,6 +185,26 @@ export async function supervise(cfg: Config): Promise<void> {
           // interrupt failed (child gone / protocol refused) — fall through to the ordinary ack so
           // the human is not met with silence, and let the normal boundary path deliver the lines.
           console.log(`[supervisor] urgent interrupt failed (${e}); falling back to ack`);
+        }
+      }
+      // Non-urgent, and streamed injection is enabled: push the lines into the running turn now (the
+      // CLI queues them) so they are picked up sooner than the turn boundary. The lines STAY in the
+      // inbox queue — they are only marked injected so the boundary de-dupes them (freshAfterInjection);
+      // an interrupt later this turn clears that via io.interrupted so nothing is lost. Marked before
+      // the await so a boundary landing mid-send still sees them as injected. Best-effort: on a failed
+      // send we un-mark them and let the ordinary boundary path deliver.
+      if (cfg.streamInject && io.phase === "busy" && !io.awaitingCheckpoint) {
+        for (const l of lines) io.injectedThisTurn.add(l);
+        try {
+          await currentSession?.send(formatInboxPrompt(lines));
+          await recordEvent(cfg, {
+            who: "supervisor",
+            kind: "inbox-inject",
+            detail: `${lines.length} line(s) streamed mid-turn`,
+          });
+        } catch (e) {
+          for (const l of lines) io.injectedThisTurn.delete(l);
+          console.log(`[supervisor] stream-inject failed (${e}); leaving for boundary delivery`);
         }
       }
       if (io.acked) return; // already acked this busy stretch — don't spam
@@ -357,22 +385,30 @@ export async function supervise(cfg: Config): Promise<void> {
         io.phase = "busy";
         io.acked = false;
       } else {
-        // Not parked: drain anything the poller queued while this turn ran, and deliver it.
+        // Not parked: drain anything the poller queued while this turn ran. Under streamed
+        // injection, lines already streamed into this turn were delivered mid-flight, so drop them
+        // here UNLESS the turn was interrupted (then the CLI may have cancelled its queued input, so
+        // re-deliver). With injection off, injectedThisTurn is empty ⇒ this is exactly the old drain.
         const queued = inbox.drain();
-        if (queued.length) {
-          nextPrompt = formatInboxPrompt(queued);
+        const deliver = io.interrupted ? queued : freshAfterInjection(queued, io.injectedThisTurn);
+        if (deliver.length) {
+          nextPrompt = formatInboxPrompt(deliver);
           io.acked = false;
           await recordEvent(cfg, {
             who: "supervisor",
             kind: "inbox-deliver",
-            detail: `${queued.length} line(s) at boundary`,
+            detail: `${deliver.length} line(s) at boundary`,
           });
         }
       }
       // If the child died right after the last result, the write can throw EPIPE; treat that as
       // "process ended" and fall through to the tidy keeper-respawn path rather than surfacing
       // an uncaught error. (Same handling as before — only the prompt is now idle-aware.)
-      turnStartedAt = new Date().toISOString(); // a fresh turn begins with this prompt
+      // A fresh turn begins with this prompt: reset the per-turn injection bookkeeping and stamp
+      // the start time.
+      io.injectedThisTurn.clear();
+      io.interrupted = false;
+      turnStartedAt = new Date().toISOString();
       try {
         await session.send(nextPrompt);
       } catch (e) {
