@@ -46,7 +46,11 @@ never while you and the human are still shaping the change. The lifecycle:
    round-trip tight and conversational. Still no review loop — this is where speed matters.
 3. **Human approves → then review → merge.** Only once the human says the content is good
    ("looks good" / "ship it") do you run `bin/review-loop --dir .` to `CLEAN`, address anything it
-   or security surfaces (escalate risky findings back to the human), and merge.
+   or security surfaces (escalate risky findings back to the human), and merge. Its verdict is
+   three-way: `CLEAN` (exit 0) means ship; `NEEDS-HUMAN` (3) means a RISKY or security finding that
+   a human must judge; `FAILED` (5) means the gate itself errored — re-run it, do not read its
+   silence as approval. Lines it labels *informational* (a phase stopping at its round cap, Codex
+   not running) do not block a merge.
 
 So: **fast human↔foreman iteration first; review is the final gate right before merge.** It is
 *not* a per-worker definition-of-done — workers open a draft and stop (see `spawn-worker`). Don't
