@@ -17,7 +17,12 @@
 #                          — and the loop it replaces (six `/code-review high --fix` rounds, each a
 #                          multi-agent review of the whole diff) is the cost this script was eating.
 #                          Findings the apply pass will not touch are ESCALATED, not ground down.
-#   2. simplify loop     — same structure with `/simplify` (quality-only, no bug-hunting).
+#   2. simplify loop     — same structure with `/simplify` (quality-only, no bug-hunting), but on its
+#                          OWN round cap (--simplify-rounds, default 2) rather than --max-rounds.
+#                          WHY its own, lower cap: /simplify is a TASTE pass — it can essentially
+#                          always find one more thing to tidy, so extra rounds buy churn, not
+#                          quality. Six rounds of it is most of why a 20-line change took two hours.
+#                          Round 1 does the substantive shrinking; round 2 cleans up after round 1.
 #   2.5 codex review loop — conditional (see --codex, DEFAULT ON). An INDEPENDENT second model
 #                          (OpenAI Codex, default gpt-5.6-sol) reviews the diff vs --base for
 #                          correctness bugs + clear simplifications and AUTO-FIXES the ones it is
@@ -25,7 +30,10 @@
 #                          and the SAME round cap as the Claude phases. Findings it judges risky /
 #                          uncertain are left UNAPPLIED and escalated (same channel as security).
 #                          If codex is not installed or not logged in, the phase WARNs and SKIPs —
-#                          the loop degrades gracefully to Claude-only, never hard-failing.
+#                          the loop degrades gracefully to Claude-only, never hard-failing. If codex
+#                          IS present but its sandbox cannot start (see run_codex), the phase reports
+#                          DID-NOT-RUN loudly and its output is discarded rather than parsed into
+#                          findings: a missing second opinion is not a review result.
 #   3. security fix loop — conditional (see --security), and it AUTO-FIXES. Each round runs a
 #                          security review of the diff vs --base and APPLIES the fixes it is
 #                          confident about (auth / input-validation / secrets / network scope),
@@ -58,9 +66,10 @@
 #
 # Usage:
 #   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
-#               [--security auto|on|off]
+#               [--simplify-rounds N] [--security auto|on|off]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
+#   review-loop --self-test-verdict               # exercise the verdict rule offline, then exit
 #   review-loop --help
 #
 # Defaults and --base/--target semantics: `--help` (usage() below) is the only copy — this header
@@ -87,16 +96,19 @@
 #          sql query handler route exec deserialize input parse. (Paths, not content — so a script
 #          that merely mentions these words does not self-trigger.)
 #
-# Exit codes / final line:
-#   0  CLEAN     — every phase (including Codex, if active) converged and no phase escalated a risky
-#                  finding.
-#   3  NOT-CLEAN — a phase hit the round cap with changes still applying, a review invocation failed,
-#                  and/or a phase needs a human (ESCALATE): it could not converge within the cap OR
-#                  it found a finding it judged too risky to auto-fix (flagged with WHY). The
-#                  code-review phase reaches this the same way: its apply pass leaves anything
-#                  uncertain UNAPPLIED and RISKY rather than re-reviewing it. WHY is printed.
-#   2  ERROR     — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never in
-#                  --stop-hook mode: a blocking code there would wedge the session (see below).
+# Exit codes / final line (see the VERDICT MODEL section below for the full rule and WHY):
+#   0  CLEAN       — no RISKY finding, no security finding, no phase error. Informational notes (a
+#                    taste phase stopping at its round cap, a missing Codex second opinion) may
+#                    still be printed; they do NOT flip the verdict.
+#   3  NEEDS-HUMAN — a reviewer left a finding UNAPPLIED as RISKY, and/or the security phase found
+#                    something in the changed code. A human must read it. (Exit 3 is deliberately
+#                    the old NOT-CLEAN code, so any caller testing `rc -eq 3` keeps working.)
+#   5  FAILED      — the GATE itself did not complete: a phase ERROR (a review invocation failed, or
+#                    a round's commit was rejected). Its silence is not approval — re-run it.
+#   2  ERROR       — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never
+#                    in --stop-hook mode: a blocking code there would wedge the session (see below).
+#   4  BUDGET      — the shared-budget admission gate waited FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds
+#                    for a slot (LOAD+2 <= FOREMAN_MAX_WORKERS) and never got one. `--force` skips it.
 #
 # In --stop-hook mode the process still runs the loop once (guarded by a marker file so a
 # re-firing Stop hook cannot recurse), but ALWAYS exits 0 so the session is allowed to end; the
@@ -109,15 +121,29 @@
 # best-effort add-on: if codex is unavailable it is skipped with a warning, never failing the loop.
 set -euo pipefail
 
+# Preserve the ORIGINAL argv before the parse loop consumes it, so the edit-while-running snapshot
+# (see below) can re-exec itself with exactly the same arguments. Empty-array-safe for old bash.
+orig_args=("$@")
+
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
 target="auto"     # default: best-effort derive the MR/PR target branch, else the historical base
 max_rounds=6
+# /simplify gets its OWN, much lower cap. It is a TASTE pass with no fixpoint to find (there is
+# always one more thing to tidy), so rounds 3..6 were paying a full review round each for churn —
+# and then reporting "NOT-CONVERGED" as if that were a defect. 2 = one substantive pass plus one
+# pass to clean up after it. Raise it with --simplify-rounds if you want the old behaviour.
+# Deliberately NOT applied to the correctness phases (code-review, security, reconciliation): those
+# keep --max-rounds, i.e. exactly the thoroughness they had.
+simplify_rounds=2
 security="on"     # default: always run security-review; the command scopes itself to real findings
 codex="on"        # default: run the Codex independent-reviewer phase (skips gracefully if unavailable)
 codex_model="gpt-5.6-sol"
 stop_hook=0
+self_test=0            # --self-test-verdict: run the verdict-rule cases and exit (see SELF-TEST)
+force=0                # --force: bypass the shared-budget admission wait (human override, see below)
+review_loop_marker=""  # our review-loops/<pid> marker, set once ADMITTED; removed by the EXIT trap
 
 # Learn --stop-hook BEFORE the parse loop reaches it, so `die`'s exit-code softening (see below)
 # holds for an error raised at ANY argument position — not only after --stop-hook was reached.
@@ -147,10 +173,19 @@ review-loop — run code-review + simplify + codex + security over this branch's
 
 Usage:
   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
-              [--security auto|on|off]
-              [--codex|--no-codex] [--codex-model MODEL]
+              [--simplify-rounds N] [--security auto|on|off]
+              [--codex|--no-codex] [--codex-model MODEL] [--force]
   review-loop --stop-hook [ ...same opts... ]
+  review-loop --self-test-verdict
   review-loop --help
+
+--self-test-verdict runs the verdict rule over fabricated phase results and exits — no agents, no
+repo work. Use it to see exactly what does and does not flip the verdict.
+
+--force bypasses the shared-budget admission WAIT (see below) and starts immediately — a human
+override for when you knowingly want to exceed FOREMAN_MAX_WORKERS. Without it, a review-loop counts
+as 2 slots against FOREMAN_MAX_WORKERS (shared with spawn-worker) and blocks until 2 slots are free,
+or until FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds elapse (default 3600 → exit 4).
 
 Scope: --base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
 commit or it is a usage error. --target REF diffs from the merge-base with the branch this work
@@ -161,22 +196,29 @@ from the open MR/PR via glab/gh and IS best-effort: it falls back to the merge-b
 (with a stderr note when a branch was derived but turned out unusable). --target none skips
 derivation.
 
-Phases run in order, committing per round; the auto-fixing loops are capped at --max-rounds:
+Phases run in order, committing per round; the auto-fixing loops are capped at --max-rounds
+(/simplify at --simplify-rounds):
   1. code-review                        (2 fixed passes: `/review <PR>` REPORTS — or a diff-scoped
                                          review prompt when the branch has no open GitHub PR — then
                                          ONE apply pass; risky findings surfaced, not looped on)
-  2. /simplify loop                     (shrink surface)
+  2. /simplify loop                     (shrink surface; own lower cap — a taste pass never runs out
+                                         of things to tidy, so extra rounds are churn, not quality)
   3. codex review loop                  (independent 2nd model; auto-applies confident fixes,
                                          escalates risky ones; skipped if codex unavailable)
   4. security fix loop                  (auto-applies confident in-scope fixes; risky ones surfaced)
   5. final convergence                  (ONLY if simplify/codex/security changed code — bounded Claude<->Codex
                                          reconciliation, or a single code-review pass if codex off)
 
-Defaults: DIR=cwd, target=auto, max-rounds=6, security=on, codex=on,
+Defaults: DIR=cwd, target=auto, max-rounds=6, simplify-rounds=2, security=on, codex=on,
           codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch if derivable,
           else with origin/main.
 
-Exit: 0 CLEAN | 3 NOT-CLEAN (cap hit / review failed / security or codex can't converge or risky fix) | 2 usage/error.
+Verdict: driven by CORRECTNESS signals only — a RISKY (deliberately unapplied) finding from any
+phase, ANY security finding, or a phase ERROR. CONVERGENCE signals are informational and never flip
+it: a phase stopping at its round cap, or Codex not running at all, are reported on their own line.
+
+Exit: 0 CLEAN | 3 NEEDS-HUMAN (RISKY finding / security finding) | 5 FAILED (a phase errored, so the
+gate did not complete) | 2 usage/error | 4 budget-wait timeout.
 EOF
 }
 
@@ -209,11 +251,14 @@ while [ "$#" -gt 0 ]; do
     --base)       [ "$#" -ge 2 ] || die_usage "--base needs REF"; base="$2"; shift 2;;
     --target)     [ "$#" -ge 2 ] || die_usage "--target needs REF|auto|none"; target="$2"; shift 2;;
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
+    --simplify-rounds) [ "$#" -ge 2 ] || die_usage "--simplify-rounds needs N"; simplify_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
     --codex)      codex="on"; shift;;
     --no-codex)   codex="off"; shift;;
     --codex-model) [ "$#" -ge 2 ] || die_usage "--codex-model needs MODEL"; codex_model="$2"; shift 2;;
+    --force)      force=1; shift;;
     --stop-hook)  stop_hook=1; shift;;
+    --self-test-verdict) self_test=1; shift;;
     -h|--help)    usage; exit 0;;
     *)            die_usage "unknown arg '$1'";;
   esac
@@ -233,6 +278,131 @@ esac
 [[ "$max_rounds" =~ ^[0-9]+$ ]] || die_usage "--max-rounds must be a non-negative integer (got '$max_rounds')"
 max_rounds="$((10#$max_rounds))"  # normalize: strip leading zeros so 08/09 aren't parsed as octal by later arithmetic
 [ "$max_rounds" -ge 1 ] || die_usage "--max-rounds must be >= 1"
+[[ "$simplify_rounds" =~ ^[0-9]+$ ]] || die_usage "--simplify-rounds must be a non-negative integer (got '$simplify_rounds')"
+simplify_rounds="$((10#$simplify_rounds))"   # same leading-zero normalization as --max-rounds
+[ "$simplify_rounds" -ge 1 ] || die_usage "--simplify-rounds must be >= 1"
+
+# --- VERDICT MODEL ----------------------------------------------------------------------------
+# The one thing a human is asked to TRUST without reading a two-hour transcript. It therefore lives
+# HERE, before any work starts, so `--self-test-verdict` (below) can drive it with fabricated phase
+# results — the rule is verifiable in a second instead of only as the tail of a full run.
+#
+# WHY it was rewritten. It used to be a boolean: ANY phase status that was not CLEAN/SKIPPED flipped
+# the run to NOT-CLEAN. Three consecutive review-loops then reported NOT-CLEAN while nothing was
+# actually wrong — the reasons were "/simplify still changing at round 6", "reconcile still changing
+# at cycle 6", and a Codex phase that had never started its sandbox. A verdict that is always
+# NOT-CLEAN forces a human to read the whole log to discover there is nothing to do, which is
+# exactly the work the verdict exists to save.
+#
+# The rule now separates CORRECTNESS signals from CONVERGENCE signals:
+#
+#   CORRECTNESS — these DRIVE the verdict and are named in the WHY line:
+#     * a RISKY finding from any phase. A reviewer deliberately left something UNAPPLIED because it
+#       judged that a human must decide. This is the signal the whole gate exists to produce.
+#     * ANY security finding, including one the security phase auto-fixed: a vulnerability was
+#       present in this branch, so a human should see what was changed on their behalf.
+#     * a phase ERROR — the review invocation failed, or a round's changes could not be committed.
+#       The phase did not actually run to completion, so its silence proves nothing.
+#
+#   CONVERGENCE — informational ONLY; printed, but they never flip the verdict and never appear in
+#   the WHY line:
+#     * simplify (or the final reconciliation) stopping at its round cap. /simplify is a TASTE pass:
+#       it can essentially always find one more thing to change, so "still changing at round N" is
+#       a fact about the cap, not evidence of a defect in the code.
+#     * codex DID-NOT-RUN (see run_codex): the second opinion is MISSING. That degrades the run and
+#       is called out loudly on the verdict line, but it is not a finding about the code, and
+#       treating it as one is what turned a broken sandbox into a fake RISKY review result.
+#
+# Three outcomes, because the old "not clean" conflated two states a human acts on differently:
+# findings to judge (read them) versus a gate that broke (re-run it, and do not mistake its silence
+# for approval). CLEAN=0, NEEDS-HUMAN=3 (the old NOT-CLEAN code, kept so callers testing `rc -eq 3`
+# still work), FAILED=5.
+#
+# Inputs are the phase-status globals as the phases leave them: CR_STATUS, SI_STATUS, CODEX_STATUS,
+# SEC_STATUS, RECONCILE_STATUS (CLEAN|SKIPPED|RISKY|NOT-CONVERGED|ERROR|DID-NOT-RUN) plus
+# SEC_FINDINGS (the surfaced security lines). Outputs: VERDICT, VERDICT_WHY (ONLY reasons that
+# actually contributed), VERDICT_NOTES (informational), VERDICT_RC.
+VERDICT="CLEAN"; VERDICT_WHY=""; VERDICT_NOTES=""; VERDICT_RC=0
+_verdict_why()  { VERDICT_WHY="${VERDICT_WHY:+$VERDICT_WHY; }$1"; }
+_verdict_note() { VERDICT_NOTES="${VERDICT_NOTES:+$VERDICT_NOTES; }$1"; }
+# FAILED outranks NEEDS-HUMAN outranks CLEAN: "the gate broke" is worse news than "here is a
+# finding", so it must not be overwritten by a later escalation.
+_verdict_escalate() { [ "$VERDICT" = "FAILED" ] || VERDICT="NEEDS-HUMAN"; return 0; }
+
+compute_verdict() {
+  VERDICT="CLEAN"; VERDICT_WHY=""; VERDICT_NOTES=""; VERDICT_RC=0
+  local pair label status
+  # One "<label>:<status>" pair per phase — statuses never contain ':', so the split is unambiguous.
+  for pair in "code-review:${CR_STATUS:-CLEAN}" \
+              "simplify:${SI_STATUS:-CLEAN}" \
+              "codex:${CODEX_STATUS:-SKIPPED}" \
+              "security:${SEC_STATUS:-SKIPPED}" \
+              "final:${RECONCILE_STATUS:-CLEAN}"; do
+    label="${pair%%:*}"; status="${pair##*:}"
+    case "$status" in
+      CLEAN|SKIPPED) ;;
+      RISKY)         _verdict_escalate
+                     _verdict_why "$label: finding(s) left UNAPPLIED as RISKY — a human must decide (listed in the summary above)";;
+      ERROR)         VERDICT="FAILED"
+                     _verdict_why "$label: phase ERROR — the review did not complete (invocation failed, or a round's commit was rejected)";;
+      NOT-CONVERGED) _verdict_note "$label: stopped at its round cap (informational — a cap, not a defect)";;
+      DID-NOT-RUN)   _verdict_note "$label: DID NOT RUN — that reviewer contributed nothing to this run";;
+      # An unrecognized status is a bug in a phase, not a clean bill of health. Fail toward the human.
+      *)             _verdict_escalate
+                     _verdict_why "$label: unrecognized phase status '$status' — treating it as needing a human";;
+    esac
+  done
+  # ANY security finding escalates, even one the phase auto-fixed and converged on: a vulnerability
+  # existed in the changed code and a human should see the fix. A RISKY security status already said
+  # so in its own words, so do not say it twice.
+  if [ -n "${SEC_FINDINGS:-}" ] && [ "${SEC_STATUS:-}" != "RISKY" ]; then
+    _verdict_escalate
+    _verdict_why "security: $(printf '%s\n' "$SEC_FINDINGS" | wc -l | tr -d ' ') finding(s) in the changed code (auto-fixed) — a human should verify the fix"
+  fi
+  case "$VERDICT" in
+    CLEAN)       VERDICT_RC=0;;
+    NEEDS-HUMAN) VERDICT_RC=3;;
+    FAILED)      VERDICT_RC=5;;
+  esac
+  return 0
+}
+
+# --- SELF-TEST (--self-test-verdict) ----------------------------------------------------------
+# Drive compute_verdict with fabricated phase results and print what each case produces, then exit.
+# WHY it exists: this script is the merge gate and a real run costs hours, so the verdict rule has to
+# be checkable without one. Add a case here whenever the rule changes; the cases below are the ones
+# the rewrite was specified against.
+if [ "$self_test" -eq 1 ]; then
+  # _st NAME CR SI CODEX SEC RECON [SEC_FINDINGS]  — positional (not KEY=VALUE) so no eval and no
+  # bash-4-only `declare -g`; this script still has to run under stock macOS bash 3.2.
+  _st() {
+    CR_STATUS="$2"; SI_STATUS="$3"; CODEX_STATUS="$4"; SEC_STATUS="$5"; RECONCILE_STATUS="$6"
+    SEC_FINDINGS="${7:-}"
+    compute_verdict
+    printf '%-24s -> %-11s exit=%s\n' "$1" "$VERDICT" "$VERDICT_RC"
+    [ -n "$VERDICT_WHY" ]   && printf '%-24s    WHY : %s\n' "" "$VERDICT_WHY"
+    [ -n "$VERDICT_NOTES" ] && printf '%-24s    note: %s\n' "" "$VERDICT_NOTES"
+    return 0
+  }
+  echo "== review-loop verdict self-test =="
+  echo
+  _st "all-clean"              CLEAN CLEAN         CLEAN       CLEAN CLEAN
+  _st "simplify-capped-only"   CLEAN NOT-CONVERGED CLEAN       CLEAN CLEAN
+  _st "reconcile-capped-only"  CLEAN CLEAN         CLEAN       CLEAN NOT-CONVERGED
+  _st "codex-did-not-run"      CLEAN CLEAN         DID-NOT-RUN CLEAN CLEAN
+  _st "security-finding-fixed" CLEAN CLEAN         CLEAN       CLEAN CLEAN \
+      "SECFINDING: APPLIED | high | api.sh:42 | unquoted \$user in a shell call — quoted it"
+  _st "security-risky"         CLEAN CLEAN         CLEAN       RISKY CLEAN \
+      "SECFINDING: RISKY | high | api.sh:42 | auth check may be bypassable -- NOT APPLIED: needs a schema change"
+  _st "code-review-risky"      RISKY CLEAN         CLEAN       CLEAN CLEAN
+  _st "codex-risky"            CLEAN CLEAN         RISKY       CLEAN CLEAN
+  _st "phase-error"            ERROR CLEAN         CLEAN       CLEAN CLEAN
+  _st "everything-at-once"     ERROR NOT-CONVERGED DID-NOT-RUN RISKY NOT-CONVERGED \
+      "SECFINDING: RISKY | high | api.sh:42 | auth check may be bypassable -- NOT APPLIED: needs a schema change"
+  echo
+  echo "(informational signals must never appear in a WHY line, and must never change exit=0)"
+  exit 0
+fi
 
 command -v git >/dev/null 2>&1 || die_usage "git not found on PATH"
 command -v claude >/dev/null 2>&1 || die_usage "claude not found on PATH"
@@ -253,6 +423,29 @@ git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || die_usage "DIR '$dir' is no
 # the marker and exit would stall the end of every single session.
 state_dir="${FOREMAN_STATE_DIR:-$dir/state}"
 marker="$state_dir/.review-loop-ran"
+
+# --- edit-while-running safety (self-snapshot + re-exec) --------------------------------------
+# HAZARD: bash reads a script lazily, by BYTE OFFSET, as it runs — not all at once. This loop runs
+# for minutes, and it reviews/edits the very git repo an agent may `git pull`/checkout concurrently.
+# If THIS file is overwritten in place mid-run, bash resumes at its old byte offset in the NEW bytes
+# and executes garbage (a subtly different command, or a syntax error). Defuse it by copying ourselves
+# to a private snapshot under $STATE and re-execing from there exactly ONCE: the running bytes then
+# live at a path nothing else writes. REVIEW_LOOP_SNAPSHOT guards against infinite re-exec; the child
+# removes the snapshot on exit via a trap (and the late EXIT trap below also lists it, since a later
+# `trap … EXIT` replaces this one). Best-effort: if the copy fails (read-only $STATE), run in place.
+if [ "${REVIEW_LOOP_SNAPSHOT:-0}" != "1" ]; then
+  snap="$state_dir/.review-loop.$$"
+  if mkdir -p "$state_dir" 2>/dev/null && cp -- "$0" "$snap" 2>/dev/null; then
+    export REVIEW_LOOP_SNAPSHOT=1 REVIEW_LOOP_SNAPSHOT_FILE="$snap"
+    exec bash "$snap" ${orig_args[@]+"${orig_args[@]}"}
+  fi
+fi
+# In the snapshot child, remove the snapshot however we exit. Replaced by the richer EXIT trap later
+# in the script (which also lists REVIEW_LOOP_SNAPSHOT_FILE), so cleanup holds across both traps.
+if [ -n "${REVIEW_LOOP_SNAPSHOT_FILE:-}" ]; then
+  trap 'rm -f "${REVIEW_LOOP_SNAPSHOT_FILE:-}" 2>/dev/null || true' EXIT
+fi
+
 if [ "$stop_hook" -eq 1 ]; then
   hook_stdin=""
   if [ ! -t 0 ]; then hook_stdin="$(cat 2>/dev/null || true)"; fi
@@ -269,6 +462,102 @@ if [ "$stop_hook" -eq 1 ]; then
   fi
   mkdir -p "$state_dir" 2>/dev/null || true
   : > "$marker" 2>/dev/null || true
+fi
+
+# --- admission gate (shared FOREMAN_MAX_WORKERS budget) ---------------------------------------
+# A review-loop is a HEAVY consumer: it drives its own review agents (`claude -p`/`codex exec`), so
+# it counts as 2 slots drawn from the SAME FOREMAN_MAX_WORKERS budget spawn-worker draws from. With
+# the default cap of 2 that means one review-loop SATURATES the budget: a 2nd review-loop — or a
+# worker launched while one runs — WAITS for a slot instead of blindly piling more agents on (the
+# token blow-up this prevents). This runs before the network-y base/target resolution below so we do
+# not pay that work until admitted.
+#
+# LOAD = (active workers) + 2*(active review-loops), where active workers = launch entries in
+# workers.jsonl with no <name>.done marker, and active review-loops = LIVE pid markers under
+# $state_dir/review-loops. This process may proceed once LOAD + 2 <= cap; otherwise it BLOCK-POLLS
+# every 15s (cleaning stale markers + recomputing) until it fits, or exits 4 at the wait timeout.
+review_cap="${FOREMAN_MAX_WORKERS:-2}"
+[[ "$review_cap" =~ ^[0-9]+$ ]] || review_cap=2   # non-integer ⇒ coerce to the default (2)
+review_loops_dir="$state_dir/review-loops"
+mkdir -p "$review_loops_dir" 2>/dev/null || true
+
+# Count LIVE review-loop pid markers under $1, deleting any whose pid is dead (stale). A review-loop
+# registers an empty file named for its pid under review-loops/ while it runs; "live" = the pid still
+# answers `kill -0`. Optional $2 = a pid to EXCLUDE (a review-loop skips its own marker). Echoes the
+# live count. Kept in sync verbatim with the copy in spawn-worker.sh (small, so duplicated not sourced).
+_review_loop_load() {
+  local rl_dir="$1" self="${2:-}" n=0 f pid
+  [ -d "$rl_dir" ] || { printf '0'; return 0; }
+  for f in "$rl_dir"/*; do
+    [ -e "$f" ] || continue                        # empty dir ⇒ the glob stays literal
+    pid="${f##*/}"
+    case "$pid" in ''|*[!0-9]*) continue;; esac     # not a pid marker we own — leave it untouched
+    if kill -0 "$pid" 2>/dev/null; then
+      [ "$pid" = "$self" ] && continue              # our own live marker — do not count it
+      n=$((n + 1))
+    else
+      rm -f "$f" 2>/dev/null || true                # dead pid — clean the stale marker
+    fi
+  done
+  printf '%s' "$n"
+}
+
+# Count ACTIVE workers: distinct names ever launched in workers.jsonl whose <name>.done is absent
+# (mirrors spawn-worker's cap check). 0 when there is no registry yet.
+_active_workers() {
+  local reg="$state_dir/workers.jsonl" names n active=0
+  [ -f "$reg" ] || { printf '0'; return 0; }
+  if command -v jq >/dev/null 2>&1; then
+    names="$(jq -r '.name // empty' "$reg" 2>/dev/null | sort -u)"
+  else
+    names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$reg" 2>/dev/null \
+             | sed -E 's/.*"([^"]*)"$/\1/' | sort -u)"
+  fi
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ -e "$state_dir/$n.done" ] || active=$((active + 1))
+  done <<EOF
+$names
+EOF
+  printf '%s' "$active"
+}
+
+# LOAD excluding THIS process (its own marker is skipped via $$).
+_current_load() { printf '%s' "$(( $(_active_workers) + 2 * $(_review_loop_load "$review_loops_dir" "$$") ))"; }
+
+review_loop_marker="$review_loops_dir/$$"
+# Register the marker-cleanup EXIT trap NOW (it also carries the snapshot file this replaces the
+# early trap for). The richer EXIT trap set later ALSO lists $review_loop_marker, so the marker is
+# removed however/whenever we exit — verified below by the two traps both naming it.
+trap 'rm -f "${review_loop_marker:-}" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" 2>/dev/null || true' EXIT
+
+if [ "$force" -eq 1 ]; then
+  # Human override: skip the wait and register immediately.
+  : > "$review_loop_marker" 2>/dev/null || true
+else
+  review_wait_timeout="${FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT:-3600}"
+  [[ "$review_wait_timeout" =~ ^[0-9]+$ ]] || review_wait_timeout=3600
+  review_waited=0; review_announced=0
+  while : ; do
+    review_load="$(_current_load)"
+    if [ "$((review_load + 2))" -le "$review_cap" ]; then
+      if [ "$review_announced" -eq 1 ]; then
+        echo "[review-loop] slot free (load $review_load/cap $review_cap) — proceeding" >&2
+      fi
+      break
+    fi
+    if [ "$review_waited" -ge "$review_wait_timeout" ]; then
+      echo "[review-loop] budget still full (load $review_load/cap $review_cap) after ${review_wait_timeout}s — giving up" >&2
+      exit 4
+    fi
+    if [ "$review_announced" -eq 0 ]; then
+      echo "[review-loop] budget full (load $review_load/cap $review_cap) — waiting for a slot…" >&2
+      review_announced=1
+    fi
+    sleep 15
+    review_waited=$((review_waited + 15))
+  done
+  : > "$review_loop_marker" 2>/dev/null || true
 fi
 
 # --- base / target resolution -----------------------------------------------------------------
@@ -593,18 +882,84 @@ run_claude() {
   return "${PIPESTATUS[0]}"
 }
 
+# Lines that mean codex NEVER GOT TO REVIEW — its sandbox failed to start — as opposed to codex
+# reviewing and reporting something. Deliberately NARROW, because this loop reviews THIS FILE: the
+# first alternative is anchored to line start (bubblewrap writes its errors there, while a reviewer
+# quoting the comment below emits them behind a '#', a '+' or an indent), and the second is a full
+# sentence codex itself prints only when it is about to use bubblewrap. Both were verified against
+# real captures of a failing and a working run.
+CODEX_SANDBOX_RE="^bwrap:|Codex.s Linux sandbox uses bubblewrap"
+# Two flags, deliberately: an OBSERVATION and a DECISION.
+#   HIT       — run_codex saw one of those lines. On its own this is only a hint: a healthy codex
+#               reviewing THIS file could quote them.
+#   CONFIRMED — run_codex_phase combined the hit with "and the round changed no files", i.e. codex
+#               demonstrably did NOT work. Only then does run_codex stop spending calls. Keeping the
+#               decision out of run_codex is what stops a false positive from poisoning a codex that
+#               is working fine (it would otherwise refuse every subsequent round and the phase would
+#               end in ERROR).
+CODEX_SANDBOX_HIT=0
+CODEX_SANDBOX_CONFIRMED=0
+CODEX_SCAN=""          # run_codex's private scan copy; listed in the EXIT trap so it cannot leak
+
 # Codex counterpart of run_claude: run one `codex exec` review-and-fix pass in DIR with the given
 # full prompt, streaming its output indented and returning codex's exit code. Same RUN_CLAUDE_CAPTURE
 # contract so run_fix_phase's caller can post-parse the findings. `</dev/null` is MANDATORY — without
-# it codex blocks forever on "Reading additional input from stdin...". The workspace-write sandbox
-# lets it edit files non-interactively; -m pins the model. run_fix_phase
+# it codex blocks forever on "Reading additional input from stdin...". -m pins the model. run_fix_phase
 # (not codex) does the git commit, so the prompt tells codex not to.
+#
+# SANDBOX — `-s danger-full-access`, deliberately, and NOT the tighter `-s workspace-write`.
+#   WHY: codex's Linux sandbox is bubblewrap, and bubblewrap cannot start in the container this
+#   harness runs in. Reproduced on this box 2026-07-28:
+#     -s workspace-write                        -> 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted'
+#     -s workspace-write, network_access=true   -> 'bwrap: setting up uid map: Permission denied'
+#     bwrap --dev-bind / / --unshare-net true   -> the same RTM_NEWADDR failure
+#     unshare --user --net true                 -> succeeds (so it is bwrap's netns setup
+#                                                  specifically: no CAP_NET_ADMIN in the namespace)
+#     -s danger-full-access                     -> works; codex ran git and returned the real diff
+#   Under workspace-write EVERY codex round failed before running a single repository command, so
+#   three consecutive review-loops got a second opinion of NOTHING while surfacing codex's "I could
+#   not inspect the diff" prose as a RISKY finding that read like a review result.
+#   TRADE-OFF, stated plainly: this removes codex's OWN sandboxing. That is acceptable HERE and only
+#   here because this same script already runs every Claude reviewer as
+#   `claude -p --dangerously-skip-permissions` over the same working tree — codex ends up with the
+#   access its co-reviewers already have, so it is the same trust model, not a new exposure. Do NOT
+#   copy this flag into a context where codex reviews UNTRUSTED code.
+#   IF THE BOX CHANGES (new kernel, different container, CAP_NET_ADMIN granted), re-test with
+#     codex exec --skip-git-repo-check -s workspace-write -m gpt-5.6-sol "run 'git log --oneline -1'"
+#   and put workspace-write back the moment bubblewrap starts.
 # shellcheck disable=SC2329  # invoked indirectly via run_fix_phase's $runner ("run_codex")
 run_codex() {
-  local prompt="$1"
-  ( cd "$dir" && codex exec --skip-git-repo-check -s workspace-write -m "$codex_model" "$prompt" </dev/null ) 2>&1 \
+  local prompt="$1" rc=0 scan=""
+  # Once the phase has CONFIRMED the sandbox cannot start there is no reason to pay for another codex
+  # call: every round would fail identically. Refuse fast, non-zero, with no output. (A mere HIT is
+  # not enough — see the two-flag note above.)
+  if [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ]; then
+    echo "    | codex: not invoked — the sandbox failure is confirmed for this run (see above)"
+    return 1
+  fi
+  # Private scan copy of the round's output. The sandbox errors are interleaved into the same stream
+  # we indent for the transcript, and the pipeline runs in a SUBSHELL — a flag set inside it would be
+  # lost — so tee the raw bytes out and grep them here, in the function body, where the assignment
+  # sticks. If mktemp fails we simply cannot detect the failure; the review still runs (`cat`).
+  scan="$(mktemp "${TMPDIR:-/tmp}/review-loop-codexscan.XXXXXX" 2>/dev/null)" || scan=""
+  CODEX_SCAN="$scan"
+  ( cd "$dir" && codex exec --skip-git-repo-check -s danger-full-access -m "$codex_model" "$prompt" </dev/null ) 2>&1 \
+    | { if [ -n "$scan" ]; then tee -a "$scan"; else cat; fi; } \
     | _indent_tee
-  return "${PIPESTATUS[0]}"
+  rc="${PIPESTATUS[0]}"
+  if [ -n "$scan" ]; then
+    if grep -aqE "$CODEX_SANDBOX_RE" "$scan" 2>/dev/null; then
+      CODEX_SANDBOX_HIT=1
+      # Loud, and phrased as what it is: a missing second opinion, not a review result. codex exits
+      # 0 in this state (the model completes, it is only its shell that never started), so the exit
+      # code alone would never have told anyone.
+      echo "    ** codex: SANDBOX/STARTUP FAILURE detected — codex could not run repository commands,"
+      echo "    ** so it reviewed NOTHING this round. See the bubblewrap note above run_codex()."
+    fi
+    rm -f "$scan" 2>/dev/null || true
+  fi
+  CODEX_SCAN=""
+  return "$rc"
 }
 
 # --- fix-phase runner (code-review, simplify, security) ---------------------------------------
@@ -655,7 +1010,7 @@ run_fix_phase() {
       # Something IS staged but the commit was rejected (pre-commit hook failed, no git identity,
       # gpg signing failed, …). Don't swallow it as "nothing to commit": the fixes are left
       # uncommitted, so the clean-tree-per-round invariant is broken and the next round would
-      # re-review the same dirty tree. Surface it as a soft error so the run reports NOT-CLEAN.
+      # re-review the same dirty tree. Surface it as a soft error (ERROR ⇒ the run reports FAILED).
       echo "    $label: round $round applied changes but the commit was REJECTED — tree left dirty (soft error)"
       PHASE_STATUS="ERROR"
       return 0
@@ -667,7 +1022,9 @@ run_fix_phase() {
     fi
 
     if [ "$round" -eq "$cap" ]; then
-      echo "    $label: still applying changes at round cap ($cap) — NOT CONVERGED"
+      # A convergence signal, NOT a failure: the verdict rule treats it as informational (see the
+      # VERDICT MODEL section). Worded so a transcript reader is not misled either.
+      echo "    $label: still applying changes at round cap ($cap) — stopping here (informational, not a defect)"
       PHASE_STATUS="NOT-CONVERGED"
     fi
   done
@@ -757,21 +1114,36 @@ run_review_phase() {
 
   echo ">>> $label: pass 1/2 REPORT — $cr_display"
   REVIEW_PASSES=1
-  RUN_CLAUDE_CAPTURE="$CR_CAP"
-  run_claude "$cr_cmd" || rc=$?
-  RUN_CLAUDE_CAPTURE=""
-  if [ "$rc" -ne 0 ]; then
-    echo "    $label: report pass exited $rc — ending phase (soft error)"
-    REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
-  fi
-  # No REVIEWFINDING line AT ALL (not even the NONE sentinel) means the pass never actually reviewed:
-  # `/review` bailing out (gh missing, PR closed since we looked it up) prints prose and exits 0, and
-  # so does a model that ignored the output contract. Treating that as "no findings" would report
-  # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
-  if ! grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
-    echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
-    REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
-  fi
+  # Empty-output is a known transient flake: a dropped headless response, or a model that skipped the
+  # output contract on ONE try, yields a capture with no REVIEWFINDING line. That was declared a hard
+  # soft-error, failing the whole loop. Retry the single report pass ONCE before giving up; only a
+  # SECOND empty result keeps today's fail-soft behaviour. A non-zero exit is not retried (it is a real
+  # failure, not an empty flake).
+  local report_try=0
+  while : ; do
+    rc=0
+    : > "$CR_CAP"
+    RUN_CLAUDE_CAPTURE="$CR_CAP"
+    run_claude "$cr_cmd" || rc=$?
+    RUN_CLAUDE_CAPTURE=""
+    if [ "$rc" -ne 0 ]; then
+      echo "    $label: report pass exited $rc — ending phase (soft error)"
+      REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
+    fi
+    # No REVIEWFINDING line AT ALL (not even the NONE sentinel) means the pass never actually reviewed:
+    # `/review` bailing out (gh missing, PR closed since we looked it up) prints prose and exits 0, and
+    # so does a model that ignored the output contract. Treating that as "no findings" would report
+    # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
+    if grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
+      break
+    fi
+    report_try=$((report_try + 1))
+    if [ "$report_try" -ge 2 ]; then
+      echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
+      REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
+    fi
+    echo "    $label: report pass emitted no REVIEWFINDING line — retrying the report pass once (transient flake?)"
+  done
   # Pass 1 emits no RISKY lines (that verdict only exists in pass 2's contract), so parse_findings'
   # risky-return is always 1 here — consume it rather than letting `set -e` trip on it.
   report="$(parse_findings REVIEWFINDING "$CR_CAP" || true)"
@@ -1025,6 +1397,30 @@ run_codex_phase() {
   RUN_CLAUDE_CAPTURE=""
   CODEX_ROUNDS="$PHASE_ROUNDS"; CODEX_CHANGED="$PHASE_CHANGED"
 
+  # The sandbox never started (see run_codex): codex reviewed NOTHING. Report that as its own status
+  # instead of laundering codex's "I could not inspect the diff" prose through parse_findings into a
+  # RISKY finding — that is a fact about this machine, not about the code, and dressing it up as a
+  # review result is what hid the breakage for three consecutive runs. So: drop the capture (nothing
+  # in it is a review), and mark codex INACTIVE so the joint reconciliation below degrades to the
+  # Claude-only path rather than alternating with a reviewer that cannot start.
+  # Guarded on CHANGED=0: a round that actually edited files demonstrably ran, so a sandbox line in
+  # its output can only be quoted text (this loop reviews the very file that documents those errors)
+  # — in that case clear the hit and carry on with the normal verdict, below.
+  if [ "$CODEX_SANDBOX_HIT" -eq 1 ] && [ "$CODEX_CHANGED" -eq 1 ]; then
+    echo "    codex: sandbox-error text seen, but the round edited files — codex DID run; treating it as quoted text" >&2
+    CODEX_SANDBOX_HIT=0
+  fi
+  if [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
+    CODEX_SANDBOX_CONFIRMED=1
+    CODEX_STATUS="DID-NOT-RUN"
+    CODEX_REASON="sandbox failed to start — codex could not run repository commands; NO second opinion this run"
+    CODEX_ACTIVE=0
+    CODEX_FINDINGS=""
+    rm -f "$CODEX_CAP" 2>/dev/null || true; CODEX_CAP=""
+    echo "    codex: DID NOT RUN (sandbox failure) — this run has NO independent second opinion" >&2
+    return 0
+  fi
+
   # Convergence verdict from this phase (the RISKY overlay is applied later, in
   # finalize_codex_findings, so a reconcile-round RISKY is included too).
   map_review_verdict "codex" "$PHASE_STATUS" "$CODEX_CHANGED"
@@ -1066,7 +1462,11 @@ CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 # rm would otherwise strand them in TMPDIR. An EXIT trap removes them regardless of how we leave. All
 # three vars are initialized before any phase can create a file, so `set -u` is satisfied when it fires.
 SEC_CAP=""; CR_CAP=""
-trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" 2>/dev/null || true' EXIT
+# Also lists REVIEW_LOOP_SNAPSHOT_FILE (the self-snapshot, see the edit-while-running block near the
+# top) and $review_loop_marker (our admission-budget marker, see the admission gate): this trap
+# REPLACES both the early snapshot-cleanup trap and the gate's marker-cleanup trap, so it must carry
+# BOTH — otherwise a marker/snapshot would leak past this point.
+trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "${CODEX_SCAN:-}" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" "${review_loop_marker:-}" 2>/dev/null || true' EXIT
 
 # Accumulates the code-review findings across the initial phase AND any reconcile / post-security
 # pass, so a finding raised late still reaches the summary.
@@ -1078,7 +1478,9 @@ CR_STATUS="$REVIEW_STATUS"; CR_PASSES="$REVIEW_PASSES"; CR_CHANGED="$REVIEW_CHAN
 _note_cr_findings
 echo
 
-run_fix_phase "simplify" "$si_cmd" "chore(review): simplify"
+# --simplify-rounds (default 2), NOT --max-rounds: a taste pass has no fixpoint to converge on, so
+# the extra rounds bought churn. See the cap's rationale where simplify_rounds is defined.
+run_fix_phase "simplify" "$si_cmd" "chore(review): simplify" "$si_cmd" run_claude "$simplify_rounds"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
@@ -1155,7 +1557,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
         break
       fi
       if [ "$cyc" -eq "$max_rounds" ]; then
-        echo "    reconcile: still changing at cycle cap ($max_rounds) — NOT CONVERGED"
+        echo "    reconcile: still changing at cycle cap ($max_rounds) — stopping here (informational, not a defect)"
         _recon_note "NOT-CONVERGED"   # fold via the shared helper (ERROR still dominates)
       fi
     done
@@ -1175,63 +1577,68 @@ echo
 
 # --- summary + verdict ------------------------------------------------------------------------
 yn() { [ "$1" -eq 1 ] && echo yes || echo no; }
+# Render a phase status for the summary. NOT-CONVERGED is spelled out as what it actually is — a
+# round-cap stop, which the verdict rule treats as informational — so a summary line can no longer
+# be misread as "this phase failed". Everything else prints verbatim.
+status_disp() {
+  case "$1" in
+    NOT-CONVERGED) printf 'stopped at round cap (informational)';;
+    *)             printf '%s' "$1";;
+  esac
+}
 echo "== summary =="
 printf '  code-review : passes=%s changed=%s status=%s (%s)\n' "$CR_PASSES" "$(yn "$CR_CHANGED")" "$CR_STATUS" "$cr_display"
 if [ -n "$CR_FINDINGS" ]; then
   echo "  code-review findings (surfaced — APPLIED/DISMISSED included; RISKY ones need a human):"
   printf '%s\n' "$CR_FINDINGS" | sort -u | sed 's/^/    - /'
 fi
-printf '  simplify    : rounds=%s changed=%s status=%s\n' "$SI_ROUNDS" "$(yn "$SI_CHANGED")" "$SI_STATUS"
-printf '  codex       : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$CODEX_STATUS" "$CODEX_REASON"
+printf '  simplify    : rounds=%s/%s changed=%s status=%s\n' "$SI_ROUNDS" "$simplify_rounds" "$(yn "$SI_CHANGED")" "$(status_disp "$SI_STATUS")"
+if [ "$CODEX_STATUS" = "DID-NOT-RUN" ]; then
+  # Deliberately NOT the rounds=/changed= shape the other phases use: this line must not read like a
+  # review result. The second opinion is missing and that is the whole message.
+  printf '  codex       : ** DID NOT RUN (%s)\n' "$CODEX_REASON"
+else
+  printf '  codex       : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$(status_disp "$CODEX_STATUS")" "$CODEX_REASON"
+fi
 if [ -n "$CODEX_FINDINGS" ]; then
   echo "  codex findings (surfaced — auto-fixed ones included; RISKY ones need a human):"
   printf '%s\n' "$CODEX_FINDINGS" | sed 's/^/    - /'
 fi
-printf '  security    : rounds=%s changed=%s status=%s (%s)\n' "$SEC_ROUNDS" "$(yn "$SEC_CHANGED")" "$SEC_STATUS" "$SEC_REASON"
+printf '  security    : rounds=%s changed=%s status=%s (%s)\n' "$SEC_ROUNDS" "$(yn "$SEC_CHANGED")" "$(status_disp "$SEC_STATUS")" "$SEC_REASON"
 if [ -n "$SEC_FINDINGS" ]; then
   echo "  security findings (surfaced — auto-fixed ones included; RISKY ones need a human):"
   printf '%s\n' "$SEC_FINDINGS" | sed 's/^/    - /'
 fi
 if [ "$FCC_RAN" -eq 1 ]; then   # FCC_RAN=1 only on the reconcile path (implies FCR_RAN=1)
   printf '  final-recon : cycles=%s status=%s (claude changed=%s / codex changed=%s)\n' \
-    "$RECON_CYCLES" "$RECONCILE_STATUS" "$(yn "$FCR_CHANGED")" "$(yn "$FCC_CHANGED")"
+    "$RECON_CYCLES" "$(status_disp "$RECONCILE_STATUS")" "$(yn "$FCR_CHANGED")" "$(yn "$FCC_CHANGED")"
 elif [ "$FCR_RAN" -eq 1 ]; then
-  printf '  final-review: passes=%s changed=%s status=%s (ran: code changed after review)\n' "$FCR_PASSES" "$(yn "$FCR_CHANGED")" "$RECONCILE_STATUS"
+  printf '  final-review: passes=%s changed=%s status=%s (ran: code changed after review)\n' "$FCR_PASSES" "$(yn "$FCR_CHANGED")" "$(status_disp "$RECONCILE_STATUS")"
 else
   printf '  final-recon : skipped (no code changed after the initial code-review)\n'
 fi
 
-why=""
-overall="CLEAN"
-# Fold one phase's status into the overall verdict + WHY. CLEAN/SKIPPED are fine; anything else means
-# a human is needed. RISKY only arises from the codex/security phases; the arm is harmless for the
-# others. (labelled per-phase so the WHY names which phase needs attention.)
-note_overall() {  # $1=phase label  $2=phase status
-  case "$2" in
-    CLEAN|SKIPPED) ;;
-    RISKY)         overall="NOT-CLEAN"; why="${why:+$why; }$1 finding too risky to auto-fix (see summary)";;
-    NOT-CONVERGED) overall="NOT-CLEAN"; why="${why:+$why; }$1 phase hit round cap";;
-    ERROR)         overall="NOT-CLEAN"; why="${why:+$why; }$1 review invocation failed";;
-  esac
-}
-note_overall "code-review" "$CR_STATUS"
-note_overall "simplify"    "$SI_STATUS"
-note_overall "final"       "$RECONCILE_STATUS"
-note_overall "codex"       "$CODEX_STATUS"
-note_overall "security"    "$SEC_STATUS"
+# The rule itself lives in compute_verdict (see the VERDICT MODEL section near the top, which is
+# also what --self-test-verdict exercises). Here we only print what it decided.
+compute_verdict
 
 echo
-if [ "$overall" = "CLEAN" ]; then
-  if [ "$CODEX_ACTIVE" -eq 1 ]; then
-    echo "review-loop: CLEAN — all phases converged (Claude+Codex), no security/codex escalation."
-  else
-    echo "review-loop: CLEAN — all active phases converged, no security escalation."
-  fi
-  final_rc=0
-else
-  echo "review-loop: NOT-CLEAN — human needed. WHY: $why"
-  final_rc=3
-fi
+# Informational FIRST and clearly separated, so the WHY line below carries only reasons that
+# actually contributed to the verdict.
+[ -n "$VERDICT_NOTES" ] && echo "review-loop: informational (did NOT affect the verdict): $VERDICT_NOTES"
+case "$VERDICT" in
+  CLEAN)
+    if [ "$CODEX_ACTIVE" -eq 1 ]; then
+      echo "review-loop: CLEAN — no RISKY finding, no security finding, no phase error (Claude+Codex)."
+    else
+      echo "review-loop: CLEAN — no RISKY finding, no security finding, no phase error."
+    fi;;
+  NEEDS-HUMAN)
+    echo "review-loop: NEEDS-HUMAN — WHY: $VERDICT_WHY";;
+  FAILED)
+    echo "review-loop: FAILED — the gate did not complete, so this is NOT an approval. WHY: $VERDICT_WHY";;
+esac
+final_rc="$VERDICT_RC"
 
 # In stop-hook mode always exit 0 so the Stop hook lets the session end (loop-safety); the real
 # status was printed above and any fixes were committed.

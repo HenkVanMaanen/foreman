@@ -16,6 +16,18 @@ export interface Config {
   // Autonomous agents run tools without interactive approval; the human-in-the-loop is
   // ask-human, not per-tool prompts. Adds --dangerously-skip-permissions when true.
   skipPermissions: boolean;
+  // When a human sends an URGENT message mid-turn (a leading !/​/now/​/interrupt token, or a
+  // follow-up while the agent is already known busy), interrupt the in-flight turn via the stdin
+  // control protocol so it is handled in seconds instead of after the whole (possibly hour-long)
+  // turn. Set FOREMAN_URGENT_INTERRUPT=0 to fall back to queue-and-deliver-at-boundary only.
+  urgentInterrupt: boolean;
+  // EXPERIMENTAL, default off. Stream a NON-urgent mid-turn message to the agent's stdin
+  // immediately (the CLI queues it) instead of only delivering it at the turn boundary, to shave
+  // latency on multi-step turns. Safe against loss (the line stays in the queue and is de-duped at
+  // the boundary; an interrupted turn re-delivers it), but the benefit depends on the CLI
+  // delivering queued input BETWEEN tool calls rather than only after the turn — unconfirmed live,
+  // so it ships off. Set FOREMAN_STREAM_INJECT=1 to try it.
+  streamInject: boolean;
   contextWindow: number;
   softMark: number; // fraction of window → nudge to checkpoint
   hardMark: number; // fraction of window → force checkpoint + restart
@@ -63,6 +75,8 @@ export function loadConfig(): Config {
     reloginEnabled: str("FOREMAN_RELOGIN", "1") !== "0",
     fakeAuthRequired: str("FOREMAN_FAKE_AUTH_REQUIRED", "0") === "1",
     skipPermissions: str("FOREMAN_SKIP_PERMISSIONS", "1") !== "0",
+    urgentInterrupt: str("FOREMAN_URGENT_INTERRUPT", "1") !== "0",
+    streamInject: str("FOREMAN_STREAM_INJECT", "0") === "1",
     contextWindow: num("FOREMAN_CONTEXT_WINDOW", 200_000),
     softMark: num("FOREMAN_SOFT_MARK", 0.6),
     hardMark: num("FOREMAN_HARD_MARK", 0.8),

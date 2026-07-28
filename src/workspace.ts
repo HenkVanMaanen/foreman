@@ -5,7 +5,7 @@
 // additions (PATH, FOREMAN_HOME, FOREMAN_NOTES_DIR) to hand to the agent subprocess.
 
 import { existsSync } from "node:fs";
-import { chmod, cp, mkdir, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { Config } from "./config.ts";
 
@@ -23,8 +23,11 @@ const BIN_SCRIPTS = [
   "notes-sync",
   "harness-sync",
   "park",
+  "wait-on",
   "spawn-worker",
   "worker-status",
+  "worker-list",
+  "worker-stop",
   "pipeline-wait",
   "review-loop",
   "second-opinion",
@@ -135,9 +138,25 @@ export async function ensureWorkspace(cfg: Config): Promise<Record<string, strin
   for (const name of BIN_SCRIPTS) {
     const dest = join(binDir, name);
     const src = join(examples, `${name}.sh`);
-    if (!existsSync(dest) && existsSync(src)) {
-      await cp(src, dest);
-      await chmod(dest, 0o755);
+    if (!existsSync(src)) continue;
+    // Seed bin/ as SYMLINKS into the tracked reference scripts, not copies, so a `git pull` that
+    // updates examples/agent-bin propagates to the agent's bin/ automatically on the next launch
+    // (the old copy-once behaviour meant merged script fixes never reached a running box). But NEVER
+    // clobber a regular file at dest: that is a deliberate local override — an agent-refined script,
+    // or a test's mock — and the whole self-modification model depends on it surviving. So: seed a
+    // symlink only when dest is MISSING, and refresh an existing symlink if it points elsewhere; a
+    // real file is left untouched. (A one-time `ln -sf` migrates already-copied boxes at deploy.)
+    let info: Awaited<ReturnType<typeof lstat>> | null = null;
+    try {
+      info = await lstat(dest);
+    } catch {
+      info = null; // dest missing
+    }
+    if (info === null) {
+      await symlink(src, dest);
+    } else if (info.isSymbolicLink() && (await readlink(dest)) !== src) {
+      await rm(dest, { force: true });
+      await symlink(src, dest);
     }
   }
   const shim = join(binDir, "foreman");

@@ -7,8 +7,22 @@ bun install          # dev deps (types)
 npm test             # unit tests (bun test) + lifecycle (bash test/run-lifecycle.sh)
 ```
 
-`npm test` runs three layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers
-`*.test.ts`), the lifecycle suite below, then `wait-reply-inbox.sh`.
+`npm test` runs four layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers
+`*.test.ts`), the lifecycle suite below, then `wait-reply-inbox.sh` and
+`review-loop-verdict.sh`.
+
+## review-loop verdict + codex-sandbox test
+
+`review-loop-verdict.sh` extracts two units verbatim from `examples/agent-bin/review-loop.sh` —
+`compute_verdict` and `run_codex` — and drives them with fabricated phase results and a PATH-shim
+`codex` (no agents, no network, no repo work; a real review-loop run takes hours). It locks the
+verdict rule: correctness signals (a RISKY finding from any phase, ANY security finding, a phase
+ERROR) decide the outcome, while convergence signals (a phase stopping at its round cap, Codex not
+running at all) are informational and can neither flip the verdict nor appear in the `WHY:` line;
+`FAILED` (exit 5) outranks `NEEDS-HUMAN` (3) outranks `CLEAN` (0). It also locks the Codex sandbox
+handling: a bubblewrap startup failure is detected even though `codex exec` exits 0, the same error
+text merely *quoted* by a healthy review is not, an unconfirmed detection does not block later
+rounds, and a confirmed one stops further Codex calls.
 
 ## wait-reply inbox test
 
