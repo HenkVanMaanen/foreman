@@ -13,13 +13,23 @@ npm test             # unit tests (bun test) + lifecycle (bash test/run-lifecycl
 
 ## review-loop verdict + codex-sandbox test
 
-`review-loop-verdict.sh` extracts two units verbatim from `examples/agent-bin/review-loop.sh` —
-`compute_verdict` and `run_codex` — and drives them with fabricated phase results and a PATH-shim
-`codex` (no agents, no network, no repo work; a real review-loop run takes hours). It locks the
-verdict rule: correctness signals (a RISKY finding from any phase, ANY security finding, a phase
-ERROR) decide the outcome, while convergence signals (a phase stopping at its round cap, Codex not
-running at all) are informational and can neither flip the verdict nor appear in the `WHY:` line;
-`FAILED` (exit 5) outranks `NEEDS-HUMAN` (3) outranks `CLEAN` (0). It also locks the Codex sandbox
+`review-loop-verdict.sh` extracts the units under test verbatim from
+`examples/agent-bin/review-loop.sh` — `compute_verdict`, `run_escalation_phase` (with its helpers and
+prompt builder) and `run_codex` — and drives them with fabricated phase results, a stubbed agent pass
+and a PATH-shim `codex` (no agents, no network, no repo work; a real review-loop run takes hours).
+
+It locks the verdict rule: correctness signals (a RISKY finding from any phase, ANY security finding,
+a phase ERROR) decide the outcome, while convergence signals (a phase stopping at its round cap,
+Codex not running at all) are informational and can neither flip the verdict nor appear in the `WHY:`
+line; `FAILED` (exit 5) > `NEEDS-AI` (3) > `NEEDS-DECISION` (6) > `CLEAN` (0). What a RISKY finding
+MEANS is the escalation pass's answer — fixed/refuted ⇒ CLEAN, "needs a product / stored-data /
+ownership decision" ⇒ NEEDS-DECISION, anything else ⇒ NEEDS-AI — and no phase status can reach
+NEEDS-DECISION on its own.
+
+It locks the escalation pass itself: it is bounded by `--escalation-attempts` (an attempt that
+changes nothing ends the phase), each finding is handed over at most once, a pass that emits no
+verdict line counts as UNRESOLVED rather than silently resolved, an echoed-back output template is
+not a verdict, and an ERRORing pass reports ERROR. It also locks the Codex sandbox
 handling: a bubblewrap startup failure is detected even though `codex exec` exits 0, the same error
 text merely *quoted* by a healthy review is not, an unconfirmed detection does not block later
 rounds, and a confirmed one stops further Codex calls.

@@ -23,7 +23,7 @@ two ways:
   `"stop_hook_active": true` when the stop is already the result of a prior Stop hook. `--stop-hook`
   reads stdin and, if it sees that flag, no-ops immediately.
 - **Always exits 0** in `--stop-hook` mode — it never returns a blocking exit code, so it cannot
-  force the session to loop. The real verdict (CLEAN / NEEDS-HUMAN / FAILED) is still printed to the transcript,
+  force the session to loop. The real verdict (CLEAN / NEEDS-AI / NEEDS-DECISION / FAILED) is still printed to the transcript,
   and any auto-fixes are committed.
 
 Because it commits its own fixes and only runs the bounded loops (hard round cap), it makes
@@ -88,13 +88,45 @@ is skipped never pays the forge round-trip.
 
 ## Verdict — what CLEAN actually means
 
-The run ends in exactly one of three states, and only **correctness** signals decide which:
+The run ends in exactly one of four states, and only **correctness** signals decide which. The three
+non-clean ones differ in exactly one way: **who owns the next step.**
 
-| verdict | exit | what caused it |
-| --- | --- | --- |
-| `CLEAN` | 0 | no RISKY finding, no security finding, no phase error |
-| `NEEDS-HUMAN` | 3 | a reviewer left a finding UNAPPLIED as RISKY, and/or the security phase found anything in the changed code (even something it auto-fixed) |
-| `FAILED` | 5 | a phase ERRORed — a review invocation failed, or a round's commit was rejected. The gate did not complete, so its silence is **not** approval |
+| verdict | exit | what caused it | who acts next |
+| --- | --- | --- | --- |
+| `CLEAN` | 0 | no unresolved RISKY finding, no security finding, no phase error | nobody — ship it |
+| `NEEDS-AI` | 3 | a RISKY finding the escalation pass could not fix (or escalation was disabled/exhausted), and/or the security phase found anything in the changed code (even something it auto-fixed) | **foreman** — another AI pass |
+| `NEEDS-DECISION` | 6 | the escalation pass reports the fix needs a PRODUCT choice, a migration of already-stored user data, or an ownership/policy call | **a person** — genuinely |
+| `FAILED` | 5 | a phase ERRORed — a review invocation failed, a round's commit was rejected, or the escalation pass itself failed. The gate did not complete, so its silence is **not** approval | re-run the gate |
+
+Precedence: `FAILED` > `NEEDS-AI` > `NEEDS-DECISION` > `CLEAN`. NEEDS-AI outranks NEEDS-DECISION on
+purpose — while AI work is still outstanding, foreman has not yet earned the right to interrupt a
+person; do that work, re-run, and the decision question is what is left. Exit **3** is the old
+`NOT-CLEAN` / `NEEDS-HUMAN` code, kept so any caller testing `rc -eq 3` keeps working.
+
+### The escalation pass — a RISKY finding is AI work, not a question
+
+Every phase is instructed to leave anything uncertain / architectural / high-blast-radius UNAPPLIED
+and flag it RISKY. That instruction is right for a cheap pass, but the run used to STOP there and
+hand the problem to a human — foreman giving up on work an AI can still do.
+
+Now every RISKY finding goes to an **escalation pass**: a fresh agent that gets the finding text, the
+reason the cheap pass declined it, and explicit permission to spend real effort (read the callers and
+tests, restructure, add tests, run the build). It must **FIX** the finding, **DISMISS** it with
+evidence, or say which of the two kinds of "cannot" applies: `UNRESOLVED` (still a coding problem —
+more AI work would help) or `DECISION` (a product / stored-data / ownership call no AI may make).
+
+- **Bounded:** `--escalation-attempts N` (0..2, default **2**). An attempt that changes nothing ends
+  the phase immediately, so in practice it is usually one pass. It can never loop.
+- **Re-reviewed:** anything it changes goes back through the correctness phases (review, Codex if
+  active, security if it was in scope) — an escalation fix cannot itself ship unreviewed. A finding
+  raised by that re-review is what a 2nd attempt is for.
+- **Never silent:** a pass that emits no verdict line for a finding counts as UNRESOLVED, never as
+  resolved. `--escalation-attempts 0` disables the phase and reports RISKY findings as `NEEDS-AI`
+  directly, exactly as before escalation existed.
+- **`NEEDS-DECISION` is deliberately rare:** no phase can land there on its own, only an escalation
+  pass that spent an attempt and justified the claim. It is for things like *"filing this reactie
+  under the right heading means storing a new field next to the existing ones — i.e. migrating
+  annotations users already saved"*: whether to migrate stored user data is a person's call.
 
 **Convergence** signals are reported but never flip the verdict, and never appear in the `WHY:` line:
 
@@ -117,7 +149,7 @@ risky/uncertain — exactly like the security phase, but for general correctness
 It runs through the *same* digest/convergence machinery and the *same* round cap as the Claude
 phases; every finding (fixed or not) is surfaced in the summary.
 
-- **Ordering:** Claude code-review → Claude `/simplify` → **Codex review** → security → final
+- **Ordering:** Claude review → Claude `/simplify` → **Codex review** → security → final
   convergence. Codex runs *before* security so security keeps the final word over the exact code
   that ships (including anything Codex changed).
 - **Joint fixpoint:** when Codex is active, the gated final pass is a bounded **Claude↔Codex
@@ -126,8 +158,8 @@ phases; every finding (fixed or not) is surfaced in the summary.
   flag, and a Claude fix Codex would flag, are both caught). The alternation is capped at
   `--max-rounds` cycles — no infinite ping-pong.
 - **Disagreement / escalation:** a Codex finding it judges too risky to auto-fix is left UNAPPLIED
-  and surfaced as an escalation (`review-loop: NEEDS-HUMAN`, WHY printed) — the same human-decides
-  channel as security escalations. Nothing risky is silently applied.
+  and routed to the escalation pass (see above) like every other RISKY finding — fixed if an AI can
+  fix it, `NEEDS-AI` / `NEEDS-DECISION` if not. Nothing risky is silently applied.
 - **Flags:** `--codex` / `--no-codex` (default **on**), `--codex-model MODEL` (default
   `gpt-5.6-sol`).
 - **Graceful skip:** if the `codex` CLI is not installed or not logged in (`codex login status`
@@ -157,23 +189,26 @@ Same graceful behavior when codex is missing/not-logged-in (warns, exits nonzero
 
 ## Notes
 
-- The hook runs `claude -p` **and `codex exec`** sub-invocations (the code-review report+apply
+- The hook runs `claude -p` **and `codex exec`** sub-invocations (the review report+apply
   pair, `/simplify`, the Codex review loop, the security fix loop, and — only if simplify, Codex or
-  security changed code — a final reconciliation / code-review pass). Each costs tokens/time; keep
+  security changed code — a final reconciliation / review pass, plus an escalation pass if anything
+  came back RISKY). Each costs tokens/time; keep
   `--max-rounds` modest for interactive use, or pass `--no-codex` to run Claude-only.
 - **`/simplify` has its own cap** (`--simplify-rounds`, default **2**, vs `--max-rounds` 6 for the
   correctness phases). A taste pass never runs out of suggestions, so rounds 3+ bought churn — they
-  were a large share of why a 20-line change took two hours. The correctness phases (code-review,
+  were a large share of why a 20-line change took two hours. The correctness phases (review,
   security, reconciliation) keep the full `--max-rounds`.
-- **The code-review phase is deliberately not a loop.** It runs the built-in `/review <PR>` once to
+- **The review phase is deliberately not a loop.** It runs the built-in `/review <PR>` once to
   REPORT (resolving the open GitHub PR for the branch via `gh`; with no PR it uses a diff-scoped
   review prompt instead), then ONE apply pass for the findings it is confident about. It replaced an
   up-to-`--max-rounds` loop of `/code-review high --fix`, whose per-round multi-agent review of the
   whole diff was by far this script's biggest token cost. Anything the apply pass will not touch is
-  escalated as a RISKY finding, not re-reviewed. `--effort` is gone with it — nothing took it.
+  escalated as a RISKY finding, not re-reviewed. `--effort` is gone with it — nothing took it. The
+  phase is LABELLED `review` because `/review` is what it runs; it was called `code-review` after the
+  command it replaced, which read as if that expensive command were still being invoked.
 - The security phase **auto-fixes** the findings it is confident about (auth / input / secrets /
-  network scope) and loops to convergence like the other phases. It escalates (NEEDS-HUMAN) if it
-  found ANY finding in the changed code — a risky one it left unapplied, or one it auto-fixed that a
-  human should still verify (all surfaced with WHY). In
+  network scope) and loops to convergence like the other phases. It escalates (NEEDS-AI) if it
+  found ANY finding in the changed code — a risky one it left unapplied, or one it auto-fixed whose
+  fix must still be verified (all surfaced with WHY). In
   `--stop-hook` mode the process still exits 0 so it doesn't wedge the session; the real status and
   any surfaced findings are printed to the transcript, and all applied fixes are committed.

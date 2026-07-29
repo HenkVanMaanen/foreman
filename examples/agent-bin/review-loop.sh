@@ -9,10 +9,13 @@
 # Phases run IN ORDER on the git repo at DIR. The order is deliberate and confirmed optimal: fix
 # correctness first, shrink the surface second, and let security have the final word over the exact
 # code that ships.
-#   1. code-review       — TWO fixed passes, not a loop. Pass 1 REPORTS via the built-in `/review
+#   1. review            — TWO fixed passes, not a loop. Pass 1 REPORTS via the built-in `/review
 #                          <PR>` (the open GitHub PR found via gh; a diff-scoped review prompt when
 #                          there is none), pass 2 APPLIES the findings it is confident about and
-#                          commits, flagging the rest RISKY for a human. WHY it is bounded: `/review`
+#                          commits, flagging the rest RISKY. (The phase is called `review` because
+#                          `/review` is literally what it runs. Its label used to be inherited from
+#                          the `/code-review --fix` loop it replaced, which read as if that expensive
+#                          command were still being invoked.) WHY it is bounded: `/review`
 #                          does not fix, so "loop until a round applies nothing" has no fixpoint here
 #                          — and the loop it replaces (six `/code-review high --fix` rounds, each a
 #                          multi-agent review of the whole diff) is the cost this script was eating.
@@ -54,6 +57,20 @@
 #                          alternation is capped at --max-rounds cycles. When Codex is inactive it
 #                          degrades to a single gated Claude review pass (catch a bug a security fix
 #                          introduced). Skipped when nothing changed after the codex phase.
+#   5. escalation pass   — conditional (see --escalation-attempts, DEFAULT 2). Runs LAST, and ONLY
+#                          when some phase left a finding UNAPPLIED as RISKY — running it last is
+#                          what lets it see every RISKY finding the run produced, including ones the
+#                          reconciliation raised. A RISKY finding used to simply END the run and hand
+#                          the problem to a human; that is foreman giving up on work an AI can still
+#                          do. Instead a FRESH agent gets the finding text, the reason the cheap apply
+#                          pass declined it, and explicit permission to spend real effort (read the
+#                          surrounding code, run the build/tests, make a larger but justified change)
+#                          — and must either FIX it or say concretely why it cannot be fixed safely.
+#                          Anything it changes is re-reviewed by the correctness phases (review,
+#                          codex if active, security if it was in scope) before it can ship, so an
+#                          escalation fix cannot itself ship unreviewed. Bounded at
+#                          --escalation-attempts (default 2) attempts, and an attempt that changes
+#                          nothing ends the phase — it can never loop.
 #
 # Convergence per round is detected structurally: we digest the working tree before and after the
 # review invocation; identical digest ⇒ the round applied nothing ⇒ that phase converged. Each
@@ -66,7 +83,7 @@
 #
 # Usage:
 #   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
-#               [--simplify-rounds N] [--security auto|on|off]
+#               [--simplify-rounds N] [--security auto|on|off] [--escalation-attempts N]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
 #   review-loop --self-test-verdict               # exercise the verdict rule offline, then exit
@@ -86,6 +103,13 @@
 #   off  — never run Codex; behaves exactly like the pre-Codex review-loop.
 # --codex-model MODEL: the Codex model to use (default gpt-5.6-sol).
 #
+# --escalation-attempts N (default 2, 0 disables): how many times the escalation pass may be handed
+#   a batch of RISKY findings. The bound is small ON PURPOSE. Each attempt is a full agent pass plus
+#   a re-review of whatever it changed, so it is the most expensive thing in the run; and if two
+#   well-resourced passes cannot fix a finding, a third is not what is missing — a human is. An
+#   attempt that changes nothing also ends the phase immediately (a second identical pass over the
+#   same findings would just repeat itself), so the real bound is "at most N, usually 1".
+#
 # --security:
 #   on   — (default) always run the security fix loop. It reviews the actual diff and only acts on
 #          real findings, so it scopes itself — no need to pre-gate. Confident in-scope fixes are
@@ -96,19 +120,36 @@
 #          sql query handler route exec deserialize input parse. (Paths, not content — so a script
 #          that merely mentions these words does not self-trigger.)
 #
-# Exit codes / final line (see the VERDICT MODEL section below for the full rule and WHY):
-#   0  CLEAN       — no RISKY finding, no security finding, no phase error. Informational notes (a
-#                    taste phase stopping at its round cap, a missing Codex second opinion) may
-#                    still be printed; they do NOT flip the verdict.
-#   3  NEEDS-HUMAN — a reviewer left a finding UNAPPLIED as RISKY, and/or the security phase found
-#                    something in the changed code. A human must read it. (Exit 3 is deliberately
-#                    the old NOT-CLEAN code, so any caller testing `rc -eq 3` keeps working.)
-#   5  FAILED      — the GATE itself did not complete: a phase ERROR (a review invocation failed, or
-#                    a round's commit was rejected). Its silence is not approval — re-run it.
-#   2  ERROR       — usage / precondition (bad flag, DIR not a git repo, `claude` not found). Never
-#                    in --stop-hook mode: a blocking code there would wedge the session (see below).
-#   4  BUDGET      — the shared-budget admission gate waited FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds
-#                    for a slot (LOAD+2 <= FOREMAN_MAX_WORKERS) and never got one. `--force` skips it.
+# Exit codes / final line (see the VERDICT MODEL section below for the full rule and WHY). THREE
+# non-clean outcomes, and the difference between them is the whole point — each names a DIFFERENT
+# owner of the next step:
+#   0  CLEAN          — no unresolved RISKY finding, no security finding, no phase error.
+#                       Informational notes (a taste phase stopping at its round cap, a missing Codex
+#                       second opinion) may still be printed; they do NOT flip the verdict.
+#   3  NEEDS-AI       — FOREMAN HAS MORE WORK TO DO. A RISKY finding survived: either the escalation
+#                       pass could not fix it safely, or escalation was disabled/exhausted — or the
+#                       security phase found something in the changed code. The next step is another
+#                       AI pass (a worker, a targeted fix, a re-run), NOT a question to the human.
+#                       (Exit 3 is deliberately the old NOT-CLEAN / NEEDS-HUMAN code, so any caller
+#                       testing `rc -eq 3` keeps working.)
+#   6  NEEDS-DECISION — A PERSON GENUINELY HAS TO CHOOSE. Reached ONLY when the escalation pass —
+#                       which was told to fix the thing — reports back that the fix requires a
+#                       PRODUCT decision, a STORED-DATA migration, or an OWNERSHIP/POLICY choice.
+#                       Those are not coding problems and no amount of AI effort makes them one; e.g.
+#                       "filing this reactie correctly means changing the stored annotation format
+#                       for existing user data". Deliberately RARE: no phase can reach it directly,
+#                       only an escalation pass that spent an attempt and justified landing here.
+#   5  FAILED         — the GATE itself did not complete: a phase ERROR (a review invocation failed,
+#                       a round's commit was rejected, the escalation pass itself failed). Its
+#                       silence is not approval — re-run it.
+#   2  ERROR          — usage / precondition (bad flag, DIR not a git repo, `claude` not found).
+#                       Never in --stop-hook mode: a blocking code there would wedge the session.
+#   4  BUDGET         — the shared-budget admission gate waited FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT
+#                       seconds for a slot (LOAD+2 <= FOREMAN_MAX_WORKERS) and never got one.
+#                       `--force` skips it.
+# Precedence when several apply: FAILED > NEEDS-AI > NEEDS-DECISION > CLEAN. NEEDS-AI outranks
+# NEEDS-DECISION on purpose — while there is still AI work outstanding, foreman has not yet earned
+# the right to interrupt a human; do that work, re-run, and the decision question is what is left.
 #
 # In --stop-hook mode the process still runs the loop once (guarded by a marker file so a
 # re-firing Stop hook cannot recurse), but ALWAYS exits 0 so the session is allowed to end; the
@@ -134,9 +175,14 @@ max_rounds=6
 # always one more thing to tidy), so rounds 3..6 were paying a full review round each for churn —
 # and then reporting "NOT-CONVERGED" as if that were a defect. 2 = one substantive pass plus one
 # pass to clean up after it. Raise it with --simplify-rounds if you want the old behaviour.
-# Deliberately NOT applied to the correctness phases (code-review, security, reconciliation): those
+# Deliberately NOT applied to the correctness phases (review, security, reconciliation): those
 # keep --max-rounds, i.e. exactly the thoroughness they had.
 simplify_rounds=2
+# The escalation pass (see the phase list) is bounded HARD: at most this many attempts per run, and
+# an attempt that changes nothing ends the phase. 2 = one real attempt plus one shot at whatever the
+# re-review of its fix turned up. 0 disables escalation entirely (a RISKY finding then reports
+# NEEDS-AI directly, the pre-escalation behaviour).
+escalation_attempts=2
 security="on"     # default: always run security-review; the command scopes itself to real findings
 codex="on"        # default: run the Codex independent-reviewer phase (skips gracefully if unavailable)
 codex_model="gpt-5.6-sol"
@@ -169,11 +215,11 @@ _tmo() { local s="$1"; shift; if command -v timeout >/dev/null 2>&1; then timeou
 usage() {
   # Print the usage block (the header comment's Usage section, condensed).
   cat <<'EOF'
-review-loop — run code-review + simplify + codex + security over this branch's changes.
+review-loop — run review + simplify + codex + security over this branch's changes.
 
 Usage:
   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
-              [--simplify-rounds N] [--security auto|on|off]
+              [--simplify-rounds N] [--security auto|on|off] [--escalation-attempts N]
               [--codex|--no-codex] [--codex-model MODEL] [--force]
   review-loop --stop-hook [ ...same opts... ]
   review-loop --self-test-verdict
@@ -198,7 +244,7 @@ derivation.
 
 Phases run in order, committing per round; the auto-fixing loops are capped at --max-rounds
 (/simplify at --simplify-rounds):
-  1. code-review                        (2 fixed passes: `/review <PR>` REPORTS — or a diff-scoped
+  1. review                             (2 fixed passes: `/review <PR>` REPORTS — or a diff-scoped
                                          review prompt when the branch has no open GitHub PR — then
                                          ONE apply pass; risky findings surfaced, not looped on)
   2. /simplify loop                     (shrink surface; own lower cap — a taste pass never runs out
@@ -207,18 +253,26 @@ Phases run in order, committing per round; the auto-fixing loops are capped at -
                                          escalates risky ones; skipped if codex unavailable)
   4. security fix loop                  (auto-applies confident in-scope fixes; risky ones surfaced)
   5. final convergence                  (ONLY if simplify/codex/security changed code — bounded Claude<->Codex
-                                         reconciliation, or a single code-review pass if codex off)
+                                         reconciliation, or a single review pass if codex off)
+  6. escalation pass                    (ONLY if some phase left a RISKY finding: a fresh, better-
+                                         resourced agent must FIX it or justify why it cannot be;
+                                         anything it changes is re-reviewed. --escalation-attempts
+                                         N, 0..2, default 2; 0 disables escalation entirely)
 
 Defaults: DIR=cwd, target=auto, max-rounds=6, simplify-rounds=2, security=on, codex=on,
-          codex-model=gpt-5.6-sol, base=merge-base of HEAD with the MR/PR target branch if derivable,
-          else with origin/main.
+          codex-model=gpt-5.6-sol, escalation-attempts=2, base=merge-base of HEAD with the MR/PR
+          target branch if derivable, else with origin/main.
 
 Verdict: driven by CORRECTNESS signals only — a RISKY (deliberately unapplied) finding from any
 phase, ANY security finding, or a phase ERROR. CONVERGENCE signals are informational and never flip
 it: a phase stopping at its round cap, or Codex not running at all, are reported on their own line.
+What a RISKY finding MEANS is decided by the escalation pass: fixed/refuted -> CLEAN, "needs a
+product/data/ownership decision" -> NEEDS-DECISION, anything else -> NEEDS-AI.
 
-Exit: 0 CLEAN | 3 NEEDS-HUMAN (RISKY finding / security finding) | 5 FAILED (a phase errored, so the
-gate did not complete) | 2 usage/error | 4 budget-wait timeout.
+Exit: 0 CLEAN | 3 NEEDS-AI (a RISKY finding no AI pass resolved / a security finding — more AI work)
+| 6 NEEDS-DECISION (the escalation pass says a PERSON must choose: product / data migration /
+ownership) | 5 FAILED (a phase errored, so the gate did not complete) | 2 usage/error | 4
+budget-wait timeout. Precedence: FAILED > NEEDS-AI > NEEDS-DECISION > CLEAN.
 EOF
 }
 
@@ -253,6 +307,7 @@ while [ "$#" -gt 0 ]; do
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
     --simplify-rounds) [ "$#" -ge 2 ] || die_usage "--simplify-rounds needs N"; simplify_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
+    --escalation-attempts) [ "$#" -ge 2 ] || die_usage "--escalation-attempts needs N"; escalation_attempts="$2"; shift 2;;
     --codex)      codex="on"; shift;;
     --no-codex)   codex="off"; shift;;
     --codex-model) [ "$#" -ge 2 ] || die_usage "--codex-model needs MODEL"; codex_model="$2"; shift 2;;
@@ -281,6 +336,11 @@ max_rounds="$((10#$max_rounds))"  # normalize: strip leading zeros so 08/09 aren
 [[ "$simplify_rounds" =~ ^[0-9]+$ ]] || die_usage "--simplify-rounds must be a non-negative integer (got '$simplify_rounds')"
 simplify_rounds="$((10#$simplify_rounds))"   # same leading-zero normalization as --max-rounds
 [ "$simplify_rounds" -ge 1 ] || die_usage "--simplify-rounds must be >= 1"
+[[ "$escalation_attempts" =~ ^[0-9]+$ ]] || die_usage "--escalation-attempts must be a non-negative integer (got '$escalation_attempts')"
+escalation_attempts="$((10#$escalation_attempts))"   # same leading-zero normalization
+# Upper bound, not just a default: escalation is the most expensive thing in the run, and "try more
+# passes" is not the answer to a finding two well-resourced passes could not fix.
+[ "$escalation_attempts" -le 2 ] || die_usage "--escalation-attempts must be 0..2 (got '$escalation_attempts'); a finding two escalation passes cannot fix needs a human, not a third pass"
 
 # --- VERDICT MODEL ----------------------------------------------------------------------------
 # The one thing a human is asked to TRUST without reading a two-hour transcript. It therefore lives
@@ -297,10 +357,11 @@ simplify_rounds="$((10#$simplify_rounds))"   # same leading-zero normalization a
 # The rule now separates CORRECTNESS signals from CONVERGENCE signals:
 #
 #   CORRECTNESS — these DRIVE the verdict and are named in the WHY line:
-#     * a RISKY finding from any phase. A reviewer deliberately left something UNAPPLIED because it
-#       judged that a human must decide. This is the signal the whole gate exists to produce.
+#     * a RISKY finding from any phase. A reviewer deliberately left something UNAPPLIED. What that
+#       MEANS is no longer decided here: it is decided by what the escalation pass did with it (see
+#       ESCALATION below). This is the signal the whole gate exists to produce.
 #     * ANY security finding, including one the security phase auto-fixed: a vulnerability was
-#       present in this branch, so a human should see what was changed on their behalf.
+#       present in this branch, so the fix must be verified rather than assumed.
 #     * a phase ERROR — the review invocation failed, or a round's changes could not be committed.
 #       The phase did not actually run to completion, so its silence proves nothing.
 #
@@ -313,27 +374,48 @@ simplify_rounds="$((10#$simplify_rounds))"   # same leading-zero normalization a
 #       is called out loudly on the verdict line, but it is not a finding about the code, and
 #       treating it as one is what turned a broken sandbox into a fake RISKY review result.
 #
-# Three outcomes, because the old "not clean" conflated two states a human acts on differently:
-# findings to judge (read them) versus a gate that broke (re-run it, and do not mistake its silence
-# for approval). CLEAN=0, NEEDS-HUMAN=3 (the old NOT-CLEAN code, kept so callers testing `rc -eq 3`
-# still work), FAILED=5.
+#   ESCALATION — what a RISKY finding MEANS. A RISKY finding no longer ends the run by itself: the
+#   escalation phase hands it to a fresh, better-resourced agent that must fix it or justify why it
+#   cannot. ESC_STATUS carries that answer back here, and it is what turns a RISKY finding into an
+#   outcome:
+#     * RESOLVED   — the escalation pass fixed or refuted every risky finding, and the correctness
+#                    phases re-ran over whatever it changed. Informational note; the run can be CLEAN.
+#     * DECISION   — the pass reports the fix requires a PRODUCT decision, a STORED-DATA migration,
+#                    or an OWNERSHIP/POLICY choice ⇒ NEEDS-DECISION. This is the ONLY route to that
+#                    outcome, and the pass has to have spent an attempt to claim it — no phase can
+#                    dump a finding there directly, which is what keeps it rare and meaningful.
+#     * UNRESOLVED — the pass could not fix it safely, ignored its output contract, or ran out of
+#                    attempts ⇒ NEEDS-AI: real work is left, and it is AI work.
+#     * MIXED      — both of the above happened in one run ⇒ NEEDS-AI (do the AI work first, re-run,
+#                    and the decision question is what remains), with BOTH named in the WHY line.
+#     * SKIPPED    — escalation disabled (--escalation-attempts 0) ⇒ a RISKY finding reports NEEDS-AI
+#                    directly, exactly as it did before escalation existed.
+#     * ERROR      — the escalation pass itself failed ⇒ FAILED, like any other broken phase.
+#
+# FOUR outcomes, because each names a different OWNER of the next step: CLEAN=0 (ship), NEEDS-AI=3
+# (foreman has more work to do — the old NOT-CLEAN/NEEDS-HUMAN code, kept so callers testing
+# `rc -eq 3` still work), NEEDS-DECISION=6 (a person genuinely has to choose), FAILED=5 (the gate
+# broke; re-run it and do not mistake its silence for approval). Precedence: FAILED > NEEDS-AI >
+# NEEDS-DECISION > CLEAN.
 #
 # Inputs are the phase-status globals as the phases leave them: CR_STATUS, SI_STATUS, CODEX_STATUS,
-# SEC_STATUS, RECONCILE_STATUS (CLEAN|SKIPPED|RISKY|NOT-CONVERGED|ERROR|DID-NOT-RUN) plus
-# SEC_FINDINGS (the surfaced security lines). Outputs: VERDICT, VERDICT_WHY (ONLY reasons that
-# actually contributed), VERDICT_NOTES (informational), VERDICT_RC.
+# SEC_STATUS, RECONCILE_STATUS (CLEAN|SKIPPED|RISKY|NOT-CONVERGED|ERROR|DID-NOT-RUN), ESC_STATUS
+# (SKIPPED|RESOLVED|DECISION|UNRESOLVED|MIXED|ERROR) plus SEC_FINDINGS (the surfaced security lines)
+# and ESC_REASON (a one-line human summary of the escalation pass). Outputs: VERDICT, VERDICT_WHY
+# (ONLY reasons that actually contributed), VERDICT_NOTES (informational), VERDICT_RC.
 VERDICT="CLEAN"; VERDICT_WHY=""; VERDICT_NOTES=""; VERDICT_RC=0
 _verdict_why()  { VERDICT_WHY="${VERDICT_WHY:+$VERDICT_WHY; }$1"; }
 _verdict_note() { VERDICT_NOTES="${VERDICT_NOTES:+$VERDICT_NOTES; }$1"; }
-# FAILED outranks NEEDS-HUMAN outranks CLEAN: "the gate broke" is worse news than "here is a
-# finding", so it must not be overwritten by a later escalation.
-_verdict_escalate() { [ "$VERDICT" = "FAILED" ] || VERDICT="NEEDS-HUMAN"; return 0; }
+# Severity ladder, so a later signal can never DOWNGRADE an earlier one: "the gate broke" outranks
+# "more AI work is left" outranks "a person must choose" outranks "ship it".
+_verdict_rank() { case "$1" in FAILED) printf 3;; NEEDS-AI) printf 2;; NEEDS-DECISION) printf 1;; *) printf 0;; esac; }
+_verdict_escalate() { [ "$(_verdict_rank "$1")" -gt "$(_verdict_rank "$VERDICT")" ] && VERDICT="$1"; return 0; }
 
 compute_verdict() {
   VERDICT="CLEAN"; VERDICT_WHY=""; VERDICT_NOTES=""; VERDICT_RC=0
-  local pair label status
+  local pair label status risky_labels="" risky=0 esc="${ESC_STATUS:-SKIPPED}" esc_why="${ESC_REASON:+ ($ESC_REASON)}"
   # One "<label>:<status>" pair per phase — statuses never contain ':', so the split is unambiguous.
-  for pair in "code-review:${CR_STATUS:-CLEAN}" \
+  for pair in "review:${CR_STATUS:-CLEAN}" \
               "simplify:${SI_STATUS:-CLEAN}" \
               "codex:${CODEX_STATUS:-SKIPPED}" \
               "security:${SEC_STATUS:-SKIPPED}" \
@@ -341,28 +423,48 @@ compute_verdict() {
     label="${pair%%:*}"; status="${pair##*:}"
     case "$status" in
       CLEAN|SKIPPED) ;;
-      RISKY)         _verdict_escalate
-                     _verdict_why "$label: finding(s) left UNAPPLIED as RISKY — a human must decide (listed in the summary above)";;
-      ERROR)         VERDICT="FAILED"
+      # Collected, not judged: the escalation block below decides what a RISKY finding means, and a
+      # phase RISKY status is deliberately never cleared by a re-review (only escalation clears it).
+      RISKY)         risky=1; risky_labels="${risky_labels:+$risky_labels, }$label";;
+      ERROR)         _verdict_escalate FAILED
                      _verdict_why "$label: phase ERROR — the review did not complete (invocation failed, or a round's commit was rejected)";;
       NOT-CONVERGED) _verdict_note "$label: stopped at its round cap (informational — a cap, not a defect)";;
       DID-NOT-RUN)   _verdict_note "$label: DID NOT RUN — that reviewer contributed nothing to this run";;
-      # An unrecognized status is a bug in a phase, not a clean bill of health. Fail toward the human.
-      *)             _verdict_escalate
-                     _verdict_why "$label: unrecognized phase status '$status' — treating it as needing a human";;
+      # An unrecognized status is a bug in a phase, not a clean bill of health. Fail toward more work.
+      *)             _verdict_escalate NEEDS-AI
+                     _verdict_why "$label: unrecognized phase status '$status' — treating it as unfinished AI work";;
     esac
   done
-  # ANY security finding escalates, even one the phase auto-fixed and converged on: a vulnerability
-  # existed in the changed code and a human should see the fix. A RISKY security status already said
-  # so in its own words, so do not say it twice.
-  if [ -n "${SEC_FINDINGS:-}" ] && [ "${SEC_STATUS:-}" != "RISKY" ]; then
-    _verdict_escalate
-    _verdict_why "security: $(printf '%s\n' "$SEC_FINDINGS" | wc -l | tr -d ' ') finding(s) in the changed code (auto-fixed) — a human should verify the fix"
+  # What the RISKY findings MEAN is the escalation pass's answer, not this loop's.
+  if [ "$risky" -eq 1 ]; then
+    case "$esc" in
+      RESOLVED)   _verdict_note "$risky_labels: RISKY finding(s) were escalated to a fresh AI pass, which fixed or refuted them$esc_why — the correctness phases re-ran over the result";;
+      DECISION)   _verdict_escalate NEEDS-DECISION
+                  _verdict_why "$risky_labels: the escalation pass reports the finding(s) need a PRODUCT / STORED-DATA / OWNERSHIP decision, not more code$esc_why — a person must choose";;
+      MIXED)      _verdict_escalate NEEDS-DECISION
+                  _verdict_why "$risky_labels: part of the escalation needs a PRODUCT / STORED-DATA / OWNERSHIP decision$esc_why"
+                  _verdict_escalate NEEDS-AI
+                  _verdict_why "$risky_labels: and part of it is still unfixed code the escalation pass could not land safely — do that AI work first, then re-run";;
+      ERROR)      _verdict_escalate FAILED
+                  _verdict_why "escalation: the escalation pass itself ERRORed$esc_why — the RISKY finding(s) were never actually handled";;
+      SKIPPED)    _verdict_escalate NEEDS-AI
+                  _verdict_why "$risky_labels: finding(s) left UNAPPLIED as RISKY and no escalation pass ran (--escalation-attempts 0) — more AI work is needed (listed in the summary above)";;
+      *)          _verdict_escalate NEEDS-AI
+                  _verdict_why "$risky_labels: RISKY finding(s) the escalation pass could not fix safely$esc_why — more AI work is needed (listed in the summary above)";;
+    esac
+  fi
+  # ANY security finding escalates, even one that was auto-fixed or fixed via escalation: a
+  # vulnerability existed in the changed code and its fix must be verified, not assumed. Suppressed
+  # only while an UNRESOLVED security RISKY is already saying so in its own words above.
+  if [ -n "${SEC_FINDINGS:-}" ] && { [ "${SEC_STATUS:-}" != "RISKY" ] || [ "$esc" = "RESOLVED" ]; }; then
+    _verdict_escalate NEEDS-AI
+    _verdict_why "security: $(printf '%s\n' "$SEC_FINDINGS" | wc -l | tr -d ' ') finding(s) in the changed code (fixed) — the fix must be verified before this ships"
   fi
   case "$VERDICT" in
-    CLEAN)       VERDICT_RC=0;;
-    NEEDS-HUMAN) VERDICT_RC=3;;
-    FAILED)      VERDICT_RC=5;;
+    CLEAN)          VERDICT_RC=0;;
+    NEEDS-AI)       VERDICT_RC=3;;
+    NEEDS-DECISION) VERDICT_RC=6;;
+    FAILED)         VERDICT_RC=5;;
   esac
   return 0
 }
@@ -373,34 +475,40 @@ compute_verdict() {
 # be checkable without one. Add a case here whenever the rule changes; the cases below are the ones
 # the rewrite was specified against.
 if [ "$self_test" -eq 1 ]; then
-  # _st NAME CR SI CODEX SEC RECON [SEC_FINDINGS]  — positional (not KEY=VALUE) so no eval and no
+  # _st NAME CR SI CODEX SEC RECON ESC [SEC_FINDINGS]  — positional (not KEY=VALUE) so no eval and no
   # bash-4-only `declare -g`; this script still has to run under stock macOS bash 3.2.
   _st() {
     CR_STATUS="$2"; SI_STATUS="$3"; CODEX_STATUS="$4"; SEC_STATUS="$5"; RECONCILE_STATUS="$6"
-    SEC_FINDINGS="${7:-}"
+    ESC_STATUS="$7"; SEC_FINDINGS="${8:-}"; ESC_REASON=""
     compute_verdict
-    printf '%-24s -> %-11s exit=%s\n' "$1" "$VERDICT" "$VERDICT_RC"
-    [ -n "$VERDICT_WHY" ]   && printf '%-24s    WHY : %s\n' "" "$VERDICT_WHY"
-    [ -n "$VERDICT_NOTES" ] && printf '%-24s    note: %s\n' "" "$VERDICT_NOTES"
+    printf '%-26s -> %-14s exit=%s\n' "$1" "$VERDICT" "$VERDICT_RC"
+    [ -n "$VERDICT_WHY" ]   && printf '%-26s    WHY : %s\n' "" "$VERDICT_WHY"
+    [ -n "$VERDICT_NOTES" ] && printf '%-26s    note: %s\n' "" "$VERDICT_NOTES"
     return 0
   }
   echo "== review-loop verdict self-test =="
   echo
-  _st "all-clean"              CLEAN CLEAN         CLEAN       CLEAN CLEAN
-  _st "simplify-capped-only"   CLEAN NOT-CONVERGED CLEAN       CLEAN CLEAN
-  _st "reconcile-capped-only"  CLEAN CLEAN         CLEAN       CLEAN NOT-CONVERGED
-  _st "codex-did-not-run"      CLEAN CLEAN         DID-NOT-RUN CLEAN CLEAN
-  _st "security-finding-fixed" CLEAN CLEAN         CLEAN       CLEAN CLEAN \
+  _st "all-clean"                CLEAN CLEAN         CLEAN       CLEAN CLEAN SKIPPED
+  _st "simplify-capped-only"     CLEAN NOT-CONVERGED CLEAN       CLEAN CLEAN SKIPPED
+  _st "reconcile-capped-only"    CLEAN CLEAN         CLEAN       CLEAN NOT-CONVERGED SKIPPED
+  _st "codex-did-not-run"        CLEAN CLEAN         DID-NOT-RUN CLEAN CLEAN SKIPPED
+  _st "security-finding-fixed"   CLEAN CLEAN         CLEAN       CLEAN CLEAN SKIPPED \
       "SECFINDING: APPLIED | high | api.sh:42 | unquoted \$user in a shell call — quoted it"
-  _st "security-risky"         CLEAN CLEAN         CLEAN       RISKY CLEAN \
+  _st "security-risky-unfixable" CLEAN CLEAN         CLEAN       RISKY CLEAN UNRESOLVED \
       "SECFINDING: RISKY | high | api.sh:42 | auth check may be bypassable -- NOT APPLIED: needs a schema change"
-  _st "code-review-risky"      RISKY CLEAN         CLEAN       CLEAN CLEAN
-  _st "codex-risky"            CLEAN CLEAN         RISKY       CLEAN CLEAN
-  _st "phase-error"            ERROR CLEAN         CLEAN       CLEAN CLEAN
-  _st "everything-at-once"     ERROR NOT-CONVERGED DID-NOT-RUN RISKY NOT-CONVERGED \
+  _st "review-risky-no-escal"    RISKY CLEAN         CLEAN       CLEAN CLEAN SKIPPED
+  _st "review-risky-escalated"   RISKY CLEAN         CLEAN       CLEAN CLEAN RESOLVED
+  _st "codex-risky-unresolved"   CLEAN CLEAN         RISKY       CLEAN CLEAN UNRESOLVED
+  _st "risky-needs-decision"     RISKY CLEAN         CLEAN       CLEAN CLEAN DECISION
+  _st "risky-mixed"              RISKY CLEAN         RISKY       CLEAN CLEAN MIXED
+  _st "escalation-errored"       RISKY CLEAN         CLEAN       CLEAN CLEAN ERROR
+  _st "phase-error"              ERROR CLEAN         CLEAN       CLEAN CLEAN SKIPPED
+  _st "everything-at-once"       ERROR NOT-CONVERGED DID-NOT-RUN RISKY NOT-CONVERGED MIXED \
       "SECFINDING: RISKY | high | api.sh:42 | auth check may be bypassable -- NOT APPLIED: needs a schema change"
   echo
   echo "(informational signals must never appear in a WHY line, and must never change exit=0)"
+  echo "(NEEDS-DECISION is reachable ONLY via an escalation pass reporting DECISION — no phase can"
+  echo " land there on its own, which is what keeps it rare)"
   exit 0
 fi
 
@@ -611,7 +719,7 @@ _json_str_field() {
 }
 
 # Best-effort MR/PR context for the checked-out branch, via glab or gh. Two consumers need it now —
-# the diff-scope derivation (--target auto) and the code-review phase (`/review <PR>`) — so it sets
+# the diff-scope derivation (--target auto) and the review phase (`/review <PR>`) — so it sets
 # GLOBALS and memoizes, rather than echoing: the caller needs TWO values, and `$(...)` would both
 # lose the second one and pay the forge round-trip twice.
 #   MR_TARGET_BRANCH — the branch this work merges INTO; "" when there is no MR context (detached
@@ -775,12 +883,12 @@ scope_diff_ref="${range:-HEAD}"
 # which can land WIDER than the base that was pinned, so "only uncommitted changes will be reviewed"
 # would be false for half the reviewers.
 if [ -z "$range" ] && [ "$base_pinned" -eq 1 ]; then
-  echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases and the diff-scoped code-review fallback see UNCOMMITTED changes only, /simplify falls back to self-deriving its own range, and '/review <PR>' reviews the whole PR regardless" >&2
+  echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases and the diff-scoped review fallback see UNCOMMITTED changes only, /simplify falls back to self-deriving its own range, and '/review <PR>' reviews the whole PR regardless" >&2
 fi
 
 si_cmd="/simplify${range:+ $range}"
 
-# --- what the code-review phase reviews --------------------------------------------------------
+# --- what the review phase reviews --------------------------------------------------------
 # The report pass used to be `/code-review <effort> --fix`, which fans out a multi-agent review of
 # the working diff on EVERY round — six of those per loop ate a whole session's quota. It is
 # replaced by the built-in `/review <PR>`, a single-agent review that reads the PR's own diff via
@@ -962,7 +1070,7 @@ run_codex() {
   return "$rc"
 }
 
-# --- fix-phase runner (code-review, simplify, security) ---------------------------------------
+# --- fix-phase runner (review, simplify, security) ---------------------------------------
 # Runs a review→apply→recheck loop to convergence: each round invokes $slash (a slash command or a
 # full prompt) via $runner, digests the working tree before/after, commits any changes, and stops
 # when a round applies nothing (CLEAN) or the round cap is hit (NOT-CONVERGED). The security and codex
@@ -971,7 +1079,7 @@ run_codex() {
 # $runner is the reviewer function to call (default run_claude; run_codex for the Codex phase) — it
 # is passed EXPLICITLY rather than via a mutable global so a phase can never leak its runner into the
 # next. $cap overrides the round cap (default --max-rounds) for a phase that is deliberately bounded
-# tighter — the code-review apply pass passes 1, since there is nothing to converge towards there.
+# tighter — the review apply pass passes 1, since there is nothing to converge towards there.
 # Sets globals: PHASE_STATUS (CLEAN|NOT-CONVERGED|ERROR), PHASE_ROUNDS, PHASE_CHANGED (0|1).
 run_fix_phase() {
   local label="$1" slash="$2" commit_prefix="$3" display="${4:-$2}" runner="${5:-run_claude}" cap="${6:-$max_rounds}"
@@ -1034,7 +1142,7 @@ run_fix_phase() {
 # Parse a captured review phase's output for its FINDING lines. Echoes the surfaced findings (every
 # APPLIED/RISKY line, deduped across rounds, with the NONE sentinel dropped) to stdout, and RETURNS 0
 # iff at least one RISKY (deliberately-unapplied) finding is present so the caller can escalate.
-# Shared verbatim by the code-review, security and codex phases — only the token
+# Shared verbatim by the review, security and codex phases — only the token
 # (REVIEWFINDING|SECFINDING|CODEXFINDING) differs.
 # Call it in a conditional so its risky-return status is consumed rather than tripping `set -e`:
 #   if FINDINGS="$(parse_findings SECFINDING "$cap")"; then RISKY=1; fi
@@ -1056,7 +1164,7 @@ parse_findings() {  # $1=token  $2=capture-file
   grep -aiqE "^$token:[[:space:]]*RISKY([[:space:]]|\|)" <<<"$out"
 }
 
-# --- code-review phase (report → apply; deliberately NOT a convergence loop) -------------------
+# --- review phase (report → apply; deliberately NOT a convergence loop) -------------------
 # Build the APPLY pass's prompt from the findings the REPORT pass produced.
 build_review_apply_prompt() {  # $1 = the REVIEWFINDING lines from the report pass
   cat <<EOF
@@ -1072,8 +1180,9 @@ For each finding:
   - If it is wrong, already fixed, or a matter of taste, DO NOT edit code — mark it DISMISSED with
     the reason. A dismissal is a judgement call you are making; be specific about why.
   - If it is real but its fix is uncertain, architectural, high-blast-radius, or could change
-    behaviour / break functionality, DO NOT edit code — leave it UNAPPLIED and flag it RISKY so a
-    human decides. When in doubt between APPLIED and RISKY, choose RISKY.
+    behaviour / break functionality, DO NOT edit code — leave it UNAPPLIED and flag it RISKY. It is
+    NOT dropped: a dedicated escalation pass with more room picks up every RISKY finding afterwards.
+    When in doubt between APPLIED and RISKY, choose RISKY.
 
 Do not add dependencies, do not refactor or reformat unrelated code, and do not fix anything that is
 not in the list above. Do NOT run \`git commit\` or \`git add\` — the caller commits. Do not create
@@ -1087,7 +1196,7 @@ For DISMISSED findings end the final field with: -- DISMISSED: <why>
 EOF
 }
 
-# Run ONE code-review phase: pass 1 REPORTS, pass 2 APPLIES what pass 1 found.
+# Run ONE review phase: pass 1 REPORTS, pass 2 APPLIES what pass 1 found.
 #
 # WHY this is two fixed passes and not a loop. The old phase ran up to --max-rounds of
 # `/code-review <effort> --fix` and stopped when a round applied nothing. `/review` does not fix, so
@@ -1277,7 +1386,7 @@ run_security_phase() {
     return 0
   fi
 
-  # Drive the auto-fixing loop through the SAME run_fix_phase machinery as code-review/simplify:
+  # Drive the auto-fixing loop through the SAME run_fix_phase machinery as review/simplify:
   # apply confident fixes, digest before/after, commit + recheck until a round changes nothing
   # (CLEAN) or the cap is hit (NOT-CONVERGED). Capture each round's raw output so we can (a) surface
   # every finding and (b) detect a RISKY finding the model deliberately left unapplied.
@@ -1302,7 +1411,7 @@ run_security_phase() {
   map_review_verdict "security" "$PHASE_STATUS" "$SEC_CHANGED"
   SEC_STATUS="$MV_STATUS"; SEC_REASON="$MV_REASON"
   if [ "$SEC_STATUS" = "CLEAN" ] && [ "$SEC_RISKY" -eq 1 ]; then
-    SEC_STATUS="RISKY"; SEC_REASON="finding(s) too risky to auto-fix — human review required"
+    SEC_STATUS="RISKY"; SEC_REASON="finding(s) too risky to auto-fix — handed to the escalation pass"
   fi
   return 0
 }
@@ -1340,7 +1449,7 @@ THEN ACT on what you find:
     requires.
   - For any finding that is uncertain, ambiguous, high-blast-radius, a matter of taste, or whose fix
     could change behavior / break functionality, DO NOT edit code — leave it UNAPPLIED and flag it
-    as RISKY so a human decides. When in doubt, do NOT apply.
+    as RISKY. A dedicated escalation pass picks those up later. When in doubt, do NOT apply.
 
 Do NOT run \`git commit\` or \`git add\` — the caller commits. Do not create new files unless a fix
 strictly requires one.
@@ -1441,15 +1550,254 @@ finalize_codex_findings() {
   # rule as the security phase). Only overlay onto an otherwise-CLEAN verdict; a NOT-CONVERGED/ERROR
   # verdict already escalates.
   if [ "$CODEX_RISKY" -eq 1 ] && [ "$CODEX_STATUS" = "CLEAN" ]; then
-    CODEX_STATUS="RISKY"; CODEX_REASON="finding(s) too risky/uncertain to auto-fix — human review required"
+    CODEX_STATUS="RISKY"; CODEX_REASON="finding(s) too risky/uncertain to auto-fix — handed to the escalation pass"
   fi
+}
+
+# --- escalation phase (a RISKY finding is AI work, not a question for a human) -----------------
+# WHY this exists. Every phase above is a CHEAP pass with an explicit instruction to leave anything
+# uncertain / architectural / high-blast-radius UNAPPLIED and flag it RISKY. That instruction is
+# right — a cheap pass should not make a large change on a hunch — but the run then STOPPED there and
+# handed the problem to a human. That is foreman giving up on work an AI can still do: "the minimal
+# edit was not obviously safe" is not the same as "no AI can fix this".
+#
+# So a RISKY finding is now routed to a fresh agent that is told the opposite thing: you are the
+# escalation pass, these were sent to you precisely because they need more than a minimal edit, and
+# "too risky to touch" is not an answer you may repeat. It must FIX the finding, REFUTE it with
+# evidence, or name concretely what blocks a safe fix — and it must distinguish the one case an AI
+# genuinely must not decide (a product choice, a migration of already-stored user data, an
+# ownership/policy call) from the case where more AI work is simply needed.
+#
+# Three structural safeguards, because this is the pass with the most freedom:
+#   * BOUNDED — at most --escalation-attempts (default 2, max 2) attempts, and an attempt that
+#     changes nothing ends the phase immediately. It cannot loop.
+#   * RE-REVIEWED — anything it changes goes back through the correctness phases (review, codex if
+#     active, security if it was in scope) before it can ship, so an escalation fix cannot itself
+#     ship unreviewed. A finding raised BY that re-review is what a 2nd attempt is for.
+#   * NEVER SILENT — a pass that emits no verdict line for its findings counts as UNRESOLVED, not as
+#     resolved. Laundering a RISKY finding into silence is the one failure this must not have.
+LF=$'\n'
+ESC_SEEN=""          # every risky line already handed to an attempt (so attempt 2 gets only NEW ones)
+_esc_mark_seen() { ESC_SEEN="${ESC_SEEN:+$ESC_SEEN$LF}$1"; return 0; }
+# Echo the lines of $1 that have NOT been escalated yet. The case pattern is QUOTED, so a finding
+# containing glob characters is matched literally.
+_esc_new() {
+  local line out=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$LF$ESC_SEEN$LF" in *"$LF$line$LF"*) continue;; esac
+    out="${out:+$out$LF}$line"
+  done <<<"${1:-}"
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return 0
+}
+
+# Every RISKY (deliberately-unapplied) finding this run has produced, from all three reviewer
+# families, deduped. The codex list is read from its live capture file while finalize_codex_findings
+# has not run yet — which is the case here, since escalation runs BEFORE it (so a codex recheck
+# inside escalation still lands in the same capture).
+_risky_finding_re='^(REVIEWFINDING|SECFINDING|CODEXFINDING):[[:space:]]*RISKY([[:space:]]|\|)'
+collect_risky_findings() {
+  local all
+  all="$( { [ -n "${CR_FINDINGS:-}" ] && printf '%s\n' "$CR_FINDINGS"
+            if [ -n "${CODEX_FINDINGS:-}" ]; then
+              printf '%s\n' "$CODEX_FINDINGS"
+            elif [ -n "${CODEX_CAP:-}" ] && [ -f "$CODEX_CAP" ]; then
+              parse_findings CODEXFINDING "$CODEX_CAP" || true
+            fi
+            [ -n "${SEC_FINDINGS:-}" ] && printf '%s\n' "$SEC_FINDINGS"
+            true; } | grep -aiE "$_risky_finding_re" | sort -u || true)"
+  [ -n "$all" ] && printf '%s\n' "$all"
+  return 0
+}
+
+build_escalation_prompt() {  # $1 = the RISKY finding lines to act on
+  cat <<EOF
+An automated review of this git branch produced the findings below. A deliberately CHEAP apply pass
+already REFUSED to fix them: it judged each one uncertain, architectural, high-blast-radius or
+behaviour-changing and left it UNAPPLIED as RISKY. Its reason is on each line, usually after
+"NOT APPLIED:".
+
+You are the ESCALATION pass. These were routed to you PRECISELY BECAUSE they need more than a
+minimal, obviously-safe edit, so "too risky to touch" is not an answer you may repeat. Take the time
+and the room the earlier pass did not have.
+
+RISKY FINDINGS:
+$1
+
+SCOPE: the changes on this branch — the diff \`git diff $scope_diff_ref\` plus any uncommitted
+changes. Do not audit or "improve" pre-existing code the branch did not touch.
+
+For EACH finding, in order:
+  1. Read the code it points at, plus its callers and tests. Decide whether the finding is REAL. If
+     it is not (the earlier reviewer misread the code, or the case is already handled elsewhere),
+     say so with the specific evidence — refuting a finding is a legitimate outcome, guessing is not.
+  2. If it IS real, FIX IT PROPERLY. You have more room than the earlier pass: you may change more
+     than one file, restructure a function, introduce a helper, and add or update tests — as long as
+     the change stays within this branch's scope and you can justify every line of it. If the repo
+     has a fast build / typecheck / test command, RUN IT and make sure your change passes.
+  3. Only if a correct fix is genuinely out of reach, say why, naming what blocks it. There are
+     exactly two kinds of "cannot", and telling them apart is the most important thing you do here:
+       - DECISION — the fix needs a PRODUCT choice, a migration of data users have ALREADY STORED,
+         or an ownership/policy call (whose data, whose SLA, which team owns this). Nobody can settle
+         that from inside the code; a person has to choose. Example: "filing this value under the
+         right heading means storing a new field next to the existing ones, i.e. migrating
+         annotations users already saved."
+       - UNRESOLVED — it is still a coding problem; you just could not land it safely here (could not
+         reproduce it, it needs an interface you cannot see, the blast radius is bigger than this
+         branch). Another, better-informed pass could still do it.
+     Do NOT reach for DECISION because a fix is large, tedious or unpleasant. If a competent engineer
+     could implement it without asking anyone's permission, it is NOT a DECISION. Claiming DECISION
+     falsely stops the machine and interrupts a person, so justify it in the line you emit.
+
+Do NOT run \`git commit\` or \`git add\` — the caller commits. Do not add dependencies, do not
+reformat unrelated code, and do not act on anything that is not in the list above.
+
+OUTPUT — emit these machine-readable lines LAST, one per finding above, each on its own line:
+  ESCFINDING: FIXED | <file:line-or-area> | <what you changed and why it is correct>
+  ESCFINDING: DISMISSED | <file:line-or-area> | <the specific evidence that the finding is not real>
+  ESCFINDING: DECISION | <product|data-migration|ownership> | <file:line-or-area> | <the choice a person must make, and the options>
+  ESCFINDING: UNRESOLVED | <file:line-or-area> | <what blocks a safe fix, and what would unblock it>
+Emit a line for EVERY finding listed above. A finding you do not mention is counted as UNRESOLVED.
+EOF
+}
+
+# Re-run the CORRECTNESS phases over whatever the escalation pass just changed, so an escalation fix
+# cannot ship unreviewed. Phase statuses are folded MONOTONICALLY (a re-run may raise ERROR/RISKY but
+# never lowers one): clearing a RISKY finding is the escalation verdict's job in compute_verdict, not
+# a re-review's. /simplify is deliberately not re-run — it is a taste pass, not a correctness one.
+escalation_recheck() {
+  echo ">>> escalation re-check — re-running the correctness phases over the escalation fix"
+  run_review_phase "review (post-escalation)" "chore(review): post-escalation review"
+  case "$REVIEW_STATUS" in
+    ERROR) CR_STATUS="ERROR";;
+    RISKY) [ "$CR_STATUS" = "ERROR" ] || CR_STATUS="RISKY";;
+  esac
+  _note_cr_findings
+  if [ "${CODEX_ACTIVE:-0}" -eq 1 ] && [ -n "${CODEX_CAP:-}" ]; then
+    RUN_CLAUDE_CAPTURE="$CODEX_CAP"
+    run_fix_phase "codex-review (post-escalation)" "$CODEX_PROMPT" "chore(review): post-escalation codex" \
+                  "codex recheck of the escalation fix" "run_codex"
+    RUN_CLAUDE_CAPTURE=""
+    [ "$PHASE_STATUS" = "ERROR" ] && CODEX_STATUS="ERROR"
+    [ "$PHASE_CHANGED" -eq 1 ] && CODEX_CHANGED=1
+  fi
+  if [ "${SEC_STATUS:-SKIPPED}" != "SKIPPED" ]; then
+    local sec_prev_findings="$SEC_FINDINGS" sec_prev_status="$SEC_STATUS"
+    run_security_phase
+    # Merge, never replace: the re-run must not DROP a finding the first run surfaced (both the
+    # summary and the verdict read this list), and must not downgrade the status.
+    SEC_FINDINGS="$(printf '%s\n%s\n' "$sec_prev_findings" "$SEC_FINDINGS" \
+                    | grep -v '^[[:space:]]*$' | sort -u || true)"
+    case "$sec_prev_status" in
+      ERROR) SEC_STATUS="ERROR";;
+      RISKY) [ "$SEC_STATUS" = "ERROR" ] || SEC_STATUS="RISKY";;
+    esac
+  fi
+  return 0
+}
+
+_esc_count() { printf '%s\n' "${ESC_FINDINGS:-}" | grep -aciE "^ESCFINDING:[[:space:]]*$1([[:space:]]|\|)" || true; }
+
+# Sets globals: ESC_STATUS (SKIPPED|RESOLVED|DECISION|UNRESOLVED|MIXED|ERROR), ESC_REASON,
+# ESC_ATTEMPTS, ESC_CHANGED (0|1), ESC_FINDINGS (the surfaced ESCFINDING lines).
+run_escalation_phase() {
+  ESC_STATUS="SKIPPED"; ESC_REASON=""; ESC_ATTEMPTS=0; ESC_CHANGED=0; ESC_FINDINGS=""; ESC_SEEN=""
+  local risky new attempt lines changed n leftover bound="" decision=0 unresolved=0 err=0
+
+  risky="$(collect_risky_findings)"
+  if [ -z "$risky" ]; then
+    ESC_REASON="no RISKY finding to escalate"
+    echo ">>> escalation pass: not needed — $ESC_REASON"
+    return 0
+  fi
+  if [ "$escalation_attempts" -eq 0 ]; then
+    ESC_REASON="--escalation-attempts 0 (disabled) — RISKY finding(s) reported as-is"
+    echo ">>> escalation pass: SKIPPED — $ESC_REASON"
+    return 0
+  fi
+
+  for ((attempt = 1; attempt <= escalation_attempts; attempt++)); do
+    # Recomputed each attempt: a re-check may have raised NEW risky findings, and only those are
+    # handed to the next attempt — re-sending a finding an attempt already answered would just buy
+    # the same answer again.
+    new="$(_esc_new "$(collect_risky_findings)")"
+    [ -n "$new" ] || break
+    _esc_mark_seen "$new"
+    ESC_ATTEMPTS="$attempt"
+    n="$(printf '%s\n' "$new" | wc -l | tr -d ' ')"
+    echo ">>> escalation: attempt $attempt/$escalation_attempts — $n RISKY finding(s) handed to a fresh, better-resourced pass"
+    printf '%s\n' "$new" | sed 's/^/    > /'
+    ESC_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-esc.XXXXXX" 2>/dev/null)" \
+      || { err=1; echo "    escalation: could not create temp capture file"; break; }
+    : > "$ESC_CAP"
+    RUN_CLAUDE_CAPTURE="$ESC_CAP"
+    # cap 1: one agent pass per attempt. The attempt LOOP is the bound; run_fix_phase is reused only
+    # for its digest/commit machinery, exactly as the review apply pass does.
+    run_fix_phase "escalation" "$(build_escalation_prompt "$new")" "chore(review): escalation fix" \
+                  "fix the RISKY findings, or justify concretely why they cannot be fixed" run_claude 1
+    RUN_CLAUDE_CAPTURE=""
+    changed="$PHASE_CHANGED"
+    [ "$PHASE_STATUS" = "ERROR" ] && err=1
+    # Same template guard as parse_findings: the contract lines above all carry the literal
+    # <file:line-or-area> placeholder, so a pass that echoes its instructions back cannot become a
+    # phantom verdict.
+    lines="$(grep -aoiE 'ESCFINDING:.*' "$ESC_CAP" 2>/dev/null | grep -vF '<file:line-or-area>' | sort -u || true)"
+    rm -f "$ESC_CAP" 2>/dev/null || true; ESC_CAP=""
+    if [ -n "$lines" ]; then
+      ESC_FINDINGS="${ESC_FINDINGS:+$ESC_FINDINGS$LF}$lines"
+      grep -aqiE '^ESCFINDING:[[:space:]]*DECISION([[:space:]]|\|)' <<<"$lines" && decision=1
+      grep -aqiE '^ESCFINDING:[[:space:]]*UNRESOLVED([[:space:]]|\|)' <<<"$lines" && unresolved=1
+      # The contract is one verdict line per finding handed over. Fewer lines than findings means at
+      # least one finding was never answered for — which the prompt says counts as UNRESOLVED. Do not
+      # let a partial answer read as a full one; that is the same laundering the empty case prevents.
+      if [ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" -lt "$n" ]; then
+        echo "    escalation: attempt $attempt answered for fewer findings than it was given — counting the rest as UNRESOLVED"
+        unresolved=1
+      fi
+    else
+      echo "    escalation: attempt $attempt emitted no ESCFINDING line — counting its findings as UNRESOLVED"
+      unresolved=1
+    fi
+    [ "$err" -eq 1 ] && break
+    if [ "$changed" -eq 1 ]; then
+      ESC_CHANGED=1
+      escalation_recheck
+    else
+      # Nothing changed ⇒ there is no new code to re-review, and a second pass over the same findings
+      # would only repeat this one. End the phase rather than pay for that.
+      echo "    escalation: attempt $attempt changed no code — nothing to re-review, ending the phase"
+      break
+    fi
+  done
+
+  if [ "$err" -eq 1 ]; then
+    ESC_STATUS="ERROR"; ESC_REASON="the escalation pass itself did not complete"
+    echo "    escalation: ERROR — $ESC_REASON"
+    return 0
+  fi
+  # Still-RISKY findings that no attempt ever got to = the attempt bound ran out. Those are UNRESOLVED
+  # by definition: nothing has answered for them.
+  leftover="$(_esc_new "$(collect_risky_findings)")"
+  if [ -n "$leftover" ]; then
+    unresolved=1; bound=" (attempt bound exhausted)"
+    echo "    escalation: $(printf '%s\n' "$leftover" | wc -l | tr -d ' ') RISKY finding(s) never reached an attempt — the bound (--escalation-attempts $escalation_attempts) is exhausted"
+  fi
+  if [ "$unresolved" -eq 1 ] && [ "$decision" -eq 1 ]; then ESC_STATUS="MIXED"
+  elif [ "$unresolved" -eq 1 ]; then ESC_STATUS="UNRESOLVED"
+  elif [ "$decision" -eq 1 ]; then ESC_STATUS="DECISION"
+  else ESC_STATUS="RESOLVED"
+  fi
+  ESC_REASON="$ESC_ATTEMPTS/$escalation_attempts attempt(s); fixed=$(_esc_count FIXED) dismissed=$(_esc_count DISMISSED) decision=$(_esc_count DECISION) unresolved=$(_esc_count UNRESOLVED)$bound"
+  echo "    escalation: $ESC_STATUS — $ESC_REASON"
+  return 0
 }
 
 # --- drive the phases -------------------------------------------------------------------------
 echo "== $prog =="
 codex_disp="$codex"; [ "$codex" = "on" ] && codex_disp="on ($codex_model)"
-echo "dir=$dir  base=$base_short  max-rounds=$max_rounds  security=$security  codex=$codex_disp"
-echo "code-review: $cr_display"
+echo "dir=$dir  base=$base_short  max-rounds=$max_rounds  security=$security  codex=$codex_disp  escalation-attempts=$escalation_attempts"
+echo "review: $cr_display"
 echo
 
 # Init all codex/reconcile globals up front so `set -u` is happy on every path (e.g. codex disabled).
@@ -1457,23 +1805,26 @@ CODEX_CAP=""; CODEX_PROMPT=""   # CODEX_PROMPT: the codex driver prompt, built o
 CODEX_STATUS="SKIPPED"; CODEX_REASON="--no-codex (disabled)"; CODEX_ROUNDS=0
 CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 
-# Belt against a temp-file leak: the code-review/security/codex phases mktemp capture files that they
+# Belt against a temp-file leak: the review/security/codex phases mktemp capture files that they
 # rm on the normal path, but an unexpected error under `set -e` (or a Ctrl-C) between mktemp and that
 # rm would otherwise strand them in TMPDIR. An EXIT trap removes them regardless of how we leave. All
 # three vars are initialized before any phase can create a file, so `set -u` is satisfied when it fires.
-SEC_CAP=""; CR_CAP=""
+SEC_CAP=""; CR_CAP=""; ESC_CAP=""
+# The escalation phase's own result globals, likewise initialized before anything can read them
+# (compute_verdict reads ESC_STATUS on every path, including runs where escalation never ran).
+ESC_STATUS="SKIPPED"; ESC_REASON=""; ESC_ATTEMPTS=0; ESC_CHANGED=0; ESC_FINDINGS=""
 # Also lists REVIEW_LOOP_SNAPSHOT_FILE (the self-snapshot, see the edit-while-running block near the
 # top) and $review_loop_marker (our admission-budget marker, see the admission gate): this trap
 # REPLACES both the early snapshot-cleanup trap and the gate's marker-cleanup trap, so it must carry
 # BOTH — otherwise a marker/snapshot would leak past this point.
-trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "${CODEX_SCAN:-}" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" "${review_loop_marker:-}" 2>/dev/null || true' EXIT
+trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "$ESC_CAP" "${CODEX_SCAN:-}" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" "${review_loop_marker:-}" 2>/dev/null || true' EXIT
 
-# Accumulates the code-review findings across the initial phase AND any reconcile / post-security
+# Accumulates the review findings across the initial phase AND any reconcile / post-security
 # pass, so a finding raised late still reaches the summary.
 CR_FINDINGS=""
 _note_cr_findings() { [ -n "$REVIEW_FINDINGS" ] && CR_FINDINGS="${CR_FINDINGS:+$CR_FINDINGS$'\n'}$REVIEW_FINDINGS"; return 0; }
 
-run_review_phase "code-review" "chore(review): code-review fixes"
+run_review_phase "review" "chore(review): review fixes"
 CR_STATUS="$REVIEW_STATUS"; CR_PASSES="$REVIEW_PASSES"; CR_CHANGED="$REVIEW_CHANGED"
 _note_cr_findings
 echo
@@ -1493,9 +1844,9 @@ run_security_phase
 echo
 
 # --- gated final convergence ------------------------------------------------------------------
-# Runs ONLY if a phase AFTER the initial /code-review applied changes — simplify, codex, or security
+# Runs ONLY if a phase AFTER the initial review phase applied changes — simplify, codex, or security
 # — otherwise the tree is already blessed by a correctness pass and there is nothing to re-check.
-# (simplify is included because it reworks code AFTER the code-review pass and only shrinks the
+# (simplify is included because it reworks code AFTER the review pass and only shrinks the
 # surface; a correctness regression it introduces would otherwise ship un-reviewed whenever codex and
 # security both change nothing, e.g. under --no-codex with a clean security run.)
 #   * Codex active  → a bounded Claude<->Codex RECONCILIATION: alternate a Claude review pass (report
@@ -1522,7 +1873,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
-      run_review_phase "code-review (reconcile)" "chore(review): reconcile code-review"
+      run_review_phase "review (reconcile)" "chore(review): reconcile review"
       FCR_RAN=1; [ "$REVIEW_CHANGED" -eq 1 ] && FCR_CHANGED=1
       c_changed="$REVIEW_CHANGED"; _recon_note "$REVIEW_STATUS"; _note_cr_findings
 
@@ -1562,16 +1913,24 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
       fi
     done
   else
-    echo ">>> final code-review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
-    run_review_phase "code-review (post-security)" "chore(review): post-security code-review"
+    echo ">>> final review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
+    run_review_phase "review (post-security)" "chore(review): post-security review"
     FCR_RAN=1; FCR_PASSES="$REVIEW_PASSES"; FCR_CHANGED="$REVIEW_CHANGED"; RECONCILE_STATUS="$REVIEW_STATUS"
     _note_cr_findings
   fi
 else
-  echo ">>> final convergence pass — skipped (nothing changed after the initial code-review)"
+  echo ">>> final convergence pass — skipped (nothing changed after the initial review)"
 fi
-# Parse codex findings from the whole run (main phase + reconcile rechecks) and overlay a RISKY
-# escalation onto CODEX_STATUS if codex left anything unapplied.
+echo
+
+# Escalation runs LAST of the working phases, so it sees every RISKY finding the run produced —
+# including any the reconciliation raised. It is deliberately BEFORE finalize_codex_findings: that
+# call consumes (and deletes) the codex capture, and escalation both reads risky codex findings out
+# of it and appends its own post-escalation codex recheck to it.
+run_escalation_phase
+echo
+# Parse codex findings from the whole run (main phase + reconcile rechecks + any escalation recheck)
+# and overlay a RISKY escalation onto CODEX_STATUS if codex left anything unapplied.
 finalize_codex_findings
 echo
 
@@ -1587,9 +1946,9 @@ status_disp() {
   esac
 }
 echo "== summary =="
-printf '  code-review : passes=%s changed=%s status=%s (%s)\n' "$CR_PASSES" "$(yn "$CR_CHANGED")" "$CR_STATUS" "$cr_display"
+printf '  review      : passes=%s changed=%s status=%s (%s)\n' "$CR_PASSES" "$(yn "$CR_CHANGED")" "$CR_STATUS" "$cr_display"
 if [ -n "$CR_FINDINGS" ]; then
-  echo "  code-review findings (surfaced — APPLIED/DISMISSED included; RISKY ones need a human):"
+  echo "  review findings (surfaced — APPLIED/DISMISSED included; RISKY ones go to the escalation pass):"
   printf '%s\n' "$CR_FINDINGS" | sort -u | sed 's/^/    - /'
 fi
 printf '  simplify    : rounds=%s/%s changed=%s status=%s\n' "$SI_ROUNDS" "$simplify_rounds" "$(yn "$SI_CHANGED")" "$(status_disp "$SI_STATUS")"
@@ -1601,12 +1960,12 @@ else
   printf '  codex       : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$(status_disp "$CODEX_STATUS")" "$CODEX_REASON"
 fi
 if [ -n "$CODEX_FINDINGS" ]; then
-  echo "  codex findings (surfaced — auto-fixed ones included; RISKY ones need a human):"
+  echo "  codex findings (surfaced — auto-fixed ones included; RISKY ones go to the escalation pass):"
   printf '%s\n' "$CODEX_FINDINGS" | sed 's/^/    - /'
 fi
 printf '  security    : rounds=%s changed=%s status=%s (%s)\n' "$SEC_ROUNDS" "$(yn "$SEC_CHANGED")" "$(status_disp "$SEC_STATUS")" "$SEC_REASON"
 if [ -n "$SEC_FINDINGS" ]; then
-  echo "  security findings (surfaced — auto-fixed ones included; RISKY ones need a human):"
+  echo "  security findings (surfaced — auto-fixed ones included; RISKY ones go to the escalation pass):"
   printf '%s\n' "$SEC_FINDINGS" | sed 's/^/    - /'
 fi
 if [ "$FCC_RAN" -eq 1 ]; then   # FCC_RAN=1 only on the reconcile path (implies FCR_RAN=1)
@@ -1615,7 +1974,17 @@ if [ "$FCC_RAN" -eq 1 ]; then   # FCC_RAN=1 only on the reconcile path (implies 
 elif [ "$FCR_RAN" -eq 1 ]; then
   printf '  final-review: passes=%s changed=%s status=%s (ran: code changed after review)\n' "$FCR_PASSES" "$(yn "$FCR_CHANGED")" "$(status_disp "$RECONCILE_STATUS")"
 else
-  printf '  final-recon : skipped (no code changed after the initial code-review)\n'
+  printf '  final-recon : skipped (no code changed after the initial review)\n'
+fi
+if [ "$ESC_STATUS" = "SKIPPED" ]; then
+  printf '  escalation  : not run (%s)\n' "${ESC_REASON:-no RISKY finding to escalate}"
+else
+  printf '  escalation  : attempts=%s changed=%s status=%s (%s)\n' \
+    "$ESC_ATTEMPTS" "$(yn "$ESC_CHANGED")" "$ESC_STATUS" "$ESC_REASON"
+fi
+if [ -n "$ESC_FINDINGS" ]; then
+  echo "  escalation outcomes (one per RISKY finding it was given):"
+  printf '%s\n' "$ESC_FINDINGS" | sort -u | sed 's/^/    - /'
 fi
 
 # The rule itself lives in compute_verdict (see the VERDICT MODEL section near the top, which is
@@ -1629,12 +1998,14 @@ echo
 case "$VERDICT" in
   CLEAN)
     if [ "$CODEX_ACTIVE" -eq 1 ]; then
-      echo "review-loop: CLEAN — no RISKY finding, no security finding, no phase error (Claude+Codex)."
+      echo "review-loop: CLEAN — no unresolved RISKY finding, no security finding, no phase error (Claude+Codex)."
     else
-      echo "review-loop: CLEAN — no RISKY finding, no security finding, no phase error."
+      echo "review-loop: CLEAN — no unresolved RISKY finding, no security finding, no phase error."
     fi;;
-  NEEDS-HUMAN)
-    echo "review-loop: NEEDS-HUMAN — WHY: $VERDICT_WHY";;
+  NEEDS-AI)
+    echo "review-loop: NEEDS-AI — FOREMAN's move, not a human's: another AI pass is what this needs. WHY: $VERDICT_WHY";;
+  NEEDS-DECISION)
+    echo "review-loop: NEEDS-DECISION — a PERSON has to choose; no amount of AI effort settles this. WHY: $VERDICT_WHY";;
   FAILED)
     echo "review-loop: FAILED — the gate did not complete, so this is NOT an approval. WHY: $VERDICT_WHY";;
 esac
