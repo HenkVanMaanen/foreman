@@ -18,7 +18,8 @@
 #             codex exec --skip-git-repo-check --color never -s danger-full-access \
 #                 -o <last-message> - < <brief> > <log> 2>&1
 #           The brief goes over STDIN (`-`), never as an argv string: briefs are long and full of
-#           quotes and newlines. FOREMAN_CODEX_MODEL pins the model (unset ⇒ codex's own default).
+#           quotes and newlines. FOREMAN_CODEX_MODEL pins the model and FOREMAN_CODEX_EFFORT the
+#           reasoning effort (each unset ⇒ codex's own default).
 # Everything OUTSIDE the engine is identical for both: same log path, same `WORKER_EXIT=` marker,
 # same `<name>.done` / `<name>.result.json` / `workers.jsonl` contract, same concurrency cap and
 # `--force`, so `worker-status` and the supervisor's done-marker poll do not know or care which
@@ -126,6 +127,10 @@ worker_run_cmd() {
   local eng="$1" qb="$2" ql="$3" qlast="$4"
   local model="${FOREMAN_CODEX_MODEL:-}" marg=""
   [ -n "$model" ] && marg=" -m $(printf '%q' "$model")"
+  # FOREMAN_CODEX_EFFORT pins codex's reasoning effort (unset ⇒ codex's own default). It is a
+  # config override rather than a flag, so it goes through -c like any other config key.
+  local effort="${FOREMAN_CODEX_EFFORT:-}"
+  [ -n "$effort" ] && marg="$marg -c model_reasoning_effort=$(printf '%q' "$effort")"
   case "$eng" in
     claude)
       printf 'claude -p --dangerously-skip-permissions "$(cat %s)" > %s 2>&1\n' "$qb" "$ql";;
