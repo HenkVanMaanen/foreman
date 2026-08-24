@@ -1637,8 +1637,8 @@ run_crosscheck_phase() {
   CODEX_ACTIVE=1
   echo ">>> $crosscheck_engine review-and-fix loop: $CODEX_REASON"
 
-  # Build the (static, scope-only) driver prompt ONCE here and reuse it for every codex round in
-  # this phase AND every reconcile recheck, instead of re-forking the heredoc via $(...) each time.
+  # Build the (static, scope-only) driver prompt ONCE here and reuse it for every cross-check round
+  # and reconcile recheck, instead of re-forking the heredoc via $(...) each time.
   CODEX_PROMPT="$(build_codex_prompt)"
   CODEX_CAP="$(mktemp "${TMPDIR:-/tmp}/review-loop-codex.XXXXXX" 2>/dev/null)" \
     || { CODEX_STATUS="ERROR"; CODEX_REASON="could not create temp capture file"; CODEX_ACTIVE=0; return 0; }
@@ -1656,7 +1656,7 @@ run_crosscheck_phase() {
   # RISKY finding — that is a fact about this machine, not about the code, and dressing it up as a
   # review result is what hid the breakage for three consecutive runs. So: drop the capture (nothing
   # in it is a review), and mark codex INACTIVE so the joint reconciliation below degrades to the
-  # Claude-only path rather than alternating with a reviewer that cannot start.
+  # primary-only path rather than alternating with a reviewer that cannot start.
   # run_fix_phase owns the one two-signal confirmation. A missing CROSS-CHECK is informational — it
   # must never become WHY — while a primary Codex phase that cannot run is a real gate ERROR.
   if [ "$crosscheck_engine" = "codex" ] && [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ]; then
@@ -1676,9 +1676,9 @@ run_crosscheck_phase() {
   return 0
 }
 
-# Parse the accumulated codex capture (main phase + any reconcile rechecks) into surfaced findings +
+# Parse the accumulated cross-check capture (main phase + reconcile rechecks) into surfaced findings +
 # the risky-escalation flag, overlay RISKY onto a CLEAN convergence verdict, then remove the capture.
-# Safe to call when codex was inactive (CODEX_CAP empty) — it just no-ops.
+# Safe to call when the cross-check was inactive (CODEX_CAP empty) — it just no-ops.
 finalize_codex_findings() {
   [ -n "${CODEX_CAP:-}" ] && [ -f "$CODEX_CAP" ] || return 0
   local CODEX_RISKY=0
