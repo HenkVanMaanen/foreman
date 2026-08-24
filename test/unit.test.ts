@@ -3,6 +3,7 @@
 // not exercise directly: token accounting, stdin framing, CLI arg parsing, the dashboard's
 // status heuristic, and the secret-name guard.
 import { describe, expect, test } from "bun:test";
+import { parseReloginEngine } from "../src/config.ts";
 import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
 import {
@@ -25,6 +26,7 @@ import { interruptMessage, promptTokens, usageTotal, userMessage } from "../src/
 import {
   DEVICE_CODE_RE,
   detectAuthRequired,
+  detectCodexAuthRequired,
   extractDeviceCode,
   extractUrl,
   makeAuthDetector,
@@ -108,6 +110,17 @@ describe("parseRun", () => {
 
   test("no -- separator yields no command", () => {
     expect(parseRun(["--secret", "A"])).toEqual({ names: ["A"], command: [] });
+  });
+});
+
+describe("parseReloginEngine", () => {
+  test("accepts the two supported engines", () => {
+    expect(parseReloginEngine("claude")).toBe("claude");
+    expect(parseReloginEngine("codex")).toBe("codex");
+  });
+
+  test("rejects an unknown engine instead of falling back to the wrong credential", () => {
+    expect(() => parseReloginEngine("gemini")).toThrow("unknown FOREMAN_RELOGIN_ENGINE 'gemini'");
   });
 });
 
@@ -465,6 +478,60 @@ describe("detectAuthRequired", () => {
   });
 });
 
+describe("detectCodexAuthRequired", () => {
+  const failed = (message: string) =>
+    ev("turn.failed", { error: { message } }) as unknown as StreamEvent;
+
+  test("the revoked-refresh-token terminal failure is the signal", () => {
+    expect(
+      detectCodexAuthRequired(
+        failed(
+          "Your access token could not be refreshed because your refresh token was revoked. " +
+            "Please log out and sign in again.",
+        ),
+      ),
+    ).toContain("refresh token was revoked");
+  });
+
+  test("the ChatGPT responses WebSocket 401 terminal failure is the signal", () => {
+    expect(
+      detectCodexAuthRequired(
+        failed(
+          "failed to connect to websocket: HTTP error: 401 Unauthorized, " +
+            "url: wss://chatgpt.com/backend-api/codex/responses",
+        ),
+      ),
+    ).toContain("401 Unauthorized");
+  });
+
+  test("an ordinary failed codex turn is NOT an auth failure", () => {
+    expect(detectCodexAuthRequired(failed("Tool use failed: ENOENT"))).toBeUndefined();
+  });
+
+  test("agent output quoting codex's exact auth errors does NOT trigger", () => {
+    const quote =
+      "Your access token could not be refreshed because your refresh token was revoked.";
+    expect(
+      detectCodexAuthRequired(
+        ev("item.completed", {
+          item: { type: "agent_message", text: quote },
+        }) as unknown as StreamEvent,
+      ),
+    ).toBeUndefined();
+  });
+
+  test("a prefixed log quotation on a failed turn does NOT pass the line anchor", () => {
+    expect(
+      detectCodexAuthRequired(
+        failed(
+          "worker output: Your access token could not be refreshed because your refresh token " +
+            "was revoked.",
+        ),
+      ),
+    ).toBeUndefined();
+  });
+});
+
 describe("makeAuthDetector", () => {
   const healthy = ev("result", { is_error: false });
 
@@ -476,6 +543,16 @@ describe("makeAuthDetector", () => {
 
   test("without the flag it is a pass-through", () => {
     expect(makeAuthDetector(false)(healthy)).toBeUndefined();
+  });
+
+  test("engine selection dispatches codex failures only to the codex detector", () => {
+    const codexFailure = ev("turn.failed", {
+      error: {
+        message: "Your access token could not be refreshed because your refresh token was revoked.",
+      },
+    }) as unknown as StreamEvent;
+    expect(makeAuthDetector(false, "codex")(codexFailure)).toBeTruthy();
+    expect(makeAuthDetector(false, "claude")(codexFailure)).toBeUndefined();
   });
 });
 

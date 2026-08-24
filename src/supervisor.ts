@@ -222,12 +222,12 @@ export async function supervise(cfg: Config): Promise<void> {
     refresh,
   });
 
-  // Re-login relay: an expired OAuth token makes every turn fail instantly with a synthetic
-  // "Not logged in · Please run /login" frame, which the loop would otherwise `continue` into
-  // forever with the model never running. Detect it, tear the session down, and hand off to the
-  // Telegram-mediated re-auth below. ONE detector for the whole run: the FOREMAN_FAKE_AUTH_REQUIRED
-  // test injection is one-shot per instance, so a per-life detector would re-inject every life.
-  const authDetector = makeAuthDetector(cfg.fakeAuthRequired);
+  // Re-login relay: a dead OAuth token makes every turn fail instantly, which the loop would
+  // otherwise continue into forever with the model never running. The engine selector chooses the
+  // CLI-specific, tightly-pinned signal and the matching recovery flow together. ONE detector for
+  // the whole run: FOREMAN_FAKE_AUTH_REQUIRED is one-shot per instance, so a per-life detector
+  // would re-inject every life.
+  const authDetector = makeAuthDetector(cfg.fakeAuthRequired, cfg.reloginEngine);
   // Owns the rest of the policy (enabled?, hot-loop breaker, which agent to re-auth) — see
   // makeAuthRecovery. Built once: the breaker's state has to span lives to spot a hot loop.
   const recoverAuth = makeAuthRecovery(cfg);

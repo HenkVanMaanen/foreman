@@ -5,10 +5,14 @@
 export interface Config {
   claudeBin: string;
   claudeExtraArgs: string[];
-  // codex CLI, used only by the re-login relay (src/relogin.ts) to re-auth the second model.
+  // codex CLI, used by the codex re-login relay (src/relogin.ts).
   codexBin: string;
-  // When claude's OAuth dies the model can't ask for help, so the supervisor relays the sign-in
-  // over the human channel itself. 0 disables (the loop then just exits for the keeper).
+  // Which CLI's auth failure the supervisor detects and recovers. This is deliberately separate
+  // from the not-yet-migrated Session engine: stage 3 can rehearse codex recovery without claiming
+  // the main loop itself already runs codex. Keep it aligned with that engine once it exists.
+  reloginEngine: "claude" | "codex";
+  // When the selected CLI's OAuth dies the model can't ask for help, so the supervisor relays the
+  // sign-in over the human channel itself. 0 disables (the loop exits for the keeper).
   reloginEnabled: boolean;
   // Test seam: report the first stream frame of the run as an auth failure, so the whole relay
   // can be rehearsed end to end without logging anyone out. One-shot per run.
@@ -66,12 +70,19 @@ function str(name: string, fallback: string): string {
   return v === undefined || v === "" ? fallback : v;
 }
 
+/** Fail closed on a typo: an unknown engine must never silently fall back to the wrong account. */
+export function parseReloginEngine(value: string): "claude" | "codex" {
+  if (value === "claude" || value === "codex") return value;
+  throw new Error(`unknown FOREMAN_RELOGIN_ENGINE '${value}' (expected: claude|codex)`);
+}
+
 export function loadConfig(): Config {
   const stateDir = str("FOREMAN_STATE_DIR", "state");
   return {
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
     codexBin: str("FOREMAN_CODEX_BIN", "codex"),
+    reloginEngine: parseReloginEngine(str("FOREMAN_RELOGIN_ENGINE", "claude")),
     reloginEnabled: str("FOREMAN_RELOGIN", "1") !== "0",
     fakeAuthRequired: str("FOREMAN_FAKE_AUTH_REQUIRED", "0") === "1",
     skipPermissions: str("FOREMAN_SKIP_PERMISSIONS", "1") !== "0",
