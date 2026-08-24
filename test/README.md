@@ -7,9 +7,25 @@ bun install          # dev deps (types)
 npm test             # unit tests (bun test) + lifecycle (bash test/run-lifecycle.sh)
 ```
 
-`npm test` runs four layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers
-`*.test.ts`), the lifecycle suite below, then `wait-reply-inbox.sh` and
-`review-loop-verdict.sh`.
+`npm test` runs five layers: `unit.test.ts` (pure helpers — `bun test` auto-discovers
+`*.test.ts`), the lifecycle suite below, then `wait-reply-inbox.sh`,
+`review-loop-verdict.sh` and `spawn-worker-engine.sh`.
+
+## spawn-worker engine test
+
+`spawn-worker-engine.sh` covers `FOREMAN_WORKER_ENGINE` (`claude`, the default, vs `codex`). It
+extracts `worker_run_cmd` and `codex_did_not_run` verbatim from
+`examples/agent-bin/spawn-worker.sh`, then drives the real spawn-worker against PATH-shim
+`claude`/`codex` binaries in a throwaway `FOREMAN_STATE_DIR` (no agent, no network, no token spend).
+
+It locks: `claude` stays the default and its command line stays byte-identical; the `codex` line
+passes the brief on **stdin** (never as an argv string) and always carries `-s danger-full-access`
+(bubblewrap cannot start in this container); an unknown engine is refused before anything spawns;
+and — the one that matters — a **bubblewrap startup failure is reported as a FAILURE**
+(`WORKER_EXIT=86`, `result.json` status `blocked`) even though `codex exec` exits 0 and the model
+still claims the work is done, while the same error text merely *quoted* by a worker that really ran
+does not false-trigger. Both engines are asserted against the identical log / `WORKER_EXIT` /
+`<name>.done` / `<name>.result.json` / `workers.jsonl` contract that `worker-status` reads.
 
 ## review-loop verdict + codex-sandbox test
 
