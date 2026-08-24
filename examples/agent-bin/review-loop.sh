@@ -6,9 +6,12 @@
 # behind the worker "definition of done": a worker does NOT mark itself done until review-loop
 # reports CLEAN (or surfaces a security issue / non-convergence for a human).
 #
-# Phases run IN ORDER on the git repo at DIR. The order is deliberate and confirmed optimal: fix
-# correctness first, shrink the surface second, and let security have the final word over the exact
-# code that ships.
+# Phases run IN ORDER on the git repo at DIR. FOREMAN_REVIEW_ENGINE selects the phase engine
+# (`claude` by default; `codex` is opt-in). The independent cross-check ALWAYS uses the opposite
+# engine: Claude phases are checked by Codex, and Codex phases are checked by Claude. Keeping those
+# roles opposite is deliberate — pointing both at the same engine destroys the second opinion this
+# gate exists to provide. The order is deliberate and confirmed optimal: fix correctness first,
+# shrink the surface second, and let security have the final word over the exact code that ships.
 #   1. review            — TWO fixed passes, not a loop. Pass 1 REPORTS via the built-in `/review
 #                          <PR>` (the open GitHub PR found via gh; a diff-scoped review prompt when
 #                          there is none), pass 2 APPLIES the findings it is confident about and
@@ -26,15 +29,16 @@
 #                          always find one more thing to tidy, so extra rounds buy churn, not
 #                          quality. Six rounds of it is most of why a 20-line change took two hours.
 #                          Round 1 does the substantive shrinking; round 2 cleans up after round 1.
-#   2.5 codex review loop — conditional (see --codex, DEFAULT ON). An INDEPENDENT second model
-#                          (OpenAI Codex, default gpt-5.6-sol) reviews the diff vs --base for
+#   2.5 cross-check loop  — conditional (see --codex, DEFAULT ON; the flag name is historical). An
+#                          INDEPENDENT second model, always the OPPOSITE phase engine, reviews the
+#                          diff vs --base for
 #                          correctness bugs + clear simplifications and AUTO-FIXES the ones it is
 #                          confident about, driven through the SAME digest/run_fix_phase machinery
 #                          and the SAME round cap as the Claude phases. Findings it judges risky /
 #                          uncertain are left UNAPPLIED and escalated (same channel as security).
-#                          If codex is not installed or not logged in, the phase WARNs and SKIPs —
-#                          the loop degrades gracefully to Claude-only, never hard-failing. If codex
-#                          IS present but its sandbox cannot start (see run_codex), the phase reports
+#                          If the opposite CLI is unavailable, the phase WARNs and SKIPs — a missing
+#                          cross-check is informational, never a finding about the code. If Codex is
+#                          selected but its sandbox cannot start (see run_codex), the phase reports
 #                          DID-NOT-RUN loudly and its output is discarded rather than parsed into
 #                          findings: a missing second opinion is not a review result.
 #   3. security fix loop — conditional (see --security), and it AUTO-FIXES. Each round runs a
@@ -48,15 +52,14 @@
 #                          UNAPPLIED and flagged (→ human escalation). EVERY finding — auto-fixed or
 #                          not — is surfaced in the summary; they are not hidden just because a fix
 #                          was applied.
-#   4. final convergence — GATED: runs ONLY if the simplify, codex, or security phase applied changes
-#                          (there is code that a later reviewer has not re-blessed). When Codex is active it
-#                          is a bounded Claude<->Codex RECONCILIATION loop: it alternates a Claude
-#                          review pass (phase 1's report+apply pair) and a Codex recheck and stops
-#                          only when a full alternation applies nothing on BOTH — so a Codex fix
-#                          Claude would flag, and a Claude fix Codex would flag, are both caught. The
-#                          alternation is capped at --max-rounds cycles. When Codex is inactive it
-#                          degrades to a single gated Claude review pass (catch a bug a security fix
-#                          introduced). Skipped when nothing changed after the codex phase.
+#   4. final convergence — GATED: runs ONLY if the simplify, cross-check, or security phase applied
+#                          changes (there is code that a later reviewer has not re-blessed). With a
+#                          cross-checker it is a bounded primary<->cross-check RECONCILIATION loop:
+#                          alternate the phase engine's review pass (phase 1's report+apply pair)
+#                          and the opposite engine's recheck, stopping only when a full alternation
+#                          applies nothing on BOTH. The alternation is capped at --max-rounds cycles.
+#                          Without a cross-checker it degrades to a single gated primary-engine
+#                          review pass. Skipped when nothing changed after the cross-check phase.
 #   5. escalation pass   — conditional (see --escalation-attempts, DEFAULT 2). Runs LAST, and ONLY
 #                          when some phase left a finding UNAPPLIED as RISKY — running it last is
 #                          what lets it see every RISKY finding the run produced, including ones the
@@ -97,11 +100,16 @@
 # origin/main: for a branch STACKED on another not-yet-merged branch, the merge-base with
 # origin/main sits BELOW the parent branch, so the parent's commits leak into the review scope.
 #
-# --codex / --no-codex:
-#   on   — (default) run the Codex independent-reviewer phase and the joint reconciliation. If the
-#          codex CLI is missing or not logged in, the phase WARNs and SKIPs (Claude-only fallback).
-#   off  — never run Codex; behaves exactly like the pre-Codex review-loop.
-# --codex-model MODEL: the Codex model to use (default gpt-5.6-sol).
+# --codex / --no-codex: historical names for enabling/disabling the independent cross-check and
+#   joint reconciliation (default on). The cross-checker is Codex for Claude phases and Claude for
+#   Codex phases. A missing cross-checker warns and skips without changing the verdict.
+# --codex-model MODEL: the Codex model to use wherever Codex is selected (default gpt-5.6-sol).
+#
+# FOREMAN_REVIEW_ENGINE (default claude): selects the engine for review, simplify, security and
+# escalation. `codex` maps every phase to a scoped `codex exec` prompt; native `codex review` cannot
+# take both `--base` and the custom prompt that preserves REVIEWFINDING markers (see the task notes).
+# Every Codex call goes through run_codex so the danger-full-access and did-not-run safeguards have
+# one implementation. Unknown values are rejected before repository work begins.
 #
 # --escalation-attempts N (default 2, 0 disables): how many times the escalation pass may be handed
 #   a batch of RISKY findings. The bound is small ON PURPOSE. Each attempt is a full agent pass plus
@@ -142,7 +150,7 @@
 #   5  FAILED         — the GATE itself did not complete: a phase ERROR (a review invocation failed,
 #                       a round's commit was rejected, the escalation pass itself failed). Its
 #                       silence is not approval — re-run it.
-#   2  ERROR          — usage / precondition (bad flag, DIR not a git repo, `claude` not found).
+#   2  ERROR          — usage / precondition (bad flag, DIR not a git repo, selected engine missing).
 #                       Never in --stop-hook mode: a blocking code there would wedge the session.
 #   4  BUDGET         — the shared-budget admission gate waited FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT
 #                       seconds for a slot (LOAD+2 <= FOREMAN_MAX_WORKERS) and never got one.
@@ -157,9 +165,10 @@
 #
 # Robustness: a non-zero `claude -p` (or `codex exec`) exit or empty output is treated as a soft
 # error that ends the current phase with a clear message (it never hangs or crashes the loop). The
-# security AND codex phases auto-apply only the fixes they are confident about; anything
-# risky/uncertain is left unapplied and escalated rather than silently changed. The Codex phase is a
-# best-effort add-on: if codex is unavailable it is skipped with a warning, never failing the loop.
+# security and independent cross-check phases auto-apply only the fixes they are confident about;
+# anything risky/uncertain is left unapplied and escalated rather than silently changed. The
+# selected primary engine is required. The opposite-engine cross-check is a best-effort add-on: if
+# its CLI is unavailable it is skipped with a warning, never failing the loop.
 set -euo pipefail
 
 # Preserve the ORIGINAL argv before the parse loop consumes it, so the edit-while-running snapshot
@@ -184,8 +193,9 @@ simplify_rounds=2
 # NEEDS-AI directly, the pre-escalation behaviour).
 escalation_attempts=2
 security="on"     # default: always run security-review; the command scopes itself to real findings
-codex="on"        # default: run the Codex independent-reviewer phase (skips gracefully if unavailable)
+codex="on"        # historical flag name: independent opposite-engine cross-check on by default
 codex_model="gpt-5.6-sol"
+review_engine="${FOREMAN_REVIEW_ENGINE:-claude}"
 stop_hook=0
 self_test=0            # --self-test-verdict: run the verdict-rule cases and exit (see SELF-TEST)
 force=0                # --force: bypass the shared-budget admission wait (human override, see below)
@@ -225,6 +235,10 @@ Usage:
   review-loop --self-test-verdict
   review-loop --help
 
+FOREMAN_REVIEW_ENGINE=claude (default) preserves the established Claude phase commands and uses
+Codex for the independent cross-check. FOREMAN_REVIEW_ENGINE=codex runs the phases with Codex and
+uses Claude for the independent cross-check. The two roles intentionally never use one engine.
+
 --self-test-verdict runs the verdict rule over fabricated phase results and exits — no agents, no
 repo work. Use it to see exactly what does and does not flip the verdict.
 
@@ -244,16 +258,15 @@ derivation.
 
 Phases run in order, committing per round; the auto-fixing loops are capped at --max-rounds
 (/simplify at --simplify-rounds):
-  1. review                             (2 fixed passes: `/review <PR>` REPORTS — or a diff-scoped
-                                         review prompt when the branch has no open GitHub PR — then
-                                         ONE apply pass; risky findings surfaced, not looped on)
-  2. /simplify loop                     (shrink surface; own lower cap — a taste pass never runs out
-                                         of things to tidy, so extra rounds are churn, not quality)
-  3. codex review loop                  (independent 2nd model; auto-applies confident fixes,
-                                         escalates risky ones; skipped if codex unavailable)
+  1. review                             (2 fixed passes: Claude `/review <PR>` / diff prompt, or a
+                                         Codex diff-scoped prompt, REPORTS; then ONE apply pass)
+  2. simplify loop                      (Claude `/simplify` or equivalent Codex prompt; own lower
+                                         cap — a taste pass never runs out of things to tidy)
+  3. opposite-engine cross-check        (independent 2nd model; auto-applies confident fixes,
+                                         escalates risky ones; missing CLI is informational)
   4. security fix loop                  (auto-applies confident in-scope fixes; risky ones surfaced)
-  5. final convergence                  (ONLY if simplify/codex/security changed code — bounded Claude<->Codex
-                                         reconciliation, or a single review pass if codex off)
+  5. final convergence                  (ONLY if simplify/cross-check/security changed code — bounded
+                                         two-engine reconciliation, or one pass if cross-check off)
   6. escalation pass                    (ONLY if some phase left a RISKY finding: a fresh, better-
                                          resourced agent must FIX it or justify why it cannot be;
                                          anything it changes is re-reviewed. --escalation-attempts
@@ -322,6 +335,20 @@ done
 # --- validation -------------------------------------------------------------------------------
 case "$security" in auto|on|off) ;; *) die_usage "--security must be auto|on|off (got '$security')";; esac
 case "$codex" in on|off) ;; *) die_usage "--codex/--no-codex only (got codex='$codex')";; esac
+
+# One switch determines BOTH roles. Do not select these independently: the cross-checker's value is
+# precisely that it is a different model from the phase engine. This small function is extracted by
+# the unit test so the default and both directions stay pinned down.
+configure_review_engines() {
+  case "$review_engine" in
+    claude) phase_runner="run_claude"; crosscheck_engine="codex"; crosscheck_runner="run_codex"
+            phase_engine_display="Claude"; crosscheck_engine_display="Codex";;
+    codex)  phase_runner="run_codex";  crosscheck_engine="claude"; crosscheck_runner="run_claude"
+            phase_engine_display="Codex"; crosscheck_engine_display="Claude";;
+    *) die_usage "unknown FOREMAN_REVIEW_ENGINE '$review_engine' (expected: claude|codex)"; return 2;;
+  esac
+}
+configure_review_engines
 # --target is either a mode word or a branch name we hand to git.
 case "$target" in
   auto|none) ;;
@@ -513,7 +540,14 @@ if [ "$self_test" -eq 1 ]; then
 fi
 
 command -v git >/dev/null 2>&1 || die_usage "git not found on PATH"
-command -v claude >/dev/null 2>&1 || die_usage "claude not found on PATH"
+case "$review_engine" in
+  claude) command -v claude >/dev/null 2>&1 || die_usage "claude not found on PATH";;
+  codex)
+    command -v codex >/dev/null 2>&1 || die_usage "codex not found on PATH"
+    _tmo 20 codex login status </dev/null >/dev/null 2>&1 \
+      || die_usage "codex not logged in ('codex login status' failed)"
+    ;;
+esac
 
 [ -d "$dir" ] || die_usage "DIR '$dir' does not exist"
 dir="$(cd "$dir" && pwd)"
@@ -886,7 +920,42 @@ if [ -z "$range" ] && [ "$base_pinned" -eq 1 ]; then
   echo "$prog: WARNING — the resolved base IS HEAD, so '$base_short...HEAD' is an EMPTY range; the security/codex phases and the diff-scoped review fallback see UNCOMMITTED changes only, /simplify falls back to self-deriving its own range, and '/review <PR>' reviews the whole PR regardless" >&2
 fi
 
+# Codex has no `/simplify` equivalent. This prompt mirrors the bundled command's cleanup-only
+# review: reuse, simplification, efficiency, implementation altitude and explicit repository
+# conventions, while preserving behavior exactly. (The installed Claude Code prompt was inspected
+# when this mapping was added; see notes/tasks/review-loop-codex.md for the evidence.)
+build_codex_simplify_prompt() {
+  cat <<EOF
+You are running an automated CODE SIMPLIFICATION pass over the pending changes on this git branch.
+This is a TASTE/CLEANUP pass, not a bug hunt. APPLY only safe refinements that preserve exact
+functionality, outputs and externally observable behavior.
+
+SCOPE: inspect ONLY the code this branch changed — the diff \`git diff $scope_diff_ref\` plus any
+uncommitted changes — and the smallest amount of surrounding code needed to understand it. Do not
+clean up pre-existing code the branch did not touch.
+
+Use the same cleanup angles as Claude Code's /simplify command:
+  - reuse: replace new reimplementations with an existing helper already used by this codebase.
+  - simplification: remove redundant/derivable state, needless duplication or variation, deep
+    nesting, and dead code; choose the clearest behavior-equivalent form, not merely fewer lines.
+  - efficiency: remove redundant computation or repeated I/O, and run genuinely independent work
+    concurrently when that is already safe under the surrounding code's contracts.
+  - altitude: fix the mechanism at the right shared layer instead of adding a fragile special case.
+  - conventions: follow the explicit repository instruction files that govern the changed files.
+
+Do not change intended behavior, fix speculative correctness issues, add dependencies, broaden the
+diff, reformat unrelated code, or remove useful abstractions. If a simplification is debatable or
+risky, leave it alone. Edit files directly for confident improvements. Do NOT run \`git commit\` or
+\`git add\` — the caller commits. If nothing is clearly worth simplifying, make no edits.
+EOF
+}
+
 si_cmd="/simplify${range:+ $range}"
+si_display="$si_cmd"
+if [ "$review_engine" = "codex" ]; then
+  si_cmd="$(build_codex_simplify_prompt)"
+  si_display="codex simplify prompt over $scope_diff_ref"
+fi
 
 # --- what the review phase reviews --------------------------------------------------------
 # The report pass used to be `/code-review <effort> --fix`, which fans out a multi-agent review of
@@ -936,6 +1005,16 @@ if [ -n "$MR_PR_NUMBER" ]; then
 else
   cr_cmd="$(build_review_prompt)"
   cr_display="diff-scoped review of ${scope_diff_ref} (no open GitHub PR for this branch)"
+fi
+
+# Codex's report pass uses `codex exec` with this scoped prompt. Native `codex review` cannot accept
+# both `--base` and a custom prompt on CLI 0.144.6, so it cannot simultaneously preserve this loop's
+# resolved scope and REVIEWFINDING contract. Keep the Claude command above untouched: with the env
+# var unset it is still byte-for-byte the same slash command / fallback prompt as before.
+codex_review_prompt=""
+if [ "$review_engine" = "codex" ]; then
+  codex_review_prompt="$(build_review_prompt)"
+  cr_display="codex exec review prompt over $scope_diff_ref"
 fi
 
 # --- helpers ----------------------------------------------------------------------------------
@@ -1000,20 +1079,19 @@ CODEX_SANDBOX_RE="^bwrap:|Codex.s Linux sandbox uses bubblewrap"
 # Two flags, deliberately: an OBSERVATION and a DECISION.
 #   HIT       — run_codex saw one of those lines. On its own this is only a hint: a healthy codex
 #               reviewing THIS file could quote them.
-#   CONFIRMED — run_codex_phase combined the hit with "and the round changed no files", i.e. codex
-#               demonstrably did NOT work. Only then does run_codex stop spending calls. Keeping the
-#               decision out of run_codex is what stops a false positive from poisoning a codex that
-#               is working fine (it would otherwise refuse every subsequent round and the phase would
-#               end in ERROR).
+#   CONFIRMED — run_fix_phase combined the hit with "and the round changed no files" (the report
+#               pass uses its mandatory missing REVIEWFINDING marker), i.e. Codex demonstrably
+#               did NOT work. Only then does run_codex stop spending calls. Keeping the decision out
+#               of run_codex is what stops one suspicious line from poisoning later Codex rounds.
 CODEX_SANDBOX_HIT=0
 CODEX_SANDBOX_CONFIRMED=0
 CODEX_SCAN=""          # run_codex's private scan copy; listed in the EXIT trap so it cannot leak
 
-# Codex counterpart of run_claude: run one `codex exec` review-and-fix pass in DIR with the given
-# full prompt, streaming its output indented and returning codex's exit code. Same RUN_CLAUDE_CAPTURE
-# contract so run_fix_phase's caller can post-parse the findings. `</dev/null` is MANDATORY — without
-# it codex blocks forever on "Reading additional input from stdin...". -m pins the model. run_fix_phase
-# (not codex) does the git commit, so the prompt tells codex not to.
+# Codex counterpart of run_claude: run one `codex exec` pass in DIR with the given full prompt,
+# stream its output indented, and return codex's exit code. Same RUN_CLAUDE_CAPTURE contract so
+# callers can post-parse findings. `</dev/null` is MANDATORY — without it codex blocks forever on
+# "Reading additional input from stdin...". -m pins the model. run_fix_phase (not codex) does the
+# git commit, so editing prompts tell codex not to.
 #
 # SANDBOX — `-s danger-full-access`, deliberately, and NOT the tighter `-s workspace-write`.
 #   WHY: codex's Linux sandbox is bubblewrap, and bubblewrap cannot start in the container this
@@ -1092,6 +1170,23 @@ run_fix_phase() {
     rc=0
     "$runner" "$slash" || rc=$?
     after="$(_tree_digest)"
+
+    # The second half of Codex's two-signal did-not-run check lives here so EVERY codex-driven
+    # editing phase reuses it. Signal 1 is run_codex's narrow sandbox/startup HIT. Signal 2 is the
+    # structural fact this round changed no files. A hit plus a real edit can only be quoted text;
+    # clear it. A hit plus no edit confirms Codex executed nothing (it can still exit 0), so stop
+    # later Codex calls and make this primary phase ERROR. The independent cross-check maps the same
+    # confirmation to informational DID-NOT-RUN in run_crosscheck_phase below.
+    if [ "$runner" = "run_codex" ] && [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
+      if [ "$before" != "$after" ]; then
+        echo "    codex: sandbox-error text seen, but the round edited files — codex DID run; treating it as quoted text" >&2
+        CODEX_SANDBOX_HIT=0
+      else
+        CODEX_SANDBOX_CONFIRMED=1
+        rc=1
+        echo "    codex: DID NOT RUN (sandbox failure + no file changes)" >&2
+      fi
+    fi
 
     if [ "$before" = "$after" ]; then
       # No measurable progress this round.
@@ -1233,7 +1328,11 @@ run_review_phase() {
     rc=0
     : > "$CR_CAP"
     RUN_CLAUDE_CAPTURE="$CR_CAP"
-    run_claude "$cr_cmd" || rc=$?
+    if [ "$review_engine" = "codex" ]; then
+      run_codex "$codex_review_prompt" || rc=$?
+    else
+      run_claude "$cr_cmd" || rc=$?
+    fi
     RUN_CLAUDE_CAPTURE=""
     if [ "$rc" -ne 0 ]; then
       echo "    $label: report pass exited $rc — ending phase (soft error)"
@@ -1244,10 +1343,23 @@ run_review_phase() {
     # so does a model that ignored the output contract. Treating that as "no findings" would report
     # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
     if grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
+      # A valid mandatory marker is positive evidence that this read-only Codex report really ran.
+      # If it also quoted the documented sandbox text, discard that lone HIT before a later
+      # no-edit phase can accidentally combine it into a false did-not-run confirmation.
+      if [ "$review_engine" = "codex" ] && [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
+        echo "    codex: sandbox-error text seen, but the report emitted REVIEWFINDING — codex DID run; treating it as quoted text" >&2
+        CODEX_SANDBOX_HIT=0
+      fi
       break
     fi
     report_try=$((report_try + 1))
     if [ "$report_try" -ge 2 ]; then
+      # For Codex review, the missing output-contract marker is the second signal that the
+      # sandbox/startup HIT meant real did-not-run rather than quoted text. This report pass is
+      # intentionally read-only, so a tree digest cannot provide the editing phases' second signal.
+      if [ "$review_engine" = "codex" ] && [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
+        CODEX_SANDBOX_CONFIRMED=1
+      fi
       echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
       REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
     fi
@@ -1272,7 +1384,7 @@ run_review_phase() {
   REVIEW_PASSES=2
   RUN_CLAUDE_CAPTURE="$CR_CAP"
   run_fix_phase "$label (apply)" "$(build_review_apply_prompt "$report")" "$commit_prefix" \
-                "apply the confident fixes from the review report" run_claude 1
+                "apply the confident fixes from the review report" "$phase_runner" 1
   RUN_CLAUDE_CAPTURE=""
   REVIEW_CHANGED="$PHASE_CHANGED"
 
@@ -1316,6 +1428,23 @@ exploitable security vulnerabilities that these changes introduce. Do not audit 
   - input validation & injection (SQL, command, path traversal, XSS, SSRF, deserialization)
   - secrets / credential handling (leaks, weak storage, logging of secrets)
   - network / transport security (TLS, unsafe requests)
+EOF
+
+# The installed Claude Code /security-review prompt applies this high-signal filter. The existing
+# Claude driver predates this switch and must stay byte-identical; spell the filter out only in the
+# new Codex mapping so its prompt preserves the command's intent without changing the default path.
+if [ "$review_engine" = "codex" ]; then
+  cat <<'EOF'
+
+Apply /security-review's false-positive filter: report only HIGH- or MEDIUM-severity issues where
+you are over 80% confident there is a concrete exploit path and meaningful security impact. Exclude
+denial of service/resource exhaustion/rate limiting, dependency-version findings, theoretical
+hardening, test- or documentation-only code, resource leaks, and inputs controlled only through
+trusted environment variables or CLI flags. Prefer missing a theoretical issue over creating noise.
+EOF
+fi
+
+cat <<EOF
 
 THEN ACT on what you find:
   - For each finding you are CONFIDENT about, whose fix is clearly in the scope above AND low-risk
@@ -1395,7 +1524,7 @@ run_security_phase() {
   : > "$SEC_CAP"
   RUN_CLAUDE_CAPTURE="$SEC_CAP"
   run_fix_phase "security-review" "$(build_security_prompt)" "chore(security): auto-fix" \
-                "/security-review + apply confident in-scope fixes"
+                "/security-review + apply confident in-scope fixes" "$phase_runner"
   RUN_CLAUDE_CAPTURE=""
   SEC_ROUNDS="$PHASE_ROUNDS"; SEC_CHANGED="$PHASE_CHANGED"
 
@@ -1416,18 +1545,20 @@ run_security_phase() {
   return 0
 }
 
-# --- codex phase (independent second reviewer, auto-fixing) -----------------------------------
-# Build the driver prompt for ONE codex review→fix round. Codex reviews the branch diff for
+# --- opposite-engine cross-check (independent second reviewer, auto-fixing) -------------------
+# Build the driver prompt for ONE cross-check review→fix round. The opposite engine reviews the diff for
 # correctness bugs + clear simplifications and APPLIES the fixes it is confident about, leaving
 # risky/uncertain ones UNAPPLIED — exactly mirroring the security phase's "act on the confident,
 # escalate the risky" posture, but for general correctness rather than security. The working-tree
-# digest (not this prose) drives convergence, so it is robust even though codex's free-text format
-# differs from Claude's. The CODEXFINDING: lines are parsed only to SURFACE findings and to detect a
-# RISKY (deliberately-unapplied) finding for escalation.
+# digest (not this prose) drives convergence. CODEXFINDING is a historical, stable parser token —
+# keep it even when Claude is the cross-checker. The lines are parsed only to SURFACE findings and
+# detect a RISKY (deliberately-unapplied) finding for escalation.
 build_codex_prompt() {
+  local reviewer="OpenAI Codex" peer="Claude"
+  if [ "$crosscheck_engine" = "claude" ]; then reviewer="Claude"; peer="OpenAI Codex"; fi
   cat <<EOF
-You are OpenAI Codex acting as an INDEPENDENT second code reviewer on this git branch, working
-ALONGSIDE Claude (which reviews the same diff). Your value is catching what the other model missed.
+You are $reviewer acting as an INDEPENDENT second code reviewer on this git branch, working
+ALONGSIDE $peer (which reviews the same diff). Your value is catching what the other model missed.
 Review the code THIS branch changed for correctness BUGS and clear, low-risk SIMPLIFICATIONS, and
 APPLY the fixes you are confident about (you can edit files directly).
 
@@ -1462,37 +1593,49 @@ If you found NOTHING worth changing in the changed code, emit exactly this singl
 EOF
 }
 
-# Preflight: is Codex usable here? Sets CODEX_REASON. Returns 0 if usable, 1 if it should be skipped
+# Preflight: is the opposite-engine cross-checker usable here? Sets CODEX_REASON (the CODEX_ prefix
+# is retained because compute_verdict's extracted interface already consumes these globals). Returns
+# 0 if usable, 1 if it should be skipped
 # (with CODEX_REASON explaining why — distinguishing DISABLED from the two UNAVAILABLE cases so the
 # summary is honest about which happened). The `codex login status` probe makes no model call, and is
 # timed + stdin-closed so it can never hang or bill.
-codex_usable() {
+crosscheck_usable() {
   if [ "$codex" != "on" ]; then CODEX_REASON="--no-codex (disabled)"; return 1; fi
-  if ! command -v codex >/dev/null 2>&1; then
-    CODEX_REASON="codex not found on PATH — degrading to Claude-only"; return 1
-  fi
-  # `codex login status` is a fast LOCAL check (no model call); guard it against wedging.
-  if ! _tmo 20 codex login status </dev/null >/dev/null 2>&1; then
-    CODEX_REASON="codex not logged in ('codex login status' failed) — degrading to Claude-only"; return 1
-  fi
-  CODEX_REASON="codex on (model $codex_model)"; return 0
+  case "$crosscheck_engine" in
+    codex)
+      if ! command -v codex >/dev/null 2>&1; then
+        CODEX_REASON="codex not found on PATH — degrading to Claude-only"; return 1
+      fi
+      # `codex login status` is a fast LOCAL check (no model call); guard it against wedging.
+      if ! _tmo 20 codex login status </dev/null >/dev/null 2>&1; then
+        CODEX_REASON="codex not logged in ('codex login status' failed) — degrading to Claude-only"; return 1
+      fi
+      CODEX_REASON="codex on (model $codex_model)"; return 0
+      ;;
+    claude)
+      if ! command -v claude >/dev/null 2>&1; then
+        CODEX_REASON="claude not found on PATH — independent cross-check unavailable"; return 1
+      fi
+      CODEX_REASON="claude on (opposite-engine cross-check)"; return 0
+      ;;
+  esac
 }
 
 # Sets globals: CODEX_STATUS (SKIPPED|CLEAN|RISKY|NOT-CONVERGED|ERROR), CODEX_REASON, CODEX_ROUNDS,
 # CODEX_CHANGED (0|1), CODEX_FINDINGS (surfaced lines), CODEX_ACTIVE (0|1 — did the phase actually
-# run, i.e. codex was usable). CODEX_CAP is a capture file kept alive across this phase AND the later
+# run, i.e. the cross-checker was usable). CODEX_CAP is a capture file kept alive across this phase AND the later
 # reconciliation (so a RISKY surfaced by a reconcile recheck also escalates); it is parsed + removed
 # by finalize_codex_findings after reconciliation.
-run_codex_phase() {
+run_crosscheck_phase() {
   CODEX_STATUS="SKIPPED"; CODEX_REASON=""; CODEX_ROUNDS=0; CODEX_CHANGED=0
   CODEX_FINDINGS=""; CODEX_ACTIVE=0
 
-  if ! codex_usable; then
-    echo ">>> codex review phase: SKIPPED — $CODEX_REASON" >&2
+  if ! crosscheck_usable; then
+    echo ">>> $crosscheck_engine review phase: SKIPPED — $CODEX_REASON" >&2
     return 0
   fi
   CODEX_ACTIVE=1
-  echo ">>> codex review-and-fix loop: $CODEX_REASON"
+  echo ">>> $crosscheck_engine review-and-fix loop: $CODEX_REASON"
 
   # Build the (static, scope-only) driver prompt ONCE here and reuse it for every codex round in
   # this phase AND every reconcile recheck, instead of re-forking the heredoc via $(...) each time.
@@ -1501,8 +1644,10 @@ run_codex_phase() {
     || { CODEX_STATUS="ERROR"; CODEX_REASON="could not create temp capture file"; CODEX_ACTIVE=0; return 0; }
   : > "$CODEX_CAP"
   RUN_CLAUDE_CAPTURE="$CODEX_CAP"
-  run_fix_phase "codex-review" "$CODEX_PROMPT" "chore(review): codex auto-fix" \
-                "codex review + apply confident fixes" "run_codex"
+  local check_label="$crosscheck_engine-review" check_commit="chore(review): $crosscheck_engine auto-fix"
+  local check_display="$crosscheck_engine review + apply confident fixes"
+  run_fix_phase "$check_label" "$CODEX_PROMPT" "$check_commit" \
+                "$check_display" "$crosscheck_runner"
   RUN_CLAUDE_CAPTURE=""
   CODEX_ROUNDS="$PHASE_ROUNDS"; CODEX_CHANGED="$PHASE_CHANGED"
 
@@ -1512,15 +1657,9 @@ run_codex_phase() {
   # review result is what hid the breakage for three consecutive runs. So: drop the capture (nothing
   # in it is a review), and mark codex INACTIVE so the joint reconciliation below degrades to the
   # Claude-only path rather than alternating with a reviewer that cannot start.
-  # Guarded on CHANGED=0: a round that actually edited files demonstrably ran, so a sandbox line in
-  # its output can only be quoted text (this loop reviews the very file that documents those errors)
-  # — in that case clear the hit and carry on with the normal verdict, below.
-  if [ "$CODEX_SANDBOX_HIT" -eq 1 ] && [ "$CODEX_CHANGED" -eq 1 ]; then
-    echo "    codex: sandbox-error text seen, but the round edited files — codex DID run; treating it as quoted text" >&2
-    CODEX_SANDBOX_HIT=0
-  fi
-  if [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
-    CODEX_SANDBOX_CONFIRMED=1
+  # run_fix_phase owns the one two-signal confirmation. A missing CROSS-CHECK is informational — it
+  # must never become WHY — while a primary Codex phase that cannot run is a real gate ERROR.
+  if [ "$crosscheck_engine" = "codex" ] && [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ]; then
     CODEX_STATUS="DID-NOT-RUN"
     CODEX_REASON="sandbox failed to start — codex could not run repository commands; NO second opinion this run"
     CODEX_ACTIVE=0
@@ -1532,7 +1671,7 @@ run_codex_phase() {
 
   # Convergence verdict from this phase (the RISKY overlay is applied later, in
   # finalize_codex_findings, so a reconcile-round RISKY is included too).
-  map_review_verdict "codex" "$PHASE_STATUS" "$CODEX_CHANGED"
+  map_review_verdict "$crosscheck_engine" "$PHASE_STATUS" "$CODEX_CHANGED"
   CODEX_STATUS="$MV_STATUS"; CODEX_REASON="$MV_REASON"
   return 0
 }
@@ -1676,8 +1815,9 @@ escalation_recheck() {
   _note_cr_findings
   if [ "${CODEX_ACTIVE:-0}" -eq 1 ] && [ -n "${CODEX_CAP:-}" ]; then
     RUN_CLAUDE_CAPTURE="$CODEX_CAP"
-    run_fix_phase "codex-review (post-escalation)" "$CODEX_PROMPT" "chore(review): post-escalation codex" \
-                  "codex recheck of the escalation fix" "run_codex"
+    run_fix_phase "$crosscheck_engine-review (post-escalation)" "$CODEX_PROMPT" \
+                  "chore(review): post-escalation $crosscheck_engine" \
+                  "$crosscheck_engine recheck of the escalation fix" "$crosscheck_runner"
     RUN_CLAUDE_CAPTURE=""
     [ "$PHASE_STATUS" = "ERROR" ] && CODEX_STATUS="ERROR"
     [ "$PHASE_CHANGED" -eq 1 ] && CODEX_CHANGED=1
@@ -1735,7 +1875,8 @@ run_escalation_phase() {
     # cap 1: one agent pass per attempt. The attempt LOOP is the bound; run_fix_phase is reused only
     # for its digest/commit machinery, exactly as the review apply pass does.
     run_fix_phase "escalation" "$(build_escalation_prompt "$new")" "chore(review): escalation fix" \
-                  "fix the RISKY findings, or justify concretely why they cannot be fixed" run_claude 1
+                  "fix the RISKY findings, or justify concretely why they cannot be fixed" \
+                  "${phase_runner:-run_claude}" 1
     RUN_CLAUDE_CAPTURE=""
     changed="$PHASE_CHANGED"
     [ "$PHASE_STATUS" = "ERROR" ] && err=1
@@ -1797,11 +1938,12 @@ run_escalation_phase() {
 echo "== $prog =="
 codex_disp="$codex"; [ "$codex" = "on" ] && codex_disp="on ($codex_model)"
 echo "dir=$dir  base=$base_short  max-rounds=$max_rounds  security=$security  codex=$codex_disp  escalation-attempts=$escalation_attempts"
+[ "$review_engine" = "codex" ] && echo "review-engine=codex  independent-cross-check=claude  (opposite engines by design)"
 echo "review: $cr_display"
 echo
 
 # Init all codex/reconcile globals up front so `set -u` is happy on every path (e.g. codex disabled).
-CODEX_CAP=""; CODEX_PROMPT=""   # CODEX_PROMPT: the codex driver prompt, built once (see run_codex_phase)
+CODEX_CAP=""; CODEX_PROMPT=""   # opposite-engine driver prompt, built once (see run_crosscheck_phase)
 CODEX_STATUS="SKIPPED"; CODEX_REASON="--no-codex (disabled)"; CODEX_ROUNDS=0
 CODEX_CHANGED=0; CODEX_FINDINGS=""; CODEX_ACTIVE=0
 
@@ -1831,13 +1973,14 @@ echo
 
 # --simplify-rounds (default 2), NOT --max-rounds: a taste pass has no fixpoint to converge on, so
 # the extra rounds bought churn. See the cap's rationale where simplify_rounds is defined.
-run_fix_phase "simplify" "$si_cmd" "chore(review): simplify" "$si_cmd" run_claude "$simplify_rounds"
+run_fix_phase "simplify" "$si_cmd" "chore(review): simplify" "$si_display" "$phase_runner" "$simplify_rounds"
 SI_STATUS="$PHASE_STATUS"; SI_ROUNDS="$PHASE_ROUNDS"; SI_CHANGED="$PHASE_CHANGED"
 echo
 
-# Codex independent-reviewer phase (before security so security keeps the final word over the exact
-# code that ships — including anything Codex changed). Skips gracefully if codex is unavailable.
-run_codex_phase
+# Opposite-engine independent review (before security so security keeps the final word over the
+# exact code that ships — including anything the cross-checker changed). It is deliberately the
+# opposite of $review_engine; never collapse this back to the primary model.
+run_crosscheck_phase
 echo
 
 run_security_phase
@@ -1849,14 +1992,13 @@ echo
 # (simplify is included because it reworks code AFTER the review pass and only shrinks the
 # surface; a correctness regression it introduces would otherwise ship un-reviewed whenever codex and
 # security both change nothing, e.g. under --no-codex with a clean security run.)
-#   * Codex active  → a bounded Claude<->Codex RECONCILIATION: alternate a Claude review pass (report
-#                     + apply, see run_review_phase) and a Codex recheck; the tree is clean only when
-#                     a full alternation applies nothing on BOTH (so a Codex fix Claude would flag AND
-#                     a Claude fix Codex would flag are caught). Capped at --max-rounds cycles.
-#   * Codex inactive→ the original single gated Claude review pass (catch a bug a security fix made).
+#   * cross-check active  → bounded primary<->opposite-engine RECONCILIATION: alternate the selected
+#                           review phase (report + apply) and the independent recheck; the tree is
+#                           clean only when a full alternation applies nothing on BOTH.
+#   * cross-check inactive→ one gated primary-engine review pass (catch a regression a later fix made).
 # RECONCILE_STATUS is the umbrella convergence verdict for this phase (CLEAN|NOT-CONVERGED|RISKY|ERROR).
-FCR_RAN=0; FCR_CHANGED=0; FCR_PASSES=0     # Claude side of the final phase (for the summary)
-FCC_RAN=0; FCC_CHANGED=0                    # Codex side of the reconciliation (for the summary)
+FCR_RAN=0; FCR_CHANGED=0; FCR_PASSES=0     # primary-engine side of the final phase
+FCC_RAN=0; FCC_CHANGED=0                    # opposite-engine side of the reconciliation
 RECON_CYCLES=0; RECONCILE_STATUS="CLEAN"
 _recon_note() {  # fold a per-pass status into the umbrella verdict (ERROR > NOT-CONVERGED > RISKY)
   case "$1" in
@@ -1869,7 +2011,7 @@ _recon_note() {  # fold a per-pass status into the umbrella verdict (ERROR > NOT
 
 if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq 1 ]; then
   if [ "$CODEX_ACTIVE" -eq 1 ]; then
-    echo ">>> joint reconciliation — code changed after the codex phase; converging Claude+Codex"
+    echo ">>> joint reconciliation — code changed after the $crosscheck_engine phase; converging $phase_engine_display+$crosscheck_engine_display"
     for ((cyc = 1; cyc <= max_rounds; cyc++)); do
       RECON_CYCLES="$cyc"
       echo ">>> reconcile cycle $cyc/$max_rounds"
@@ -1878,8 +2020,9 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
       c_changed="$REVIEW_CHANGED"; _recon_note "$REVIEW_STATUS"; _note_cr_findings
 
       RUN_CLAUDE_CAPTURE="$CODEX_CAP"
-      run_fix_phase "codex-review (reconcile)" "$CODEX_PROMPT" "chore(review): reconcile codex" \
-                    "codex recheck" "run_codex"
+      run_fix_phase "$crosscheck_engine-review (reconcile)" "$CODEX_PROMPT" \
+                    "chore(review): reconcile $crosscheck_engine" \
+                    "$crosscheck_engine recheck" "$crosscheck_runner"
       RUN_CLAUDE_CAPTURE=""
       FCC_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCC_CHANGED=1
       x_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"
@@ -1894,7 +2037,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
       fi
 
       if [ "$c_changed" -eq 0 ] && [ "$x_changed" -eq 0 ]; then
-        echo "    reconcile: both Claude and Codex applied nothing — joint fixpoint reached"
+        echo "    reconcile: both $phase_engine_display and $crosscheck_engine_display applied nothing — joint fixpoint reached"
         # A transient inner round-cap in an EARLIER cycle set RECONCILE_STATUS=NOT-CONVERGED (the
         # inner pass was still churning at its own cap, so the alternation kept going). Reaching a
         # genuine joint fixpoint supersedes that stale verdict — the spec is "CLEAN when a full
@@ -1913,7 +2056,11 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
       fi
     done
   else
-    echo ">>> final review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
+    if [ "$review_engine" = "claude" ]; then
+      echo ">>> final review pass — code changed after the initial review (simplify/security/codex); re-checking for regressions"
+    else
+      echo ">>> final review pass — code changed after the initial review (simplify/security/claude cross-check); re-checking for regressions"
+    fi
     run_review_phase "review (post-security)" "chore(review): post-security review"
     FCR_RAN=1; FCR_PASSES="$REVIEW_PASSES"; FCR_CHANGED="$REVIEW_CHANGED"; RECONCILE_STATUS="$REVIEW_STATUS"
     _note_cr_findings
@@ -1955,12 +2102,24 @@ printf '  simplify    : rounds=%s/%s changed=%s status=%s\n' "$SI_ROUNDS" "$simp
 if [ "$CODEX_STATUS" = "DID-NOT-RUN" ]; then
   # Deliberately NOT the rounds=/changed= shape the other phases use: this line must not read like a
   # review result. The second opinion is missing and that is the whole message.
-  printf '  codex       : ** DID NOT RUN (%s)\n' "$CODEX_REASON"
+  if [ "$crosscheck_engine" = "codex" ]; then
+    printf '  codex       : ** DID NOT RUN (%s)\n' "$CODEX_REASON"
+  else
+    printf '  claude-xchk : ** DID NOT RUN (%s)\n' "$CODEX_REASON"
+  fi
 else
-  printf '  codex       : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$(status_disp "$CODEX_STATUS")" "$CODEX_REASON"
+  if [ "$crosscheck_engine" = "codex" ]; then
+    printf '  codex       : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$(status_disp "$CODEX_STATUS")" "$CODEX_REASON"
+  else
+    printf '  claude-xchk : rounds=%s changed=%s status=%s (%s)\n' "$CODEX_ROUNDS" "$(yn "$CODEX_CHANGED")" "$(status_disp "$CODEX_STATUS")" "$CODEX_REASON"
+  fi
 fi
 if [ -n "$CODEX_FINDINGS" ]; then
-  echo "  codex findings (surfaced — auto-fixed ones included; RISKY ones go to the escalation pass):"
+  if [ "$crosscheck_engine" = "codex" ]; then
+    echo "  codex findings (surfaced — auto-fixed ones included; RISKY ones go to the escalation pass):"
+  else
+    echo "  claude cross-check findings (surfaced — auto-fixed ones included; RISKY ones go to the escalation pass):"
+  fi
   printf '%s\n' "$CODEX_FINDINGS" | sed 's/^/    - /'
 fi
 printf '  security    : rounds=%s changed=%s status=%s (%s)\n' "$SEC_ROUNDS" "$(yn "$SEC_CHANGED")" "$(status_disp "$SEC_STATUS")" "$SEC_REASON"
@@ -1969,8 +2128,13 @@ if [ -n "$SEC_FINDINGS" ]; then
   printf '%s\n' "$SEC_FINDINGS" | sed 's/^/    - /'
 fi
 if [ "$FCC_RAN" -eq 1 ]; then   # FCC_RAN=1 only on the reconcile path (implies FCR_RAN=1)
-  printf '  final-recon : cycles=%s status=%s (claude changed=%s / codex changed=%s)\n' \
-    "$RECON_CYCLES" "$(status_disp "$RECONCILE_STATUS")" "$(yn "$FCR_CHANGED")" "$(yn "$FCC_CHANGED")"
+  if [ "$review_engine" = "claude" ]; then
+    printf '  final-recon : cycles=%s status=%s (claude changed=%s / codex changed=%s)\n' \
+      "$RECON_CYCLES" "$(status_disp "$RECONCILE_STATUS")" "$(yn "$FCR_CHANGED")" "$(yn "$FCC_CHANGED")"
+  else
+    printf '  final-recon : cycles=%s status=%s (codex changed=%s / claude changed=%s)\n' \
+      "$RECON_CYCLES" "$(status_disp "$RECONCILE_STATUS")" "$(yn "$FCR_CHANGED")" "$(yn "$FCC_CHANGED")"
+  fi
 elif [ "$FCR_RAN" -eq 1 ]; then
   printf '  final-review: passes=%s changed=%s status=%s (ran: code changed after review)\n' "$FCR_PASSES" "$(yn "$FCR_CHANGED")" "$(status_disp "$RECONCILE_STATUS")"
 else
@@ -1998,7 +2162,7 @@ echo
 case "$VERDICT" in
   CLEAN)
     if [ "$CODEX_ACTIVE" -eq 1 ]; then
-      echo "review-loop: CLEAN — no unresolved RISKY finding, no security finding, no phase error (Claude+Codex)."
+      echo "review-loop: CLEAN — no unresolved RISKY finding, no security finding, no phase error ($phase_engine_display+$crosscheck_engine_display)."
     else
       echo "review-loop: CLEAN — no unresolved RISKY finding, no security finding, no phase error."
     fi;;

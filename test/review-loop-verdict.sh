@@ -19,8 +19,8 @@
 #                     error text merely QUOTED by a healthy review is not; and a detection that was
 #                     never confirmed by the phase must not stop later codex rounds.
 #
-# shellcheck disable=SC2034  # the units under test are eval'd in from review-loop.sh, so shellcheck
-#                            # cannot see that these globals are the INPUTS those units read.
+# shellcheck disable=SC2034,SC2154  # units are eval'd from review-loop.sh, so shellcheck cannot see
+#                                  # the extracted functions assign/read these globals.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,9 +40,13 @@ eval "$(extract '^_esc_new[(][)]')"
 eval "$(extract '^_risky_finding_re=')"
 eval "$(extract '^build_escalation_prompt[(][)]')"
 eval "$(extract '^run_escalation_phase[(][)]')"
+eval "$(extract '^configure_review_engines[(][)]')"
+eval "$(extract '^build_codex_simplify_prompt[(][)]')"
+eval "$(extract '^build_security_prompt[(][)]')"
 eval "$(sed -n '/^LF=/p;/^_esc_mark_seen()/p;/^_esc_count()/p' "$SCRIPT")"
 for fn in compute_verdict run_codex _esc_new collect_risky_findings build_escalation_prompt \
-          run_escalation_phase _esc_mark_seen _esc_count; do
+          run_escalation_phase _esc_mark_seen _esc_count configure_review_engines \
+          build_codex_simplify_prompt build_security_prompt; do
   type "$fn" >/dev/null 2>&1 || fail "could not extract $fn from $SCRIPT"
 done
 
@@ -326,10 +330,60 @@ grep -q 'codex exec --skip-git-repo-check -s danger-full-access' "$SCRIPT" \
   || fail "run_codex must invoke codex with -s danger-full-access (see the bubblewrap note)"
 echo "  OK  codex is invoked with -s danger-full-access"
 
-# === 9. the label rename ======================================================================
+# === 9. review-engine selection ================================================================
+echo "### 9: review phases and the independent cross-check always use opposite engines ###"
+ENGINE_DIE=""
+die_usage() { ENGINE_DIE="$1"; return 2; }
+
+unset FOREMAN_REVIEW_ENGINE
+review_engine="${FOREMAN_REVIEW_ENGINE:-claude}"
+configure_review_engines
+[ "$phase_runner:$crosscheck_engine:$crosscheck_runner" = "run_claude:codex:run_codex" ] \
+  || fail "unset engine did not preserve Claude phases + Codex cross-check"
+default_selection="$phase_runner:$crosscheck_engine:$crosscheck_runner"
+
+FOREMAN_REVIEW_ENGINE=claude; review_engine="$FOREMAN_REVIEW_ENGINE"
+configure_review_engines
+[ "$phase_runner:$crosscheck_engine:$crosscheck_runner" = "$default_selection" ] \
+  || fail "unset and explicit claude engine selections differ"
+grep -q 'claude -p --dangerously-skip-permissions "$slash" </dev/null' "$SCRIPT" \
+  || fail "the established Claude phase command changed"
+echo "  OK  unset == explicit claude: unchanged claude runner + codex cross-check"
+
+FOREMAN_REVIEW_ENGINE=codex; review_engine="$FOREMAN_REVIEW_ENGINE"
+configure_review_engines
+[ "$phase_runner:$crosscheck_engine:$crosscheck_runner" = "run_codex:claude:run_claude" ] \
+  || fail "codex engine did not select Codex phases + Claude cross-check"
+[ "$phase_runner" != "$crosscheck_runner" ] || fail "codex phases are cross-checking themselves"
+echo "  OK  codex phases -> independent claude cross-check"
+
+scope_diff_ref="base...HEAD"
+p="$(build_codex_simplify_prompt)"
+for phrase in "TASTE/CLEANUP" "reuse:" "simplification:" "efficiency:" "altitude:" "conventions:" "preserve exact"; do
+  case "$p" in *"$phrase"*) ;; *) fail "codex simplify prompt is missing '$phrase'";; esac
+done
+review_engine=codex
+p="$(build_security_prompt)"
+case "$p" in *"over 80%"*"SECFINDING: APPLIED"*"SECFINDING: RISKY"*) ;;
+  *) fail "codex security prompt lost /security-review's confidence filter or output markers";;
+esac
+grep -q 'run_codex "$codex_review_prompt"' "$SCRIPT" \
+  || fail "codex review report no longer reuses run_codex"
+grep -q 'codex_review_prompt="$(build_review_prompt)"' "$SCRIPT" \
+  || fail "codex review report lost the scoped REVIEWFINDING prompt"
+echo "  OK  codex prompts preserve simplify/security intent and parser markers"
+
+rc=0
+FOREMAN_REVIEW_ENGINE=wat bash "$SCRIPT" --self-test-verdict > "$WS/bad-engine.out" 2>&1 || rc=$?
+[ "$rc" -eq 2 ] || fail "unknown FOREMAN_REVIEW_ENGINE must exit 2 before work (got $rc)"
+grep -q "unknown FOREMAN_REVIEW_ENGINE 'wat'" "$WS/bad-engine.out" \
+  || fail "unknown engine rejection was not loud"
+echo "  OK  unknown FOREMAN_REVIEW_ENGINE is rejected before self-test/work"
+
+# === 10. the label rename =====================================================================
 # The phase runs `/review`, so nothing user-facing may still call it `code-review`. Only genuine
 # references to the retired `/code-review` COMMAND may remain.
-echo "### 9: the phase is labelled after the command it actually runs ###"
+echo "### 10: the phase is labelled after the command it actually runs ###"
 stale="$(grep -n 'code-review' "$SCRIPT" | grep -v '/code-review' || true)"
 [ -z "$stale" ] || fail "stale 'code-review' phase label(s) in $SCRIPT:$LF$stale"
 grep -q '^run_review_phase "review"' "$SCRIPT" || fail "the main phase is no longer invoked as 'review'"
