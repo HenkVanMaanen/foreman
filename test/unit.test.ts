@@ -380,7 +380,9 @@ describe("formatInboxPrompt", () => {
     const p = formatInboxPrompt(["MSG x - yo"]);
     expect(p.startsWith("[inbox] New message(s)")).toBe(true);
     expect(p).toContain("MSG x - yo");
-    expect(p).toContain("new root");
+    expect(p).toContain("bin/reply <post_id>");
+    expect(p).toContain("pass ONLY the 1st field");
+    expect(p).toContain("bin/reply <post_id> -` sends a literal dash");
   });
 });
 

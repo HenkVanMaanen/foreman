@@ -37,8 +37,21 @@ arg1="${1-}"
 dry_run=0
 if [ "${1-}" = "--dry-run" ]; then dry_run=1; shift || true; fi
 # Message: $1 if present, otherwise stdin (the safe, primary path for quotes/newlines).
+#
+# Inbox lines contain TWO routing-looking fields: `MSG <post_id> <root_or_-> <text>`. The reply
+# command accepts only the post id; it resolves a Mattermost root itself, and Telegram ignores the
+# routing value. If an agent accidentally copies both fields (`... | reply <post_id> -`), the old
+# parser treated `-` as the message and silently discarded the real piped text. Recover that exact
+# misuse when stdin is a pipe so the intended response reaches the human instead of a bare dash.
 if [ "$#" -ge 1 ]; then
   message="$1"
+  if [ "$message" = "-" ] && [[ -p /dev/stdin ]]; then
+    piped_message="$(cat)"
+    if [ -n "$piped_message" ]; then
+      echo "reply: ignored stray root-field '-'; using piped message (pass only <post_id>)" >&2
+      message="$piped_message"
+    fi
+  fi
 else
   message="$(cat)"
 fi

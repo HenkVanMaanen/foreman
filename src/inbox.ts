@@ -87,7 +87,9 @@ export function formatInboxPrompt(msgLines: string[]): string {
   return (
     "[inbox] New message(s) from the human since your last turn:\n" +
     `${msgLines.join("\n")}\n\n` +
-    "Handle them (reply in the correct thread; a leading '-' in the 2nd field means a new root). " +
+    "Handle each `MSG` with `printf ... | bin/reply <post_id>`: pass ONLY the 1st field after " +
+    "`MSG`. The 2nd `<root_or_->` field is metadata; never append it to `bin/reply` " +
+    "(`bin/reply <post_id> -` sends a literal dash). The script resolves the correct thread. " +
     "An `ACK <post_id> <root_or_-> +1` line means the human approved that post with a 👍 (no reply " +
     "text) — treat it as their go-ahead on that post."
   );
