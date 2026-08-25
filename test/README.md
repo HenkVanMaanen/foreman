@@ -1,6 +1,6 @@
 # foreman tests
 
-## Tests (no real Claude, no network)
+## Tests (no real agents, no network)
 
 ```sh
 bun install          # dev deps (types)
@@ -61,8 +61,8 @@ newlines collapse to spaces; nothing new → exit 3 with the watermark unmoved.
 
 ## Lifecycle test
 
-`run-lifecycle.sh` drives the **real supervisor** against `mock-claude.ts` — a fake
-`claude -p` that speaks the stream-json protocol — from a fresh temp workspace. It verifies:
+`run-lifecycle.sh` drives the **real supervisor** against `mock-claude.ts` and `mock-codex.ts`
+from a fresh temp workspace. It verifies:
 
 - **Cold-start workspace seeding** — `notes/` (from the seed), `notes/journal|tasks/`, and an
   executable `bin/` (`ask-human`, `wait-reply`, `foreman` shim) are created on first launch.
@@ -70,16 +70,25 @@ newlines collapse to spaces; nothing new → exit 3 with the watermark unmoved.
   (checkpoint request) → the agent "checkpoints" → the supervisor kills and **relaunches fresh**.
 - **Agent-initiated recycle** — the agent drops a `state/clear-request` sentinel → the
   supervisor detects it and relaunches fresh.
+- **Codex resident lifecycle** — the first prompt uses `codex exec --json`, later prompts resume
+  the emitted thread id, Codex usage maps to context occupancy without double-counting cached or
+  output tokens, and the same checkpoint/recycle contract launches a new thread.
+- **Engine-specific auth recovery** — both relay paths are rehearsed, including the Codex device
+  flow's post-login real-call verification and fail-closed behavior when verification fails.
 
 `mock-claude.ts` modes: `MOCK_MODE=usage` (default, escalating tokens) and `MOCK_MODE=clear`
 (writes the sentinel). A cross-process `mock-lives` counter ends the scenario after one recycle.
 
-## Protocol note (validated against real claude)
+## Protocol note
 
 Against `claude` 2.1.201, `result` frames carry `session_id` and a `usage` object with
 `input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens` —
 exactly what `src/protocol.ts:usageTotal` sums for the watchdog. Real claude also emits
 `rate_limit_event` frames, which the supervisor currently ignores.
+
+Codex `exec --json` emits a `thread.started` id and terminal `turn.completed`/`turn.failed`
+events. `input_tokens` already includes its cached subset, so the adapter maps only that total to
+the common result usage; subsequent supervisor turns use `codex exec resume <thread-id>`.
 
 ## Live cold-start (needs a Telegram bot)
 

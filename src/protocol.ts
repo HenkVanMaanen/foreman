@@ -1,9 +1,9 @@
-// stream-json protocol types.
+// Normalized resident-session protocol types.
 //
 // The harness drives claude in headless streaming mode:
 //   claude -p --input-format stream-json --output-format stream-json --verbose
-// Each side exchanges newline-delimited JSON objects. These types capture the
-// subset foreman needs; unknown fields are ignored.
+// Codex's exec JSONL adapter maps its terminal events into the same small result/usage subset.
+// Unknown engine-specific fields remain available through `raw`.
 
 export type EventType = "system" | "assistant" | "user" | "result" | "control_response";
 

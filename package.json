@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "A lean harness that runs Claude Code as a long-running autonomous senior software engineer.",
+  "description": "A lean harness that runs Claude Code or Codex CLI as a long-running autonomous senior software engineer.",
   "scripts": {
     "start": "bun run src/foreman.ts supervise",
     "dev": "bun --watch run src/foreman.ts supervise",

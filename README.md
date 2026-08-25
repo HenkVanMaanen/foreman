@@ -1,8 +1,8 @@
 # foreman
 
-A **lean** harness that turns **Claude Code** into a long-running, autonomous **senior
-software engineer** — one that **pages a human** when it needs one, **manages its own
-context**, works in parallel, and **improves its own harness**.
+A **lean** harness that turns **Claude Code or Codex CLI** into a long-running, autonomous
+**senior software engineer** — one that **pages a human** when it needs one, **manages its
+own context**, works in parallel, and **improves its own harness**.
 
 It **inverts the agent loop**: instead of a human steering every turn, the agent drives
 continuously and pulls a human in on demand. The human is the interrupt handler, not the pilot.
@@ -14,12 +14,12 @@ scripts. So the harness does **only what the agent can't do to itself** — ever
 is owned by the agent and bootstrapped at runtime.
 
 **Harness (irreducible):**
-1. **Supervise** — keep a `claude` process alive; relaunch fresh on exit/request.
+1. **Supervise** — keep a Claude stream or resumed Codex thread alive; relaunch fresh on request.
 2. **Recycle context** — watch token usage; force checkpoint-and-restart before the window fills.
 3. **Guard secrets** — inject credentials into subprocesses by name; values never touch the transcript.
 
 **Agent (everything else):** human contact (its own `curl` scripts to Telegram/Mattermost),
-parallelism (`claude -p` workers in git worktrees), task sources, autonomy rules, notes,
+parallelism (Claude/Codex workers in git worktrees), task sources, autonomy rules, notes,
 journaling, config — all learned by asking a human and written to its own notes.
 
 A fresh foreman with empty notes pages a human and asks *"what should I work on, and where?"*
@@ -29,10 +29,11 @@ A fresh foreman with empty notes pages a human and asks *"what should I work on,
 
 - **TypeScript on Bun** — so the agent can edit its own harness and `bun --watch` reloads it
   **instantly, no build step**. A dumb bash `keeper.sh` wraps it so a bad self-edit just bounces.
-- **Drive `claude -p` over stdin/stdout** (not the SDK, not raw API) — keeps **subscription
-  billing** (cheap for long runs) and full **process-lifecycle control** (needed to recycle context).
-- **`claude -p` recursion for parallelism** — each worker is a full Claude Code instance with
-  its own context window, so it can recurse *and* a worker parked on a human never blocks others.
+- **Drive the installed CLI** (not a raw API) — keeps subscription auth and full
+  **process-lifecycle control**. Claude uses one stream-json process; Codex uses `exec --json` and
+  `exec resume <thread-id>` turns.
+- **CLI workers for parallelism** — each worker is a full agent instance with its own context
+  window, so a worker parked on a human never blocks others.
 
 See [`DESIGN.md`](./DESIGN.md) for the full architecture, context-recycling loop, secrets
 model, and cold-start walkthrough.
@@ -40,9 +41,9 @@ model, and cold-start walkthrough.
 ## Status
 
 **Runnable, harness verified.** The supervisor lifecycle — cold-start workspace seeding,
-context-watchdog recycle, and agent-initiated recycle — is exercised end-to-end against a
-mock `claude` by `npm test`. The stream-json frame shapes are validated against real
-`claude` 2.1.201. Secrets capture/inject works end-to-end. The one leg not yet wired for a
+context-watchdog recycle, and agent-initiated recycle — is exercised end-to-end against mock
+Claude and Codex CLIs by `npm test`. Both event adapters are covered, including Codex thread
+resume. Secrets capture/inject works end-to-end. The one leg not yet wired for a
 *live* run is the real Telegram/Mattermost round-trip (needs your bot token). Human-contact
 scripts are reference-quality; expect to refine them for your workspace.
 
@@ -52,7 +53,8 @@ scripts are reference-quality; expect to refine them for your workspace.
 bun install                  # dev deps (types)
 npm test                     # unit tests + supervisor lifecycle (mock claude, no network)
 
-claude login                 # subscription auth so headless runs don't hit metered API
+claude login                 # when FOREMAN_SESSION_ENGINE=claude
+codex login                  # when FOREMAN_SESSION_ENGINE=codex
 cp .env.example .env         # Telegram/Mattermost creds, context marks, age secrets identity
 ./keeper.sh                  # dumb keeper → runs the harness → spawns the foreman agent
 ```
@@ -86,7 +88,8 @@ bun run format    # biome autofix (format + organize imports + safe lint fixes)
 keeper.sh                  dumb outer keeper (never changes); respawns the harness
 src/foreman.ts             entrypoint + CLI (supervise | dashboard | secret set | run | relogin)
 src/supervisor.ts          agent lifecycle + context watchdog (checkpoint & recycle)
-src/session.ts             owns one claude -p stream-json subprocess
+src/session.ts             engine-neutral resident-session facade + Claude stream adapter
+src/codex-session.ts       Codex exec/resume JSONL adapter
 src/relogin.ts             engine-selected Telegram re-auth when Claude/Codex OAuth dies
 src/protocol.ts            stream-json event/usage types
 src/secrets.ts             encrypted store; capture-via-pipe + inject-by-env
@@ -99,11 +102,11 @@ examples/agent-bin/        reference ask-human / wait-reply scripts the agent ad
 
 ## Design decisions (locked)
 
-- Substrate: `claude -p --input-format stream-json --output-format stream-json --verbose`, long-lived subprocess.
+- Substrate: selectable Claude stream-json process or resumed Codex exec JSONL turns.
 - Harness: **TypeScript on Bun**, wrapped by a dumb bash keeper for safe self-modification.
 - Human channels (MVP): Telegram + Mattermost, via **agent-owned** curl scripts.
 - Loop semantics: async — the agent parks on a human-call and keeps working other tasks.
-- Parallelism: **agent-owned**, via detached `claude -p` workers, each in a git worktree.
+- Parallelism: **agent-owned**, via detached Claude/Codex workers, each in a git worktree.
 - Notes: agent-owned markdown + an always-loaded `INDEX.md`.
 - Secrets: harness-guarded — captured via pipe, injected by name; values never enter context.
 - Context: harness watchdog forces checkpoint → fresh restart → rehydrate from notes.
