@@ -72,8 +72,8 @@ async function main(argv: string[]): Promise<number> {
  */
 async function runRelogin(cfg: Config, rest: string[]): Promise<number> {
   // --force starts the flow even when the session still looks live — that is what makes this
-  // a rehearsal rather than a no-op. Off by default: for codex it would clear a WORKING
-  // ~/.codex/auth.json the moment device-auth starts.
+  // a rehearsal rather than a no-op. Codex handles force with a synthetic device banner plus the
+  // real PONG verifier; it never starts device-auth against the working credential.
   const force = rest.includes("--force");
   // Every argument is accounted for. A typo'd flag must not be silently ignored: `relogin claude
   // --forse` would otherwise run WITHOUT force, hit the "already logged in?" guard, and exit 0

@@ -13,8 +13,10 @@
 // the lockout. Whatever it reads and does not use as the code it hands back to the human, since
 // the watermark has already moved past it (see inbox.ts invariant 3).
 //
-// codex needs no code relay at all: `codex login --device-auth` prints a URL + one-time code and
-// polls by itself, so we only have to forward those two strings and wait.
+// codex needs no code pasted back into the CLI: `codex login --device-auth` works headlessly,
+// prints a URL + one-time code and polls by itself. We forward those two strings, wait for the
+// human to authorize henk's ChatGPT credential, then prove the recovered credential with a real
+// `codex exec` call. `codex login status` is intentionally never used: it only reads auth.json.
 //
 // See notes/tasks/telegram-login-relay.md for the captured observable signals this matches on.
 
@@ -37,6 +39,8 @@ const EXIT_TIMEOUT_MS = 60_000;
 const HUMAN_TIMEOUT_MS = 10 * 60_000;
 /** Cap on the whole codex device-auth wait — the one-time code expires in 15 min anyway. */
 const CODEX_TIMEOUT_MS = 16 * 60_000;
+/** A network-backed codex verification call gets the same bound as the established manual probe. */
+const CODEX_VERIFY_TIMEOUT_MS = 90_000;
 /**
  * Say the quiet part out loud on EVERY failed codex attempt: device-auth cleared ~/.codex/auth.json
  * the moment it started, so an attempt that did not finish leaves codex LOGGED OUT rather than as
@@ -44,8 +48,9 @@ const CODEX_TIMEOUT_MS = 16 * 60_000;
  * survived.
  */
 const SIGNED_OUT_NOTICE =
-  "[harness] codex re-authentication did not complete — codex is now signed OUT " +
-  "(device-auth clears its credentials when it starts). Run `foreman relogin codex` to try again.";
+  "Codex re-authentication did not complete. Device auth clears the local credential when it " +
+  "starts, so Codex is now signed out and foreman cannot continue. " +
+  "On the foreman host, run `foreman relogin codex` to try again.";
 /** Bad-code retries before we give up and let the keeper respawn us. */
 const MAX_ATTEMPTS = 3;
 /** Inbox wakes carrying no text (👍 reaction-acks) to sit through before failing an attempt. */
@@ -153,6 +158,17 @@ const AUTH_TEXT_RE =
   /^\s*not logged in\b|please run \/login|oauth token (has )?expired|refresh token (has )?(expired|is invalid)|invalid refresh token/i;
 
 /**
+ * Codex's terminal auth failures, reproduced from the 2026-07-22 incident. This is deliberately
+ * line-anchored and phrasing-specific: a model may quote either string while working on this file,
+ * and a broad `401` / `refresh token` search would turn that healthy output into a lockout.
+ *
+ * The WebSocket alternative accepts the two prefixes Codex itself uses in terminal errors and
+ * JSON `turn.failed.error.message` values, but pins the status AND exact ChatGPT responses URL.
+ */
+const CODEX_AUTH_TEXT_RE =
+  /^(?:Your access token could not be refreshed because your refresh token was revoked\.|(?:failed to connect to websocket: )?(?:HTTP error: |unexpected status )401 Unauthorized\b[^\n]*\burl: wss:\/\/chatgpt\.com\/backend-api\/codex\/responses\b)/i;
+
+/**
  * The observable "auth required" signal from a driven `claude -p --output-format stream-json`.
  * Reproduced against an empty CLAUDE_CONFIG_DIR (see the notes): the child does NOT die — it
  * emits a synthetic assistant frame carrying `error: "authentication_failed"`, then a `result`
@@ -175,6 +191,27 @@ export function detectAuthRequired(ev: StreamEvent): string | undefined {
 }
 
 /**
+ * The definitive Codex failure frame's message, or undefined for every progress/output frame.
+ * `item.completed` is where agent prose lives, so requiring `turn.failed` prevents even a
+ * line-perfect quotation in a worker's output from being mistaken for the CLI's own failure.
+ */
+function codexTurnFailureMessage(ev: StreamEvent): string | undefined {
+  if ((ev.type as string) !== "turn.failed") return undefined;
+  if (!ev.raw || typeof ev.raw !== "object") return undefined;
+  const error = (ev.raw as { error?: unknown }).error;
+  if (!error || typeof error !== "object") return undefined;
+  const message = (error as { message?: unknown }).message;
+  return typeof message === "string" ? message : undefined;
+}
+
+/** Detect a dead Codex ChatGPT session without treating an ordinary failed turn as auth death. */
+export function detectCodexAuthRequired(ev: StreamEvent): string | undefined {
+  const message = codexTurnFailureMessage(ev);
+  if (!message || !CODEX_AUTH_TEXT_RE.test(message)) return undefined;
+  return message.trim().slice(0, 200);
+}
+
+/**
  * The detail an INJECTED detection reports. Exported as a constant because it is the whole
  * coupling between the detector and the recovery: makeAuthRecovery forces the login flow for
  * exactly this detail, so the one-shot lives in ONE place (the detector) instead of being latched
@@ -183,21 +220,21 @@ export function detectAuthRequired(ev: StreamEvent): string | undefined {
 export const INJECTED_AUTH_DETAIL = "injected (FOREMAN_FAKE_AUTH_REQUIRED)";
 
 /**
- * Wrap detectAuthRequired with the test seam: with `injectFirst` (cfg.fakeAuthRequired, from
- * FOREMAN_FAKE_AUTH_REQUIRED) the FIRST frame is reported as an auth failure, so the whole relay
- * (Telegram send, inbox wait, login command) can be exercised end to end without logging anyone
- * out. One-shot per detector instance — so the caller must build the detector ONCE for the whole
- * run, not per agent life, or a successful relogin re-arms the injection on the next life and the
- * harness spins forever (see supervisor.ts).
+ * Wrap the selected detector with the test seam: with `injectFirst` (cfg.fakeAuthRequired, from
+ * FOREMAN_FAKE_AUTH_REQUIRED) the FIRST frame is reported as an auth failure, so notification,
+ * verification and relaunch/refusal can be exercised without logging anyone out. One-shot per
+ * detector instance — so the caller must build it ONCE for the whole run, not per agent life, or a
+ * successful relogin re-arms the injection on the next life and the harness spins forever.
  */
-export function makeAuthDetector(injectFirst: boolean) {
+export function makeAuthDetector(injectFirst: boolean, engine: Config["reloginEngine"] = "claude") {
   let injected = injectFirst;
+  const detect = engine === "codex" ? detectCodexAuthRequired : detectAuthRequired;
   return (ev: StreamEvent): string | undefined => {
     if (injected) {
       injected = false;
       return INJECTED_AUTH_DETAIL;
     }
-    return detectAuthRequired(ev);
+    return detect(ev);
   };
 }
 
@@ -254,9 +291,15 @@ function shQuote(s: string): string {
  */
 async function runBounded(
   cmd: string[],
-  opts: { stdin?: Uint8Array | "ignore"; capture?: boolean; env: Record<string, string> },
+  opts: {
+    stdin?: Uint8Array | "ignore";
+    capture?: boolean;
+    env: Record<string, string>;
+    timeoutMs?: number;
+  },
 ): Promise<{ out: string; code: number }> {
-  const deadline = Date.now() + CHILD_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? CHILD_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   const left = () => Math.max(0, deadline - Date.now());
   // Tracked outside the try so the catch can reap a child that DID start before one of the awaits
   // below rejected (a stdout stream error, say) — otherwise the 127 return leaves it running.
@@ -275,7 +318,7 @@ async function runBounded(
     if (opts.capture) {
       const text = await withTimeout(new Response(proc.stdout).text(), left());
       if (text === undefined) {
-        console.error(`[relogin] ${cmd[0]} did not respond within ${CHILD_TIMEOUT_MS}ms`);
+        console.error(`[relogin] ${cmd[0]} did not respond within ${timeoutMs}ms`);
         await killAndReap(proc);
         return { out: "", code: 124 };
       }
@@ -283,7 +326,7 @@ async function runBounded(
     }
     const code = await withTimeout(proc.exited, left());
     if (code === undefined) {
-      console.error(`[relogin] ${cmd[0]} did not exit within ${CHILD_TIMEOUT_MS}ms — killing it`);
+      console.error(`[relogin] ${cmd[0]} did not exit within ${timeoutMs}ms — killing it`);
       await killAndReap(proc);
       return { out, code: 124 };
     }
@@ -520,18 +563,37 @@ async function claudeAuthStatus(
 }
 
 /**
- * True when `codex login status` reports a live session. It prints "Logged in using ChatGPT" and
- * exits 0, versus "Not logged in" / exit 1 (measured on v0.144.6); we require BOTH so a future
- * wording change or a config-load failure (which also exits 1) can't be read as success.
+ * Prove Codex auth against the network. `codex login status` is NOT verification: it only reads
+ * ~/.codex/auth.json and returned "Logged in using ChatGPT" throughout the July 2026 revoked-token
+ * incident. The real call must exit 0 AND put exactly PONG on stdout; either condition alone can
+ * lie (Codex has other exit-0/did-nothing failure modes, and an error transcript can quote PONG).
  *
- * Same child env as the login, for the reason claudeAuthStatus() gives.
+ * Same child env as the login, for the reason claudeAuthStatus() gives. stdin is ignored, which is
+ * Bun.spawn's direct equivalent of the established probe's `</dev/null`.
  */
-async function codexLoggedIn(cfg: Config, childEnv: Record<string, string>): Promise<boolean> {
-  const { out, code } = await runBounded([cfg.codexBin, "login", "status"], {
-    capture: true,
-    env: childEnv,
-  });
-  return code === 0 && /^\s*Logged in/im.test(stripAnsi(out));
+export async function verifyCodexAuth(
+  cfg: Config,
+  childEnv: Record<string, string>,
+): Promise<boolean> {
+  const { out, code } = await runBounded(
+    [cfg.codexBin, "exec", "--skip-git-repo-check", "--color", "never", "reply with exactly: PONG"],
+    {
+      capture: true,
+      env: childEnv,
+      timeoutMs: CODEX_VERIFY_TIMEOUT_MS,
+    },
+  );
+  const answer = stripAnsi(out).trim();
+  const ok = code === 0 && answer === "PONG";
+  if (ok) {
+    console.log("[relogin] codex verification passed (real PONG call)");
+  } else {
+    console.error(
+      `[relogin] codex verification failed (real PONG call exited ${code}, ` +
+        `expected stdout exactly PONG)`,
+    );
+  }
+  return ok;
 }
 
 /**
@@ -751,9 +813,11 @@ export async function reloginClaude(
  * process to exit. No pty needed (verified with stdin=/dev/null).
  *
  * CAUTION (measured): starting device-auth CLEARS ~/.codex/auth.json immediately (see
- * SIGNED_OUT_NOTICE). Hence the guard below — never start it against a session that is still good.
+ * SIGNED_OUT_NOTICE). Hence the real-PONG guard below — never start it against a session that is
+ * still good. Starting the command only initiates the relay; the human still owns and approves the
+ * ChatGPT credential in their browser. We never receive, persist, or print account credentials.
  */
-async function reloginCodex(
+export async function reloginCodex(
   cfg: Config,
   watchdog: Heartbeat,
   // Unused: device-auth polls by itself, so there is no code to relay back off the inbox. Taken
@@ -764,45 +828,76 @@ async function reloginCodex(
   refresh: () => void | Promise<void> = () => {},
 ): Promise<boolean> {
   const childEnv = harnessChildEnv(cfg, env);
-  if (!force && (await codexLoggedIn(cfg, childEnv))) return true;
+  if (!force && (await verifyCodexAuth(cfg, childEnv))) return true;
+  // `force` means rehearsal for codex. Unlike claude's login command, device-auth immediately
+  // clears the real auth file, so the fake seam MUST NOT spawn it. A synthetic, plainly labelled
+  // banner exercises extraction, phone notification, waiting/exit handling and the real PONG gate
+  // without presenting a live OAuth code or touching henk's credential.
+  const rehearsal = force;
   // Spawn inside the try — a missing/unrunnable codexBin makes Bun.spawn throw synchronously,
   // and from outside it that escapes as an unhandled rejection instead of returning false.
   let proc: Bun.Subprocess<"ignore", "pipe", "inherit"> | undefined;
   try {
-    proc = Bun.spawn([cfg.codexBin, "login", "--device-auth"], {
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "inherit",
-      env: childEnv,
-    });
-    // Both patterns must be complete before we forward either: a truncated device code is as
-    // unusable as a truncated link, and codex gives the human only 15 minutes to type it.
-    const banner = await readBanner(proc.stdout, watchdog, URL_RE, DEVICE_CODE_RE);
+    let banner: string;
+    let loginExited: Promise<number>;
+    if (rehearsal) {
+      banner =
+        "https://auth.openai.com/codex/device/rehearsal\n" +
+        "Enter this one-time code\n    FAKE-CODEX\n";
+      loginExited = Promise.resolve(0);
+    } else {
+      proc = Bun.spawn([cfg.codexBin, "login", "--device-auth"], {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "inherit",
+        env: childEnv,
+      });
+      // Both patterns must be complete before we forward either: a truncated device code is as
+      // unusable as a truncated link, and codex gives the human only 15 minutes to type it.
+      banner = await readBanner(proc.stdout, watchdog, URL_RE, DEVICE_CODE_RE);
+      drain(proc.stdout); // codex chatters while it polls; an undrained pipe would wedge it
+      loginExited = proc.exited;
+    }
     watchdog.touch();
     const url = extractUrl(banner);
     const code = extractDeviceCode(banner);
     if (!url || !code) throw new Error("codex login printed no complete device URL/code");
-    drain(proc.stdout); // codex chatters while it polls; an undrained pipe would wedge it
 
     await notify(
       childEnv,
-      `[harness] codex needs re-authentication.\n\n1. Open: ${url}\n2. Enter this code: ${code}\n` +
-        `Nothing to reply here — I am polling and will confirm when it lands.`,
+      (rehearsal
+        ? "Rehearsal: Codex auth is being treated as dead. No real login was started and your " +
+          "credential was not touched.\n\n"
+        : "Codex auth is dead, so foreman cannot continue and is waiting for you.\n\n") +
+        `1. Open: ${url}\n` +
+        `2. Enter this code (it expires in 15 minutes): ${code}\n` +
+        `3. Approve the ChatGPT sign-in.\n\n` +
+        `You do not need to reply; Codex is polling and I will verify the account with a real ` +
+        `PONG call before resuming.`,
     );
 
     // codex polls on its own; just bound the wait. 16 min of silence would read as both a wedge
     // (watchdog) and "quiet" (dashboard), so heartbeat and `refresh` ride the slices — see
     // awaitSliced.
-    const done = await awaitSliced(proc.exited, watchdog, CODEX_TIMEOUT_MS, refresh);
+    const done = await awaitSliced(loginExited, watchdog, CODEX_TIMEOUT_MS, refresh);
     watchdog.touch();
-    if (done === undefined) await killAndReap(proc);
+    if (done === undefined && proc) await killAndReap(proc);
 
-    if (await codexLoggedIn(cfg, childEnv)) {
-      await notifyQuietly(childEnv, "[harness] codex re-authenticated.");
+    if (await verifyCodexAuth(cfg, childEnv)) {
+      await notifyQuietly(
+        childEnv,
+        "Codex auth works again. Foreman verified it with a real PONG call and is resuming.",
+      );
       return true;
     }
     // We just asked, and the answer was no.
-    await notifyQuietly(childEnv, SIGNED_OUT_NOTICE);
+    await notifyQuietly(
+      childEnv,
+      rehearsal
+        ? "Rehearsal verification still reports Codex auth dead. Foreman will not declare success " +
+            "or resume; no credential was changed."
+        : SIGNED_OUT_NOTICE,
+    );
     return false;
   } catch (e) {
     console.error(`[relogin] codex failed: ${e}`);
@@ -812,7 +907,9 @@ async function reloginCodex(
       // completed-but-failed attempt does, so the human hears the same warning. Guarded on `proc`
       // because a Bun.spawn that THREW never started device-auth; re-checked because this path has
       // not asked yet, and a failure that left the credentials intact must not raise a false alarm.
-      if (!(await codexLoggedIn(cfg, childEnv))) await notifyQuietly(childEnv, SIGNED_OUT_NOTICE);
+      if (!(await verifyCodexAuth(cfg, childEnv))) {
+        await notifyQuietly(childEnv, SIGNED_OUT_NOTICE);
+      }
     }
     return false;
   }
@@ -880,6 +977,8 @@ type AuthRecoveryOutcome = "recovered" | "disabled" | "breaker-tripped" | "faile
  */
 export function makeAuthRecovery(cfg: Config) {
   const breaker = makeReloginBreaker();
+  const flow = RELOGIN_AGENTS.get(cfg.reloginEngine);
+  if (!flow) throw new Error(`no re-login flow for ${cfg.reloginEngine}`);
   return async (
     watchdog: Heartbeat,
     inbox: InboxQueue,
@@ -892,8 +991,9 @@ export function makeAuthRecovery(cfg: Config) {
     // Force the flow when the failure was INJECTED: the session is still live by construction, so
     // the "already logged in?" guard would short-circuit to true and the rehearsal would exercise
     // nothing but the detector — no Telegram send, no inbox wait, no login command. `claude auth
-    // login` does not drop the existing session while it runs, so forcing it here is safe (unlike
-    // codex device-auth, which clears its credentials the moment it starts).
+    // login` does not drop the existing session while it runs. reloginCodex treats force as a safe
+    // synthetic device-auth banner and still runs the REAL PONG verifier; it never starts real
+    // device-auth on a fake detection, because that command clears auth.json immediately.
     //
     // Derived from the detection itself rather than from a second one-shot latched off cfg: the
     // detector's injection is already one-shot, so reading its verdict makes "this was the
@@ -902,8 +1002,6 @@ export function makeAuthRecovery(cfg: Config) {
     const force = detail === INJECTED_AUTH_DETAIL;
     if (!cfg.reloginEnabled) return "disabled";
     if (breaker(sawHealthyTurn) === "give-up") return "breaker-tripped";
-    return (await reloginClaude(cfg, watchdog, inbox, env, force, refresh))
-      ? "recovered"
-      : "failed";
+    return (await flow.run(cfg, watchdog, inbox, env, force, refresh)) ? "recovered" : "failed";
   };
 }

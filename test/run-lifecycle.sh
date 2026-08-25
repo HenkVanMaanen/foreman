@@ -3,7 +3,10 @@
 # network). Verifies cold-start workspace seeding + both recycle paths:
 #   1. context watchdog: soft mark → hard mark → checkpoint → recycle
 #   2. agent-initiated: clear-request sentinel → recycle
-#   3. auth-required: injected auth frame → Telegram-mediated re-login relay → relaunch
+#   3. claude auth-required: injected frame → established relay → relaunch
+#   4. codex auth-required: injected frame → codex-only safe rehearsal → real-call verifier
+#   5. codex verification failure: the relay refuses to declare recovery or relaunch
+#   6. production-shaped codex device flow: mock login + post-login PONG, never local status
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,7 +19,8 @@ trap 'rm -rf "$WS"' EXIT
 # in and split state/notes between the real repo and $WS → spurious failures.
 export FOREMAN_STATE_DIR="$WS/state" FOREMAN_NOTES_DIR="$WS/notes" \
        FOREMAN_WORKTREES_DIR="$WS/worktrees" FOREMAN_AGE_IDENTITY="$WS/state/age-identity.txt"
-unset FOREMAN_STATE_REPO FOREMAN_CLAUDE_EXTRA_ARGS FOREMAN_AGE_RECIPIENT
+unset FOREMAN_STATE_REPO FOREMAN_CLAUDE_EXTRA_ARGS FOREMAN_AGE_RECIPIENT \
+      FOREMAN_RELOGIN_ENGINE FOREMAN_CODEX_BIN
 
 export FOREMAN_CLAUDE_BIN="$HERE/test/mock-claude.ts"
 export FOREMAN_BOOTSTRAP_PROMPT="$HERE/prompts/bootstrap.md"
@@ -106,7 +110,93 @@ assert_grep "re-authenticated" "$WS/state/relay-sent.txt"
 grep -q '"kind":"auth-required"' "$WS/state/events.jsonl" || fail "no auth-required event recorded"
 grep -q '"kind":"relogin","detail":"recovered"' "$WS/state/events.jsonl" \
   || fail "no recovered relogin event recorded"
+echo "--- claude relay transcript ---"
+cat "$WS/state/relay-sent.txt"
 echo "  scenario 3 OK"
+
+echo "### scenario 4: codex auth-required → codex relay only → verified relaunch ###"
+rm -rf "$WS"/{state,notes,bin,worktrees}
+mkdir -p "$WS/bin" "$WS/state"
+cat > "$WS/bin/reply" <<'STUB'
+#!/usr/bin/env bash
+{ echo "--- relay message ---"; cat; echo; } >> "$FOREMAN_STATE_DIR/relay-sent.txt"
+STUB
+cat > "$WS/bin/wait-reply" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+exit 3
+STUB
+chmod +x "$WS/bin/reply" "$WS/bin/wait-reply"
+FOREMAN_RELOGIN_ENGINE=codex FOREMAN_CODEX_BIN="$HERE/test/mock-codex.ts" \
+  FOREMAN_FAKE_AUTH_REQUIRED=1 MOCK_CODEX_VERIFY=healthy \
+  timeout 60 bun run "$HERE/src/foreman.ts" supervise >"$WS/s4.log" 2>&1 \
+  || { cat "$WS/s4.log"; fail "codex supervisor rehearsal errored"; }
+cat "$WS/s4.log"
+assert_grep "auth required (injected" "$WS/s4.log"
+assert_grep "codex verification passed (real PONG call)" "$WS/s4.log"
+assert_grep "life 2 started" "$WS/s4.log"
+assert_grep "Rehearsal: Codex auth is being treated as dead" "$WS/state/relay-sent.txt"
+assert_grep "Codex auth works again" "$WS/state/relay-sent.txt"
+refute_grep "claude needs re-authentication" "$WS/state/relay-sent.txt"
+refute_grep "\[harness\]" "$WS/state/relay-sent.txt"
+assert_grep "exec --skip-git-repo-check --color never reply with exactly: PONG" \
+  "$WS/state/mock-codex-calls.txt"
+refute_grep "login status" "$WS/state/mock-codex-calls.txt"
+refute_grep "login --device-auth" "$WS/state/mock-codex-calls.txt"
+echo "--- codex rehearsal relay transcript ---"
+cat "$WS/state/relay-sent.txt"
+echo "  scenario 4 OK"
+
+echo "### scenario 5: still-dead codex auth → verification rejects → no relaunch ###"
+rm -rf "$WS"/{state,notes,bin,worktrees}
+mkdir -p "$WS/bin" "$WS/state"
+cat > "$WS/bin/reply" <<'STUB'
+#!/usr/bin/env bash
+{ echo "--- relay message ---"; cat; echo; } >> "$FOREMAN_STATE_DIR/relay-sent.txt"
+STUB
+cat > "$WS/bin/wait-reply" <<'STUB'
+#!/usr/bin/env bash
+sleep 1
+exit 3
+STUB
+chmod +x "$WS/bin/reply" "$WS/bin/wait-reply"
+FOREMAN_RELOGIN_ENGINE=codex FOREMAN_CODEX_BIN="$HERE/test/mock-codex.ts" \
+  FOREMAN_FAKE_AUTH_REQUIRED=1 MOCK_CODEX_VERIFY=dead \
+  timeout 60 bun run "$HERE/src/foreman.ts" supervise >"$WS/s5.log" 2>&1 \
+  || { cat "$WS/s5.log"; fail "codex failed-verification rehearsal errored"; }
+cat "$WS/s5.log"
+assert_grep "codex verification failed (real PONG call exited 1" "$WS/s5.log"
+assert_grep "re-login failed → exiting" "$WS/s5.log"
+assert_grep "Foreman will not declare success or resume" "$WS/state/relay-sent.txt"
+refute_grep "Codex auth works again" "$WS/state/relay-sent.txt"
+refute_grep "life 2 started" "$WS/s5.log"
+refute_grep "login status" "$WS/state/mock-codex-calls.txt"
+echo "--- still-dead relay transcript ---"
+cat "$WS/state/relay-sent.txt"
+echo "  scenario 5 OK"
+
+echo "### scenario 6: codex device-auth shape → human relay → real-call verification ###"
+rm -rf "$WS"/{state,notes,bin,worktrees}
+mkdir -p "$WS/bin" "$WS/state"
+cat > "$WS/bin/reply" <<'STUB'
+#!/usr/bin/env bash
+{ echo "--- relay message ---"; cat; echo; } >> "$FOREMAN_STATE_DIR/relay-sent.txt"
+STUB
+chmod +x "$WS/bin/reply"
+FOREMAN_CODEX_BIN="$HERE/test/mock-codex.ts" MOCK_CODEX_VERIFY=state \
+  timeout 30 bun run "$HERE/src/foreman.ts" relogin codex >"$WS/s6.log" 2>&1 \
+  || { cat "$WS/s6.log"; fail "production-shaped codex relay errored"; }
+cat "$WS/s6.log"
+assert_grep "codex verification failed (real PONG call exited 1" "$WS/s6.log"
+assert_grep "codex verification passed (real PONG call)" "$WS/s6.log"
+assert_grep "Codex auth is dead, so foreman cannot continue" "$WS/state/relay-sent.txt"
+assert_grep "Codex auth works again" "$WS/state/relay-sent.txt"
+refute_grep "\[harness\]" "$WS/state/relay-sent.txt"
+assert_grep "login --device-auth" "$WS/state/mock-codex-calls.txt"
+refute_grep "login status" "$WS/state/mock-codex-calls.txt"
+echo "--- production-shaped codex relay transcript ---"
+cat "$WS/state/relay-sent.txt"
+echo "  scenario 6 OK"
 
 echo
 echo "ALL LIFECYCLE TESTS PASSED"
