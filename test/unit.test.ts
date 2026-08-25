@@ -3,7 +3,8 @@
 // not exercise directly: token accounting, stdin framing, CLI arg parsing, the dashboard's
 // status heuristic, and the secret-name guard.
 import { describe, expect, test } from "bun:test";
-import { parseReloginEngine } from "../src/config.ts";
+import { codexStreamEvent, codexTurnCommand } from "../src/codex-session.ts";
+import { parseReloginEngine, parseSessionEngine } from "../src/config.ts";
 import { parseStatus } from "../src/dashboard.ts";
 import { parseRun } from "../src/foreman.ts";
 import {
@@ -121,6 +122,89 @@ describe("parseReloginEngine", () => {
 
   test("rejects an unknown engine instead of falling back to the wrong credential", () => {
     expect(() => parseReloginEngine("gemini")).toThrow("unknown FOREMAN_RELOGIN_ENGINE 'gemini'");
+  });
+});
+
+describe("parseSessionEngine", () => {
+  test("accepts the two resident engines", () => {
+    expect(parseSessionEngine("claude")).toBe("claude");
+    expect(parseSessionEngine("codex")).toBe("codex");
+  });
+
+  test("rejects a typo instead of silently launching another CLI", () => {
+    expect(() => parseSessionEngine("gemini")).toThrow("unknown FOREMAN_SESSION_ENGINE 'gemini'");
+  });
+});
+
+describe("codex resident-session adapter", () => {
+  const cfg = {
+    codexBin: "/bin/codex",
+    skipPermissions: true,
+    codexExtraArgs: ["-m", "test-model"],
+  };
+
+  test("initial turn reads the prompt from stdin and requests JSONL", () => {
+    expect(codexTurnCommand(cfg)).toEqual([
+      "/bin/codex",
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-m",
+      "test-model",
+      "-",
+    ]);
+  });
+
+  test("later turns resume the exact emitted thread id", () => {
+    expect(codexTurnCommand(cfg, "thread-42")).toEqual([
+      "/bin/codex",
+      "exec",
+      "resume",
+      "--json",
+      "--skip-git-repo-check",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "-m",
+      "test-model",
+      "thread-42",
+      "-",
+    ]);
+  });
+
+  test("permission bypass is omitted when the harness disables it", () => {
+    expect(codexTurnCommand({ ...cfg, skipPermissions: false })).not.toContain(
+      "--dangerously-bypass-approvals-and-sandbox",
+    );
+  });
+
+  test("thread.started becomes the common init event", () => {
+    expect(codexStreamEvent({ type: "thread.started", thread_id: "thread-42" })).toMatchObject({
+      type: "system",
+      subtype: "init",
+      session_id: "thread-42",
+    });
+  });
+
+  test("turn.completed maps input_tokens once, without cached/output double counting", () => {
+    expect(
+      codexStreamEvent({
+        type: "turn.completed",
+        usage: {
+          input_tokens: 27_684,
+          cached_input_tokens: 23_040,
+          output_tokens: 12,
+        },
+      }),
+    ).toMatchObject({ type: "result", is_error: false, usage: { input_tokens: 27_684 } });
+  });
+
+  test("turn.failed becomes a failed boundary while retaining native raw shape", () => {
+    const event = codexStreamEvent({
+      type: "turn.failed",
+      error: { message: "ordinary failure" },
+    });
+    expect(event).toMatchObject({ type: "result", is_error: true, result: "ordinary failure" });
+    expect((event?.raw as { type: string }).type).toBe("turn.failed");
   });
 });
 
@@ -553,6 +637,17 @@ describe("makeAuthDetector", () => {
     }) as unknown as StreamEvent;
     expect(makeAuthDetector(false, "codex")(codexFailure)).toBeTruthy();
     expect(makeAuthDetector(false, "claude")(codexFailure)).toBeUndefined();
+  });
+
+  test("codex detection survives the session adapter's normalized result boundary", () => {
+    const normalized = codexStreamEvent({
+      type: "turn.failed",
+      error: {
+        message: "Your access token could not be refreshed because your refresh token was revoked.",
+      },
+    });
+    expect(normalized).toBeDefined();
+    expect(makeAuthDetector(false, "codex")(normalized as StreamEvent)).toBeTruthy();
   });
 });
 

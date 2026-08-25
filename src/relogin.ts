@@ -196,8 +196,12 @@ export function detectAuthRequired(ev: StreamEvent): string | undefined {
  * line-perfect quotation in a worker's output from being mistaken for the CLI's own failure.
  */
 function codexTurnFailureMessage(ev: StreamEvent): string | undefined {
-  if ((ev.type as string) !== "turn.failed") return undefined;
   if (!ev.raw || typeof ev.raw !== "object") return undefined;
+  const rawType = (ev.raw as { type?: unknown }).type;
+  // The session adapter normalizes a failed turn to the supervisor's `result` boundary while
+  // retaining the native Codex event in raw. Direct detector tests and any future raw consumer may
+  // still hand us type=turn.failed, so accept either representation without loosening the shape.
+  if ((ev.type as string) !== "turn.failed" && rawType !== "turn.failed") return undefined;
   const error = (ev.raw as { error?: unknown }).error;
   if (!error || typeof error !== "object") return undefined;
   const message = (error as { message?: unknown }).message;

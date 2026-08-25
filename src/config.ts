@@ -3,13 +3,16 @@
 // harness itself needs.
 
 export interface Config {
+  // CLI that owns the resident foreman conversation. Claude keeps one streaming process alive;
+  // Codex runs one `exec --json` process per turn and resumes the emitted thread id.
+  sessionEngine: "claude" | "codex";
   claudeBin: string;
   claudeExtraArgs: string[];
-  // codex CLI, used by the codex re-login relay (src/relogin.ts).
+  // codex CLI, used by both the resident session and the codex re-login relay.
   codexBin: string;
-  // Which CLI's auth failure the supervisor detects and recovers. This is deliberately separate
-  // from the not-yet-migrated Session engine: stage 3 can rehearse codex recovery without claiming
-  // the main loop itself already runs codex. Keep it aligned with that engine once it exists.
+  codexExtraArgs: string[];
+  // Which CLI's auth failure the supervisor detects and recovers. Kept independently selectable so
+  // the recovery flow can still be rehearsed against a mock without changing the session engine.
   reloginEngine: "claude" | "codex";
   // When the selected CLI's OAuth dies the model can't ask for help, so the supervisor relays the
   // sign-in over the human channel itself. 0 disables (the loop exits for the keeper).
@@ -21,16 +24,14 @@ export interface Config {
   // ask-human, not per-tool prompts. Adds --dangerously-skip-permissions when true.
   skipPermissions: boolean;
   // When a human sends an URGENT message mid-turn (a leading !/​/now/​/interrupt token, or a
-  // follow-up while the agent is already known busy), interrupt the in-flight turn via the stdin
-  // control protocol so it is handled in seconds instead of after the whole (possibly hour-long)
-  // turn. Set FOREMAN_URGENT_INTERRUPT=0 to fall back to queue-and-deliver-at-boundary only.
+  // follow-up while the agent is already known busy), interrupt the in-flight turn (Claude control
+  // frame or Codex SIGINT + resume) so it is handled in seconds instead of after the whole turn.
+  // Set FOREMAN_URGENT_INTERRUPT=0 to fall back to queue-and-deliver-at-boundary only.
   urgentInterrupt: boolean;
   // EXPERIMENTAL, default off. Stream a NON-urgent mid-turn message to the agent's stdin
-  // immediately (the CLI queues it) instead of only delivering it at the turn boundary, to shave
-  // latency on multi-step turns. Safe against loss (the line stays in the queue and is de-duped at
-  // the boundary; an interrupted turn re-delivers it), but the benefit depends on the CLI
-  // delivering queued input BETWEEN tool calls rather than only after the turn — unconfirmed live,
-  // so it ships off. Set FOREMAN_STREAM_INJECT=1 to try it.
+  // immediately instead of only delivering it at the turn boundary. Claude can queue this input;
+  // Codex cannot accept input after stdin EOF, so its adapter rejects the send and the poller safely
+  // leaves the line queued for the boundary. Set FOREMAN_STREAM_INJECT=1 to try it.
   streamInject: boolean;
   contextWindow: number;
   softMark: number; // fraction of window → nudge to checkpoint
@@ -76,13 +77,22 @@ export function parseReloginEngine(value: string): "claude" | "codex" {
   throw new Error(`unknown FOREMAN_RELOGIN_ENGINE '${value}' (expected: claude|codex)`);
 }
 
+/** The resident-session selector has the same fail-closed posture as the recovery selector. */
+export function parseSessionEngine(value: string): "claude" | "codex" {
+  if (value === "claude" || value === "codex") return value;
+  throw new Error(`unknown FOREMAN_SESSION_ENGINE '${value}' (expected: claude|codex)`);
+}
+
 export function loadConfig(): Config {
   const stateDir = str("FOREMAN_STATE_DIR", "state");
+  const sessionEngine = parseSessionEngine(str("FOREMAN_SESSION_ENGINE", "claude"));
   return {
+    sessionEngine,
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
     codexBin: str("FOREMAN_CODEX_BIN", "codex"),
-    reloginEngine: parseReloginEngine(str("FOREMAN_RELOGIN_ENGINE", "claude")),
+    codexExtraArgs: str("FOREMAN_CODEX_EXTRA_ARGS", "").split(" ").filter(Boolean),
+    reloginEngine: parseReloginEngine(str("FOREMAN_RELOGIN_ENGINE", sessionEngine)),
     reloginEnabled: str("FOREMAN_RELOGIN", "1") !== "0",
     fakeAuthRequired: str("FOREMAN_FAKE_AUTH_REQUIRED", "0") === "1",
     skipPermissions: str("FOREMAN_SKIP_PERMISSIONS", "1") !== "0",

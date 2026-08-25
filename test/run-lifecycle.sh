@@ -7,6 +7,7 @@
 #   4. codex auth-required: injected frame → codex-only safe rehearsal → real-call verifier
 #   5. codex verification failure: the relay refuses to declare recovery or relaunch
 #   6. production-shaped codex device flow: mock login + post-login PONG, never local status
+#   7. codex supervising session: initial exec → resumed turns → checkpoint/recycle
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,7 +21,8 @@ trap 'rm -rf "$WS"' EXIT
 export FOREMAN_STATE_DIR="$WS/state" FOREMAN_NOTES_DIR="$WS/notes" \
        FOREMAN_WORKTREES_DIR="$WS/worktrees" FOREMAN_AGE_IDENTITY="$WS/state/age-identity.txt"
 unset FOREMAN_STATE_REPO FOREMAN_CLAUDE_EXTRA_ARGS FOREMAN_AGE_RECIPIENT \
-      FOREMAN_RELOGIN_ENGINE FOREMAN_CODEX_BIN
+      FOREMAN_RELOGIN_ENGINE FOREMAN_CODEX_BIN FOREMAN_SESSION_ENGINE \
+      FOREMAN_CODEX_EXTRA_ARGS
 
 export FOREMAN_CLAUDE_BIN="$HERE/test/mock-claude.ts"
 export FOREMAN_BOOTSTRAP_PROMPT="$HERE/prompts/bootstrap.md"
@@ -197,6 +199,31 @@ refute_grep "login status" "$WS/state/mock-codex-calls.txt"
 echo "--- production-shaped codex relay transcript ---"
 cat "$WS/state/relay-sent.txt"
 echo "  scenario 6 OK"
+
+echo "### scenario 7: codex supervising session → exec resume → recycle ###"
+rm -rf "$WS"/{state,notes,bin,worktrees}
+FOREMAN_SESSION_ENGINE=codex FOREMAN_RELOGIN_ENGINE=codex \
+  FOREMAN_CODEX_BIN="$HERE/test/mock-codex.ts" MOCK_STEP=300 \
+  timeout 30 bun run "$HERE/src/foreman.ts" supervise >"$WS/s7.log" 2>&1 \
+  || { cat "$WS/s7.log"; fail "codex resident-session lifecycle errored"; }
+cat "$WS/s7.log"
+assert_grep "agent launched; bootstrap sent (engine=codex)" "$WS/s7.log"
+assert_grep "turn complete; context ≈ 300/1000" "$WS/s7.log"
+assert_grep "turn complete; context ≈ 600/1000" "$WS/s7.log"
+assert_grep "turn complete; context ≈ 900/1000" "$WS/s7.log"
+assert_grep "hard mark hit" "$WS/s7.log"
+assert_grep "checkpoint turn complete → recycling" "$WS/s7.log"
+assert_grep "relaunching fresh" "$WS/s7.log"
+assert_grep "agent process ended" "$WS/s7.log"
+assert_grep "exec --json --skip-git-repo-check" "$WS/state/mock-codex-calls.txt"
+assert_grep "exec resume --json --skip-git-repo-check" "$WS/state/mock-codex-calls.txt"
+assert_grep "mock-codex-life-1" "$WS/state/mock-codex-calls.txt"
+assert_grep "life=1 turn=4 .*checkpoint NOW" "$WS/state/mock-codex-prompts.txt"
+# cached_input_tokens is already included in Codex input_tokens, and output tokens are not context
+# occupancy. Neither may be added again (300 + 250 + 999 would otherwise produce 1549 here).
+refute_grep "context ≈ 1549/1000" "$WS/s7.log"
+refute_grep "mock-claude" "$WS/s7.log"
+echo "  scenario 7 OK"
 
 echo
 echo "ALL LIFECYCLE TESTS PASSED"

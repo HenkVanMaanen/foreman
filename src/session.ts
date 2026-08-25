@@ -1,7 +1,9 @@
-// Owns one long-lived `claude -p` subprocess and speaks the stream-json protocol.
+// Engine-neutral session facade. Claude uses one bidirectional stream-json child; Codex uses the
+// process-per-turn exec/resume adapter in codex-session.ts.
 
 import { randomUUID } from "node:crypto";
 import type { Subprocess } from "bun";
+import { CodexSession } from "./codex-session.ts";
 import type { Config } from "./config.ts";
 import { interruptMessage, type StreamEvent, userMessage } from "./protocol.ts";
 
@@ -10,7 +12,7 @@ export interface StartOptions {
   env?: Record<string, string>;
 }
 
-export class Session {
+class ClaudeSession {
   private proc: Subprocess<"pipe", "pipe", "inherit"> | undefined;
   // Serialise stdin writes. There are now TWO writers: the main loop (send) and the always-on
   // inbox poller (interrupt, from its own async context). A half-written line would corrupt the
@@ -22,7 +24,7 @@ export class Session {
   constructor(private cfg: Config) {}
 
   /** Launch the subprocess. Does not send any turn — call send() with the bootstrap. */
-  start(opts: StartOptions = {}): void {
+  start(env: Record<string, string> = {}): void {
     if (this.proc) throw new Error("session already started");
 
     const args = [
@@ -40,7 +42,7 @@ export class Session {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "inherit",
-      env: { ...process.env, ...(opts.env ?? {}) },
+      env: { ...process.env, ...env },
     });
   }
 
@@ -108,5 +110,41 @@ export class Session {
     this.proc.kill();
     await this.proc.exited;
     this.proc = undefined;
+  }
+}
+
+interface SessionDriver {
+  start(env?: Record<string, string>): void;
+  send(text: string): Promise<void>;
+  interrupt(): Promise<string>;
+  events(): AsyncGenerator<StreamEvent>;
+  stop(): Promise<void>;
+}
+
+export class Session {
+  private driver: SessionDriver;
+
+  constructor(cfg: Config) {
+    this.driver = cfg.sessionEngine === "codex" ? new CodexSession(cfg) : new ClaudeSession(cfg);
+  }
+
+  start(opts: StartOptions = {}): void {
+    this.driver.start(opts.env ?? {});
+  }
+
+  send(text: string): Promise<void> {
+    return this.driver.send(text);
+  }
+
+  interrupt(): Promise<string> {
+    return this.driver.interrupt();
+  }
+
+  events(): AsyncGenerator<StreamEvent> {
+    return this.driver.events();
+  }
+
+  stop(): Promise<void> {
+    return this.driver.stop();
   }
 }

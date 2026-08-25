@@ -246,8 +246,12 @@ export async function supervise(cfg: Config): Promise<void> {
     io.acked = false;
     io.awaitingCheckpoint = false;
     turnStartedAt = new Date().toISOString();
-    console.log("[supervisor] agent launched; bootstrap sent");
-    await recordEvent(cfg, { who: "supervisor", kind: "launch", detail: `life #${life}` });
+    console.log(`[supervisor] agent launched; bootstrap sent (engine=${cfg.sessionEngine})`);
+    await recordEvent(cfg, {
+      who: "supervisor",
+      kind: "launch",
+      detail: `life #${life}; engine ${cfg.sessionEngine}`,
+    });
     await refresh();
 
     let awaitingCheckpoint = false;
