@@ -7,7 +7,7 @@
 # reports CLEAN (or surfaces a security issue / non-convergence for a human).
 #
 # Phases run IN ORDER on the git repo at DIR. FOREMAN_REVIEW_ENGINE selects the phase engine
-# (`claude` by default; `codex` is opt-in). The independent cross-check ALWAYS uses the opposite
+# (`codex` by default). The optional independent cross-check uses the opposite
 # engine: Claude phases are checked by Codex, and Codex phases are checked by Claude. Keeping those
 # roles opposite is deliberate — pointing both at the same engine destroys the second opinion this
 # gate exists to provide. The order is deliberate and confirmed optimal: fix correctness first,
@@ -105,7 +105,7 @@
 #   Codex phases. A missing cross-checker warns and skips without changing the verdict.
 # --codex-model MODEL: the Codex model to use wherever Codex is selected (default gpt-5.6-sol).
 #
-# FOREMAN_REVIEW_ENGINE (default claude): selects the engine for review, simplify, security and
+# FOREMAN_REVIEW_ENGINE (default codex): selects the engine for review, simplify, security and
 # escalation. `codex` maps every phase to a scoped `codex exec` prompt; native `codex review` cannot
 # take both `--base` and the custom prompt that preserves REVIEWFINDING markers (see the task notes).
 # Every Codex call goes through run_codex so the danger-full-access and did-not-run safeguards have
@@ -193,9 +193,9 @@ simplify_rounds=2
 # NEEDS-AI directly, the pre-escalation behaviour).
 escalation_attempts=2
 security="on"     # default: always run security-review; the command scopes itself to real findings
-codex="on"        # historical flag name: independent opposite-engine cross-check on by default
+codex="${FOREMAN_REVIEW_CROSSCHECK:-off}" # historical flag name: optional opposite-engine cross-check
 codex_model="gpt-5.6-sol"
-review_engine="${FOREMAN_REVIEW_ENGINE:-claude}"
+review_engine="${FOREMAN_REVIEW_ENGINE:-codex}"
 stop_hook=0
 self_test=0            # --self-test-verdict: run the verdict-rule cases and exit (see SELF-TEST)
 force=0                # --force: bypass the shared-budget admission wait (human override, see below)
@@ -235,9 +235,9 @@ Usage:
   review-loop --self-test-verdict
   review-loop --help
 
-FOREMAN_REVIEW_ENGINE=claude (default) preserves the established Claude phase commands and uses
-Codex for the independent cross-check. FOREMAN_REVIEW_ENGINE=codex runs the phases with Codex and
-uses Claude for the independent cross-check. The two roles intentionally never use one engine.
+FOREMAN_REVIEW_ENGINE=codex (default) runs every phase with Codex. The opposite-engine cross-check
+is disabled by default; enable it explicitly with `--codex` or FOREMAN_REVIEW_CROSSCHECK=on. When
+enabled, the cross-check uses the opposite engine from the primary reviewer.
 
 --self-test-verdict runs the verdict rule over fabricated phase results and exits — no agents, no
 repo work. Use it to see exactly what does and does not flip the verdict.
@@ -272,7 +272,7 @@ Phases run in order, committing per round; the auto-fixing loops are capped at -
                                          anything it changes is re-reviewed. --escalation-attempts
                                          N, 0..2, default 2; 0 disables escalation entirely)
 
-Defaults: DIR=cwd, target=auto, max-rounds=6, simplify-rounds=2, security=on, codex=on,
+Defaults: DIR=cwd, target=auto, max-rounds=6, simplify-rounds=2, security=on, codex=off,
           codex-model=gpt-5.6-sol, escalation-attempts=2, base=merge-base of HEAD with the MR/PR
           target branch if derivable, else with origin/main.
 
