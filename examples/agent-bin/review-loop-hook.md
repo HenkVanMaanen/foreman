@@ -161,7 +161,7 @@ phases; every finding (fixed or not) is surfaced in the summary.
   and routed to the escalation pass (see above) like every other RISKY finding — fixed if an AI can
   fix it, `NEEDS-AI` / `NEEDS-DECISION` if not. Nothing risky is silently applied.
 - **Flags:** `--codex` / `--no-codex` (default **on**), `--codex-model MODEL` (default
-  `gpt-5.6-sol`).
+  `gpt-6-astra` with `xhigh` reasoning).
 - **Graceful skip:** if the `codex` CLI is not installed or not logged in (`codex login status`
   fails), the phase prints a warning and is **skipped** — the loop degrades to Claude-only and never
   hard-fails. The summary distinguishes `--no-codex (disabled)` from `codex not found` /

@@ -71,10 +71,11 @@ case "$cx" in *"-o /LAST"*) ;; *) fail "codex engine does not capture the last m
 case "$cx" in *"> /LOG 2>&1"*) ;; *) fail "codex engine does not write the standard log: $cx";; esac
 ok "engine=codex runs 'codex exec', brief on stdin, danger-full-access, same log path"
 
-case "$cx" in *" -m "*) fail "codex engine pinned a model with FOREMAN_CODEX_MODEL unset: $cx";; esac
+case "$cx" in *"-m gpt-6-astra"*) ;; *) fail "codex engine lost its gpt-6-astra default: $cx";; esac
+case "$cx" in *"model_reasoning_effort=xhigh"*) ;; *) fail "codex engine lost its xhigh default: $cx";; esac
 cxm="$(FOREMAN_CODEX_MODEL='gpt-5.6-sol' worker_run_cmd codex /BRIEF /LOG /LAST)"
 case "$cxm" in *"-m gpt-5.6-sol"*) ;; *) fail "FOREMAN_CODEX_MODEL not honoured: $cxm";; esac
-ok "FOREMAN_CODEX_MODEL pins the model; unset leaves codex its own default"
+ok "Codex workers default to gpt-6-astra/xhigh; FOREMAN_CODEX_MODEL overrides the model"
 
 rc=0; worker_run_cmd gemini /BRIEF /LOG /LAST >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 2 ] || fail "unknown engine should return 2, got $rc"

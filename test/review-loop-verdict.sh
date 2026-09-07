@@ -329,6 +329,9 @@ echo "  OK  a confirmed failure stops further codex calls"
 grep -q 'codex exec --skip-git-repo-check -s danger-full-access' "$SCRIPT" \
   || fail "run_codex must invoke codex with -s danger-full-access (see the bubblewrap note)"
 echo "  OK  codex is invoked with -s danger-full-access"
+grep -q 'model_reasoning_effort="$effort"' "$SCRIPT" \
+  || fail "every run_codex invocation must pin its configured reasoning effort"
+echo "  OK  codex is invoked with the configured reasoning effort"
 
 # === 9. review-engine selection ================================================================
 echo "### 9: review phases and the independent cross-check always use opposite engines ###"

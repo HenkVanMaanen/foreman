@@ -91,7 +91,12 @@ export function loadConfig(): Config {
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
     codexBin: str("FOREMAN_CODEX_BIN", "codex"),
-    codexExtraArgs: str("FOREMAN_CODEX_EXTRA_ARGS", "").split(" ").filter(Boolean),
+    codexExtraArgs: str(
+      "FOREMAN_CODEX_EXTRA_ARGS",
+      "--model gpt-6-astra -c model_reasoning_effort=xhigh",
+    )
+      .split(" ")
+      .filter(Boolean),
     reloginEngine: parseReloginEngine(str("FOREMAN_RELOGIN_ENGINE", sessionEngine)),
     reloginEnabled: str("FOREMAN_RELOGIN", "1") !== "0",
     fakeAuthRequired: str("FOREMAN_FAKE_AUTH_REQUIRED", "0") === "1",

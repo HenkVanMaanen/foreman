@@ -103,7 +103,7 @@
 # --codex / --no-codex: historical names for enabling/disabling the independent cross-check and
 #   joint reconciliation (default on). The cross-checker is Codex for Claude phases and Claude for
 #   Codex phases. A missing cross-checker warns and skips without changing the verdict.
-# --codex-model MODEL: the Codex model to use wherever Codex is selected (default gpt-5.6-sol).
+# --codex-model MODEL: the Codex model to use wherever Codex is selected (default gpt-6-astra).
 #
 # FOREMAN_REVIEW_ENGINE (default codex): selects the engine for review, simplify, security and
 # escalation. `codex` maps every phase to a scoped `codex exec` prompt; native `codex review` cannot
@@ -194,7 +194,8 @@ simplify_rounds=2
 escalation_attempts=2
 security="on"     # default: always run security-review; the command scopes itself to real findings
 codex="${FOREMAN_REVIEW_CROSSCHECK:-off}" # historical flag name: optional opposite-engine cross-check
-codex_model="gpt-5.6-sol"
+codex_model="gpt-6-astra"
+codex_effort="${FOREMAN_CODEX_EFFORT:-xhigh}"
 review_engine="${FOREMAN_REVIEW_ENGINE:-codex}"
 stop_hook=0
 self_test=0            # --self-test-verdict: run the verdict-rule cases and exit (see SELF-TEST)
@@ -273,7 +274,8 @@ Phases run in order, committing per round; the auto-fixing loops are capped at -
                                          N, 0..2, default 2; 0 disables escalation entirely)
 
 Defaults: DIR=cwd, target=auto, max-rounds=6, simplify-rounds=2, security=on, codex=off,
-          codex-model=gpt-5.6-sol, escalation-attempts=2, base=merge-base of HEAD with the MR/PR
+          codex-model=gpt-6-astra, codex-effort=xhigh, escalation-attempts=2,
+          base=merge-base of HEAD with the MR/PR
           target branch if derivable, else with origin/main.
 
 Verdict: driven by CORRECTNESS signals only — a RISKY (deliberately unapplied) finding from any
@@ -357,6 +359,9 @@ esac
 # --codex-model is interpolated into the `codex -m` command; restrict its charset (mirrors the
 # <name>/<id> posture in spawn-worker.sh / wait-reply.sh) to keep it a single safe token.
 [[ "$codex_model" =~ ^[A-Za-z0-9._-]+$ ]] || die_usage "--codex-model must match ^[A-Za-z0-9._-]+$ (got '$codex_model')"
+case "$codex_effort" in minimal|low|medium|high|xhigh) ;;
+  *) die_usage "FOREMAN_CODEX_EFFORT must be minimal|low|medium|high|xhigh (got '$codex_effort')";;
+esac
 [[ "$max_rounds" =~ ^[0-9]+$ ]] || die_usage "--max-rounds must be a non-negative integer (got '$max_rounds')"
 max_rounds="$((10#$max_rounds))"  # normalize: strip leading zeros so 08/09 aren't parsed as octal by later arithmetic
 [ "$max_rounds" -ge 1 ] || die_usage "--max-rounds must be >= 1"
@@ -1111,11 +1116,11 @@ CODEX_SCAN=""          # run_codex's private scan copy; listed in the EXIT trap 
 #   access its co-reviewers already have, so it is the same trust model, not a new exposure. Do NOT
 #   copy this flag into a context where codex reviews UNTRUSTED code.
 #   IF THE BOX CHANGES (new kernel, different container, CAP_NET_ADMIN granted), re-test with
-#     codex exec --skip-git-repo-check -s workspace-write -m gpt-5.6-sol "run 'git log --oneline -1'"
+#     codex exec --skip-git-repo-check -s workspace-write -m gpt-6-astra -c model_reasoning_effort=xhigh "run 'git log --oneline -1'"
 #   and put workspace-write back the moment bubblewrap starts.
 # shellcheck disable=SC2329  # invoked indirectly via run_fix_phase's $runner ("run_codex")
 run_codex() {
-  local prompt="$1" rc=0 scan=""
+  local prompt="$1" rc=0 scan="" effort="${codex_effort:-xhigh}"
   # Once the phase has CONFIRMED the sandbox cannot start there is no reason to pay for another codex
   # call: every round would fail identically. Refuse fast, non-zero, with no output. (A mere HIT is
   # not enough — see the two-flag note above.)
@@ -1129,7 +1134,8 @@ run_codex() {
   # sticks. If mktemp fails we simply cannot detect the failure; the review still runs (`cat`).
   scan="$(mktemp "${TMPDIR:-/tmp}/review-loop-codexscan.XXXXXX" 2>/dev/null)" || scan=""
   CODEX_SCAN="$scan"
-  ( cd "$dir" && codex exec --skip-git-repo-check -s danger-full-access -m "$codex_model" "$prompt" </dev/null ) 2>&1 \
+  ( cd "$dir" && codex exec --skip-git-repo-check -s danger-full-access -m "$codex_model" \
+      -c model_reasoning_effort="$effort" "$prompt" </dev/null ) 2>&1 \
     | { if [ -n "$scan" ]; then tee -a "$scan"; else cat; fi; } \
     | _indent_tee
   rc="${PIPESTATUS[0]}"
