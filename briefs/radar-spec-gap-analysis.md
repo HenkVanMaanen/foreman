@@ -1,0 +1,14 @@
+Werk als senior read-only software-auditor in de Standaard Radar repository. Vergelijk de actuele main implementatie grondig en evidence-based met de volledige specificatie uit Henk msgs 333051122/333051123, samengevat hieronder. Maak GEEN codewijzigingen en open geen MR. Inspecteer code, configuratie, schema/migraties, jobs, parsers, extractors, tests, mail/reporting en docs. Trek geen conclusies uit namen alleen: traceer werkelijke flows en citeer bestand:paginaregel of bestand:regel en tests. Lever een compacte maar volledige matrix: Volledig / Gedeeltelijk / Ontbreekt / Onzeker, met bewijs, concrete afwijking en aanbevolen volgende stap/prioriteit. Beantwoord expliciet of TenderNed-data alleen online blijft of welke metadata/documentinhoud lokaal wordt opgeslagen.
+
+Eisen:
+1. Dagelijks nieuwe TenderNed-publicaties monitoren met AND over categorieën en OR binnen categorie: publicatietypes (Aankondiging opdracht, Marktconsultatie, Vooraankondiging, Rectificatie, Aankondiging wijziging); opdrachtsoort Diensten/Leveringen; Europees/Nationaal; aard Overheidsopdracht/Opdracht/Raamovereenkomst; genoemde procedures; genoemde typen aanbestedende dienst; CPV-hoofdcodes plus alle onderliggende codes: 302,324,325,480,642,720 families.
+2. Alle bijlagen/formats verwerken: PDF, scan/OCR, Word, Excel, zip, tabellen, afbeeldingen; tekst extraheren en tekst/afbeeldingen analyseren/interpreteren.
+3. Relevante hit opslaan. Eenmaal einde dag mail naar Siwert.Groot@ictu.nl met organisatie, TenderNed URL, contactgegevens uit stukken, hitcriteria en planning.
+4. Dagelijks relevante publicaties blijven monitoren op metadata/documentwijzigingen: nieuw document of gewijzigde naam/publicatiedatum/format/grootte; rectificatie/gunning/planning; dagmail expliciet als wijziging. Stop na gunning, voortijdige stop of rectificatie.
+5. Uitbreiding: documenten analyseren op verplichte open standaarden, exact en algemene verwijzingen; classificeren geëist versus genoemd.
+6. Daarna synoniemen/afkortingen/misspellingen, uitbreidbare lijst en goedkeuringsproces.
+7. Gestructureerd rapport: algemene info, functionaliteit/aard max 100 woorden, IT-PvE eisen elk 1 zin, standaardverwijzingen met document+pagina en liefst volledige context/alinea.
+8. Eis/wens/anders definiëren; mogelijkheid voor feedback/lerend systeem.
+9. Toekomstig: uit functionaliteit afleiden welke standaarden relevant zijn (expliciet nog niet vereist).
+
+Controleer ook de bestaande CPV-config-semantie: lege lijst versus gewenste prefixes, checksumnotatie en descendants. Noteer welke eisen productbeslissingen/definitieve afstemming met Forum vereisen. Draai alleen lichte relevante tests indien nuttig; dit is primair read-only. Sluit af met een aanbevolen gefaseerde backlog (MVP blockers eerst), grove relatieve omvang/risico, en precieze open vragen. Schrijf het eindrapport ook naar /home/dev/foreman/state/radar-spec-gap-analysis-report.md en geef in je final een korte samenvatting.

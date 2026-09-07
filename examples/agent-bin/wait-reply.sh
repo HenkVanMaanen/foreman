@@ -355,9 +355,14 @@ EOF
       # the human (a prompt-injection vector). Strangers' updates are still consumed (offset advances
       # via $last below) but never returned. If TELEGRAM_CHAT_ID is unset, fail CLOSED: surface nothing (see the unset guard below).
       out="$(echo "$resp" | jq -r --arg cid "${TELEGRAM_CHAT_ID:-}" '.result[]
-        | select(.message.text != null)
+        | select(.message.text != null or .message.document != null)
         | select($cid != "" and ((.message.chat.id|tostring) == $cid))
-        | ((.update_id|tostring) + "\t" + (.message.message_id|tostring) + "\t" + (.message.chat.id|tostring) + "\t" + (.message.text | gsub("[\t\r\n]+"; " ")))' 2>/dev/null || true)"
+        | ((.update_id|tostring) + "\t" + (.message.message_id|tostring) + "\t" + (.message.chat.id|tostring) + "\t"
+          + (if .message.document != null then
+              ("TG_DOCUMENT file_id=" + .message.document.file_id
+                + " file_name=" + (.message.document.file_name // "attachment")
+                + " caption=" + (.message.caption // ""))
+            else .message.text end | gsub("[\t\r\n]+"; " ")))' 2>/dev/null || true)"
       last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
       if [ -n "$out" ]; then
         while IFS=$'\t' read -r uid mid cid text; do

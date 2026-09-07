@@ -1,0 +1,5 @@
+You are a fresh implementation worker for the QRLink monorepo. Read and obey the repo's AGENTS.md and CLAUDE.md completely first.
+
+Human-reported bug: updating a customer's trial end date in the admin dashboard fails. The UI/customer object includes `trialEndAt: "2026-09-11T14:13:00Z"`; API returns HTTP 500 code `incorrectdatetimevalue`; backend log says `Error 1292 (22007): Incorrect datetime value: '0000-00-00' for column 'trial_end_at' at row 1`.
+
+Work from current origin/master in an isolated branch/worktree. Trace the complete dashboard payload -> API parsing/model -> SQL update path. Reproduce the exact valid RFC3339 value in a regression test, establish the actual root cause, implement the smallest robust fix, and test in proportion to risk (focused tests plus relevant broader checks). Preserve unrelated work. Open a DRAFT PR on git.sallandpioneers.com/qrlink/qrlink with a concise explanation and test evidence, push only the task branch, and do not run review-loop or merge. Record your final status and PR URL in notes/tasks/qrlink-admin-trial-end-update.md. Use Henk van Maanen <henk@qrlink.nl> for commits if repo conventions require it.
