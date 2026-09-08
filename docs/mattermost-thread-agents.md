@@ -1,11 +1,11 @@
 # Mattermost thread agents — opt-in draft
 
-Defaults: `FOREMAN_THREAD_AGENTS=0`, `FOREMAN_CHANNEL_MODE=auto`. No live configuration or deployment is included. After human review, the intended configuration is:
+Defaults: `FOREMAN_THREAD_AGENTS=0`, `FOREMAN_CHANNEL_MODE=auto`, `FOREMAN_MAX_THREAD_AGENTS=2`. No live configuration or deployment is included. After human review, the intended configuration is:
 
 ```dotenv
 FOREMAN_THREAD_AGENTS=1
 FOREMAN_CHANNEL_MODE=mattermost
-FOREMAN_MAX_THREAD_AGENTS=2
+FOREMAN_MAX_THREAD_AGENTS=50
 MATTERMOST_TEAM=calabytes
 MATTERMOST_CHANNELS=general,foreman-improvements
 MATTERMOST_ALLOWED_USERS=<authorized usernames, comma separated>
@@ -25,7 +25,7 @@ thread-control bind mm:<channel>:<post> owner/repo /absolute/isolated/worktree
 
 The command requires an authorized receipt and binds its channel and root, including accumulated replies. One worktree cannot belong to two bindings. Casual chat stays with the resident; after replying, it runs `thread-control dismiss mm:<channel>:<post>`. Undismissed casual receipts replay to the resident after restart. There is no keyword classifier or spawn-for-every-root rule. Bound follow-ups bypass resident triage.
 
-`state/threads/registry.json` records bindings, pending/completed post IDs, status and explicit Codex session IDs. Each thread has one active turn; the total cap is 1–8, default 2. Completed turns move to the back of the scheduling order. The existing adapter captures `thread.started.thread_id` immediately and uses that exact ID for resume, never `--last`. Local compatibility evidence: installed `codex-cli 0.153.4`, its exec/resume help, the existing JSONL parser, and mock CLI tests. Configured Codex extra arguments are retained, including defaults `--model gpt-6-astra -c model_reasoning_effort=xhigh` and overrides.
+`state/threads/registry.json` records bindings, pending/completed post IDs, status and explicit Codex session IDs. Each thread has one active turn; `FOREMAN_MAX_THREAD_AGENTS` caps concurrent agents at any positive JavaScript safe integer (up to `Number.MAX_SAFE_INTEGER`), default 2. The intended deployment sets 50, matching the existing detached-worker limit. Total conversation thread bindings are unlimited. Completed turns move to the back of the scheduling order. The existing adapter captures `thread.started.thread_id` immediately and uses that exact ID for resume, never `--last`. Local compatibility evidence: installed `codex-cli 0.153.4`, its exec/resume help, the existing JSONL parser, and mock CLI tests. Configured Codex extra arguments are retained, including defaults `--model gpt-6-astra -c model_reasoning_effort=xhigh` and overrides.
 
 Each CLI holds a per-thread kernel lock. Surviving CLI locks count against the cap after restart. Interrupted batches replay with their saved session ID and an explicit warning to inspect existing side effects. A failed start/turn, missing session ID, nonzero exit or mismatched session retains messages and marks the thread failed. Other threads continue. After inspection, the resident can run `thread-control retry mm:<channel>:<post>`. Failures never trigger endless automatic fresh sessions. Detached-worker accounting and review-loop behavior are not reused.
 

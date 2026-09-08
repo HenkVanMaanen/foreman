@@ -132,6 +132,6 @@ export function parseChannelMode(value: string): Config["channelMode"] {
 
 export function parseThreadCap(value: string): number {
   const cap = Number(value);
-  if (Number.isInteger(cap) && cap >= 1 && cap <= 8) return cap;
-  throw new Error("FOREMAN_MAX_THREAD_AGENTS must be an integer between 1 and 8");
+  if (Number.isSafeInteger(cap) && cap >= 1) return cap;
+  throw new Error("FOREMAN_MAX_THREAD_AGENTS must be a positive safe integer");
 }

@@ -627,8 +627,30 @@ test("explicit channel modes, cap validation and flag-off environment compatibil
   expect(parseChannelMode("auto")).toBe("auto");
   expect(parseChannelMode("telegram")).toBe("telegram");
   expect(() => parseChannelMode("typo")).toThrow();
-  expect(() => parseThreadCap("0")).toThrow();
-  expect(() => parseThreadCap("2.5")).toThrow();
+  for (const cap of [1, 2, 8, 9, 50, 51, Number.MAX_SAFE_INTEGER]) {
+    expect(parseThreadCap(String(cap))).toBe(cap);
+  }
+  for (const value of [
+    "",
+    " ",
+    "typo",
+    "50agents",
+    "unlimited",
+    "0",
+    "-0",
+    "-1",
+    "2.5",
+    "NaN",
+    "Infinity",
+    "-Infinity",
+    "1e309",
+    "9007199254740992",
+    "9007199254740993",
+  ]) {
+    expect(() => parseThreadCap(value)).toThrow(
+      "FOREMAN_MAX_THREAD_AGENTS must be a positive safe integer",
+    );
+  }
   const env = {
     MATTERMOST_BOT_TOKEN: "fake",
     TELEGRAM_BOT_TOKEN: "fake",
