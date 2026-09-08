@@ -237,6 +237,57 @@ test("prelaunch registry save failure releases the slot and retries the queued t
   expect(r.snapshot().threads[0]?.done).toEqual(["root"]);
 });
 
+test.each([
+  true,
+  false,
+])("completion registry write failure is retained for retry (ok=%j)", async (ok) => {
+  const f = fixture();
+  f.cfg.maxThreadAgents = 1;
+  const h = heldTurns();
+  const r = f.router(h.run);
+  r.start();
+  f.bind(r, f.post("root"));
+  f.bind(r, f.post("next"));
+  await r.tick();
+  expect(h.calls).toHaveLength(1);
+  const path = join(f.cfg.stateDir, "threads/registry.json");
+  const persisted = readJson(path, null);
+  const obstruction = `${path}.${process.pid}.tmp`;
+  mkdirSync(obstruction); // Fail the completion checkpoint after the turn has already run.
+  try {
+    h.calls[0]?.end({ ok, text: "completed reply" });
+    await until(() => r.snapshot().threads.find((t) => t.root === "root")?.status !== "running");
+    const completed = r.snapshot().threads.find((t) => t.root === "root");
+    expect(completed?.status).toBe(ok ? "idle" : "failed");
+    expect(completed?.done).toEqual(ok ? ["root"] : []);
+    expect(completed?.pending).toEqual(ok ? [] : ["root"]);
+    expect(completed?.inFlight).toEqual(ok ? undefined : ["root"]);
+    expect(readJson(path, null)).toEqual(persisted);
+    expect(f.resident).toEqual([]);
+    await expect(r.tick()).rejects.toThrow();
+    expect(h.calls).toHaveLength(1);
+  } finally {
+    rmSync(obstruction, { recursive: true, force: true });
+  }
+
+  // The scheduled tick retries persistence without new input and can reuse the released slot.
+  await until(() => h.calls.length === 2);
+  expect(h.calls[1]?.prompt).toContain('"id":"next"');
+  expect(readJson(path, null)).toEqual(r.snapshot());
+  expect(f.resident).toHaveLength(ok ? 0 : 1);
+  h.calls[1]?.end({ ok: true });
+  await until(() => r.snapshot().threads.find((t) => t.root === "next")?.status === "idle");
+  await r.tick();
+  expect(h.calls).toHaveLength(2);
+  expect(readJson(path, null)).toEqual(r.snapshot());
+  expect(f.sent.filter((reply) => reply.root === "root").map((reply) => reply.text)).toEqual([
+    "Bound to a dedicated agent; queued for the next available slot.",
+    ok
+      ? "completed reply"
+      : "Turn failed; messages retained. Resident must inspect and use thread-control retry.",
+  ]);
+});
+
 test("shutdown during a routing failure leaves receipts recoverable by the next router", async () => {
   const f = fixture();
   const r = f.router();

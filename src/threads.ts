@@ -357,7 +357,13 @@ export class ThreadRouter {
         thread.status = "queued";
         throw error;
       }
-      void this.turn(thread, thread.inFlight).finally(() => this.active.delete(thread.key));
+      void this.turn(thread, thread.inFlight)
+        .finally(() => this.active.delete(thread.key))
+        .catch(() => {
+          // Keep the in-memory completion/failure state: collect() retries its checkpoint and
+          // resident notification before admitting more work. Never replay a completed turn here.
+          console.error("[threads] turn persistence deferred; state retained for retry");
+        });
     }
     await this.drain();
   }
