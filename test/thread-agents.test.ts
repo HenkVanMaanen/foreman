@@ -202,6 +202,41 @@ test.each([
   expect(r.snapshot().threads[0]?.done).toEqual(["root", "followup"]);
 });
 
+test("prelaunch registry save failure releases the slot and retries the queued thread", async () => {
+  const f = fixture();
+  f.cfg.maxThreadAgents = 1;
+  const h = heldTurns();
+  const r = f.router(h.run);
+  f.bind(r, f.post("root"));
+  const path = join(f.cfg.stateDir, "threads/registry.json");
+  const persisted = readJson(path, null);
+  const obstruction = `${path}.${process.pid}.tmp`;
+  const collect = r.collect.bind(r);
+  const collection = spyOn(r, "collect").mockImplementationOnce(() => {
+    collect();
+    // Let collection persist, then fail only the checkpoint immediately before launch.
+    mkdirSync(obstruction);
+  });
+  try {
+    await expect(r.tick()).rejects.toThrow();
+    expect(h.calls).toHaveLength(0);
+    expect(r.snapshot().threads[0]?.status).toBe("queued");
+    expect(r.snapshot().threads[0]?.pending).toEqual(["root"]);
+    expect(readJson(path, null)).toEqual(persisted);
+  } finally {
+    collection.mockRestore();
+    rmSync(obstruction, { recursive: true, force: true });
+  }
+
+  // Retry on the same router with a one-slot cap, without another incoming message.
+  await r.tick();
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]?.prompt).toContain('"id":"root"');
+  h.calls[0]?.end({ ok: true });
+  await until(() => r.snapshot().threads[0]?.status === "idle");
+  expect(r.snapshot().threads[0]?.done).toEqual(["root"]);
+});
+
 test("shutdown during a routing failure leaves receipts recoverable by the next router", async () => {
   const f = fixture();
   const r = f.router();

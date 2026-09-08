@@ -350,7 +350,13 @@ export class ThreadRouter {
       thread.status = "running";
       // Preserve batch membership across replay, even as collect() appends follow-ups.
       thread.inFlight ??= [...thread.pending];
-      this.save();
+      try {
+        this.save();
+      } catch (error) {
+        this.active.delete(thread.key);
+        thread.status = "queued";
+        throw error;
+      }
       void this.turn(thread, thread.inFlight).finally(() => this.active.delete(thread.key));
     }
     await this.drain();
