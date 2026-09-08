@@ -215,6 +215,8 @@ export interface InboxPoller {
 }
 
 export interface PollerHooks {
+  /** Divert durable bound-thread receipts before resident delivery. */
+  route?: (lines: string[]) => string[];
   /** True while the agent is mid-turn (not parked) — the poller auto-acks in that case. */
   isBusy: () => boolean;
   /** Called with each fresh batch that arrived while busy, so the supervisor can auto-ack once. */
@@ -367,11 +369,12 @@ export function startInboxPoller(
         // Push BEFORE honouring stop(): this batch's watermark was already advanced by the
         // wait-reply that just returned, so a batch dropped here is gone for good (invariant 3).
         // Whoever stopped us drains the queue afterwards and hands the leftovers back.
-        queue.push(action.lines);
+        const lines = hooks.route ? hooks.route(action.lines) : action.lines;
+        queue.push(lines);
         if (stopped) break;
-        if (hooks.isBusy()) {
+        if (lines.length && hooks.isBusy()) {
           try {
-            await hooks.onBusyMessage(action.lines);
+            await hooks.onBusyMessage(lines);
           } catch {
             // an ack failure must never disturb polling
           }
@@ -548,6 +551,7 @@ export async function waitForWakeup(
  * ps/procfs the way a spawned curl would be.
  */
 export async function sendTelegramAck(text: string): Promise<void> {
+  if (process.env["FOREMAN_CHANNEL_MODE"] === "mattermost") return;
   const token = process.env["TELEGRAM_BOT_TOKEN"];
   const chat = process.env["TELEGRAM_CHAT_ID"];
   if (!token || !chat) return;

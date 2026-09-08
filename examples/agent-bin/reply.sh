@@ -30,6 +30,15 @@
 #   MATTERMOST_CHANNEL_ID is used only if non-empty; otherwise the human DM channel is resolved
 #   dynamically from the API (bot id + target-user id → direct channel), same as wait-reply.
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/channel-mode.sh"
+if [ -n "${FOREMAN_ROUTER_TOKEN:-}" ]; then
+  helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/thread-cli.ts"
+  exec bun "$helper" reply "$@"
+fi
+if [ -n "${FOREMAN_THREAD_KEY:-}" ]; then
+  echo 'Use thread-reply with text on stdin; questions resume on the next human message.' >&2
+  exit 2
+fi
 
 # --- Arg parsing --------------------------------------------------------------------------
 arg1="${1-}"
@@ -59,6 +68,13 @@ fi
 # Empty / `-` / `new` first arg → a new root thread. Otherwise it must be a Mattermost post id
 # (an alphanumeric handle); reject anything else so it can't be a malformed value we then
 # interpolate into an API path.
+if [[ "$arg1" == mm:* ]]; then
+  [[ "$arg1" =~ ^mm:([A-Za-z0-9_-]+):([A-Za-z0-9]+)$ ]] || { echo 'reply: invalid Mattermost reference' >&2; exit 2; }
+  [ "${FOREMAN_CHANNEL_MODE:-auto}" != telegram ] || { echo 'reply: Mattermost is disabled in emergency mode' >&2; exit 2; }
+  export MATTERMOST_CHANNEL_ID="${BASH_REMATCH[1]}"
+  arg1="${BASH_REMATCH[2]}"
+  unset TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+fi
 root_arg=""
 case "$arg1" in
   ""|-|new) root_arg="" ;;
@@ -140,6 +156,8 @@ root_id=""
 if [ -n "$root_arg" ]; then
   post="$(curl "${mm[@]}" -f "$api/posts/$root_arg" || true)"
   [ -n "$post" ] || { echo "reply: post '$root_arg' not found" >&2; exit 1; }
+  post_channel="$(printf '%s' "$post" | jq -r '.channel_id // empty')"
+  [ -z "$post_channel" ] || chan="$post_channel"
   root_id="$(printf '%s' "$post" | jq -r '.root_id // ""')"
   [ "$root_id" = "null" ] && root_id=""
   [ -n "$root_id" ] || root_id="$root_arg"

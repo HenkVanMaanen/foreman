@@ -306,7 +306,7 @@ EOF
 } > "$runner_file"
 
 # Detach so the worker outlives this turn.
-nohup bash "$runner_file" >/dev/null 2>&1 &
+env -u MATTERMOST_BOT_TOKEN -u TELEGRAM_BOT_TOKEN -u FOREMAN_ROUTER_TOKEN -u FOREMAN_ROUTER_SOCKET nohup bash "$runner_file" >/dev/null 2>&1 &
 pid=$!
 
 # Registry launch line (append-only). started_at is ISO-8601 UTC, or epoch seconds if `date -u` with

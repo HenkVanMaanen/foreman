@@ -31,6 +31,8 @@ const BIN_SCRIPTS = [
   "pipeline-wait",
   "review-loop",
   "second-opinion",
+  "thread-control",
+  "thread-reply",
 ] as const;
 
 /**
@@ -66,7 +68,26 @@ export function harnessChildEnv(
     ...env,
     ...extra,
     FOREMAN_STATE_DIR: resolve(cfg.stateDir),
+    FOREMAN_CHANNEL_MODE: cfg.channelMode,
+    FOREMAN_THREAD_AGENTS: cfg.threadAgents ? "1" : "0",
   };
+}
+
+/** Credential hygiene, not hostile-worker isolation. Keep the resident's control capability only. */
+export function agentEnv(
+  env: Record<string, string | undefined>,
+  resident = true,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  const thread = Boolean(env["FOREMAN_THREAD_KEY"]);
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    if ((thread || env["FOREMAN_THREAD_AGENTS"] === "1") && /^(MATTERMOST_|TELEGRAM_)/.test(key))
+      continue;
+    if ((!resident || thread) && /^FOREMAN_ROUTER_/.test(key)) continue;
+    result[key] = value;
+  }
+  return result;
 }
 
 /**

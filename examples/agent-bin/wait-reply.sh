@@ -40,6 +40,7 @@
 # Closed/expired/already-claimed secret route → exit 4. Configuration/failure → exit 1 or 2.
 set +x # A Telegram response may contain a reserved secret, even in ordinary inbox mode.
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/channel-mode.sh"
 
 # --- Mode + arg parsing ---------------------------------------------------------------------
 # Inbox mode when no positional <id> is given (or the explicit --inbox flag). Otherwise the
@@ -88,6 +89,19 @@ timed_out() { [ "$deadline" != 0 ] && [ "$(date +%s)" -ge "$deadline" ]; }
 # FOREMAN_STATE_DIR is unset, mirroring the per-id path derivation.
 wm_dir="${FOREMAN_STATE_DIR:-$HOME/.foreman}/wait-reply"
 mkdir -p "$wm_dir" 2>/dev/null || true
+
+# One inbox caller per state directory, for both transports. Kernel lock self-heals on exit.
+if [ "$mode" = inbox ]; then
+  exec 8>"$wm_dir/.inbox.lock"
+  flock -n -E 3 8 || exit 3
+fi
+if [ "${FOREMAN_THREAD_AGENTS:-0}" = 1 ] && [ "${FOREMAN_CHANNEL_MODE:-auto}" != telegram ]; then
+  if [ "${FOREMAN_CHANNEL_MODE:-auto}" = mattermost ] || { [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; }; then
+    [ "$mode" = inbox ] || { echo 'Thread routing uses the supervisor inbox; do not start a single-thread waiter.' >&2; exit 2; }
+    helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/mattermost.ts"
+    exec bun "$helper"
+  fi
+fi
 
 # --- getUpdates single-consumer coordination -------------------------------------------------
 # Telegram allows only ONE getUpdates long-poll at a time, and single-thread vs inbox mode keep
@@ -153,7 +167,7 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
 
   # Only engage Mattermost if setup actually resolved the bot identity; otherwise fall through
   # to the next configured channel (Telegram) rather than polling a broken/absent channel.
-  if [ -n "$bot_id" ]; then
+  if [ -n "$bot_id" ] && [ -n "$tgt_id" ]; then
     if [ "$mode" = "inbox" ]; then
       # ---- INBOX over Mattermost -----------------------------------------------------------
       # Persistent CHANNEL watermark (last-seen human create_at, ms). First-ever call seeds it
@@ -199,13 +213,13 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
       # chronological order, as "<id>\t<create_at>\t<root_or_->\t<message>" (message newlines/tabs
       # collapsed to spaces so each post is exactly one tab-delimited line). The root field is "-"
       # for a root/non-threaded post — never empty, so the tab-split (IFS=tab, a whitespace IFS
-      # char that would otherwise collapse an empty field) keeps all four columns aligned. When
-      # the target id couldn't be resolved, fall back to "any non-bot user".
+      # char that would otherwise collapse an empty field) keeps all four columns aligned. Unresolved
+      # target identities fail closed; never accept arbitrary channel members.
       inbox_pick() {
         jq -r --arg bot "$bot_id" --arg tgt "$tgt_id" --argjson wm "$wm" '
           [ .posts[]?
             | select(.create_at > $wm)
-            | select( if $tgt != "" then .user_id == $tgt else .user_id != $bot end )
+            | select($tgt != "" and .user_id == $tgt)
           ]
           | sort_by(.create_at)
           | .[]
@@ -275,8 +289,8 @@ RACT
 
       # Given a channel/thread posts JSON on stdin, print "<post_id>\t<create_at>\t<message>" of
       # the oldest matching human post NEWER than the watermark, or nothing. $1 = root_id selector.
-      pick() { jq -r --arg q "$id" --arg bot "$bot_id" --argjson wm "$wm_val" \
-        "[.posts[]? | select(.user_id != \$bot) | select(.create_at > \$wm) | select($1)]
+      pick() { jq -r --arg q "$id" --arg bot "$bot_id" --arg tgt "$tgt_id" --argjson wm "$wm_val" \
+        "[.posts[]? | select(\$tgt != \"\" and .user_id == \$tgt) | select(.create_at > \$wm) | select($1)]
          | sort_by(.create_at)
          | (.[0] | if . then (.id + \"\t\" + (.create_at|tostring) + \"\t\" + .message) else empty end)" 2>/dev/null || true; }
       handle() {  # $1 = "<id>\t<create_at>\t<message>"; advance watermark, react, emit; 1 if empty

@@ -3,6 +3,9 @@
 // harness itself needs.
 
 export interface Config {
+  channelMode: "auto" | "mattermost" | "telegram";
+  threadAgents: boolean;
+  maxThreadAgents: number;
   // CLI that owns the resident foreman conversation. Claude keeps one streaming process alive;
   // Codex runs one `exec --json` process per turn and resumes the emitted thread id.
   sessionEngine: "claude" | "codex";
@@ -87,6 +90,9 @@ export function loadConfig(): Config {
   const stateDir = str("FOREMAN_STATE_DIR", "state");
   const sessionEngine = parseSessionEngine(str("FOREMAN_SESSION_ENGINE", "claude"));
   return {
+    channelMode: parseChannelMode(str("FOREMAN_CHANNEL_MODE", "auto")),
+    threadAgents: str("FOREMAN_THREAD_AGENTS", "0") === "1",
+    maxThreadAgents: parseThreadCap(str("FOREMAN_MAX_THREAD_AGENTS", "2")),
     sessionEngine,
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
@@ -117,4 +123,15 @@ export function loadConfig(): Config {
     bootstrapPromptPath: str("FOREMAN_BOOTSTRAP_PROMPT", "prompts/bootstrap.md"),
     dashboardPort: num("FOREMAN_DASHBOARD_PORT", 7878),
   };
+}
+
+export function parseChannelMode(value: string): Config["channelMode"] {
+  if (value === "auto" || value === "mattermost" || value === "telegram") return value;
+  throw new Error("FOREMAN_CHANNEL_MODE must be auto|mattermost|telegram");
+}
+
+export function parseThreadCap(value: string): number {
+  const cap = Number(value);
+  if (Number.isInteger(cap) && cap >= 1 && cap <= 8) return cap;
+  throw new Error("FOREMAN_MAX_THREAD_AGENTS must be an integer between 1 and 8");
 }
