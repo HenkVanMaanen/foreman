@@ -1,12 +1,13 @@
 // Supervisor-owned thread registry, queues, outbox and resident control interface.
 // This is a cooperative boundary: the shared uid/filesystem cannot isolate a hostile worker.
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { CodexSession } from "./codex-session.ts";
 import type { Config } from "./config.ts";
 import { type HumanPost, Mattermost, postLine, receiptPath } from "./mattermost.ts";
-import { readJson, safeId, writeJson } from "./thread-store.ts";
+import { enqueueOutbox, readOutbox } from "./thread-outbox.ts";
+import { readJson, writeJson } from "./thread-store.ts";
 import { agentEnv, binPath, harnessChildEnv } from "./workspace.ts";
 
 export const DEFAULT_POLICY = {
@@ -232,13 +233,7 @@ export class ThreadRouter {
   }
 
   enqueueReply(thread: Thread, text: string, id: string = randomUUID()): void {
-    const path = join(this.cfg.stateDir, "thread-outbox", thread.key, `${safeId(id)}.json`);
-    const previous = readJson<{ queuedAt?: number } | null>(path, null);
-    // Sub-millisecond epoch time also orders replies from the separate worker CLI process.
-    const queuedAt = previous
-      ? (previous.queuedAt ?? statSync(path).mtimeMs)
-      : performance.timeOrigin + performance.now();
-    writeJson(path, { text, queuedAt });
+    enqueueOutbox(this.cfg.stateDir, thread.key, text, id);
   }
 
   async drain(): Promise<void> {
@@ -247,25 +242,14 @@ export class ThreadRouter {
     try {
       for (const thread of this.registry.threads) {
         const dir = join(this.cfg.stateDir, "thread-outbox", thread.key);
-        mkdirSync(dir, { recursive: true, mode: 0o700 });
-        const items = readdirSync(dir)
-          .filter((s) => s.endsWith(".json"))
-          .map((file) => {
-            const path = join(dir, file);
-            const item = readJson<{ text: string; sent?: boolean; queuedAt?: number }>(path, {
-              text: "",
-            });
-            return { file, path, item, queuedAt: item.queuedAt ?? statSync(path).mtimeMs };
-          })
-          .sort((a, b) => a.queuedAt - b.queuedAt || a.file.localeCompare(b.file));
-        for (const { file, path, item, queuedAt } of items) {
+        for (const { file, item } of readOutbox(this.cfg.stateDir, thread.key)) {
           if (item.sent) continue;
           if (typeof item.text !== "string" || !item.text.trim())
             throw new Error("invalid outbox text");
           // No destination is accepted from the worker payload. The registry alone decides.
           try {
             await this.sendReply(thread, item.text, file.slice(0, -5));
-            writeJson(path, { text: item.text, queuedAt, sent: true });
+            writeJson(join(dir, file), { ...item, sent: true });
           } catch {
             break;
           } // retain and retry, preserving per-thread output order

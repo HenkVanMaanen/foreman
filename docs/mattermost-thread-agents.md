@@ -31,6 +31,8 @@ Each CLI holds a per-thread kernel lock. Surviving CLI locks count against the c
 
 Thread agents use `thread-reply` on PATH, with text on stdin, for progress/questions. Assistant output is posted after a successful turn. A question ends that turn; a new human message resumes it. Agents launched with the feature enabled have no inherited Mattermost/Telegram environment credentials; thread agents also lack the resident control capability. Detached spawn-worker launches strip bot tokens and the resident capability in either mode. Resident reply/ask-human calls proxy through an authenticated local supervisor endpoint, which retains credentials. Worker outboxes carry text only; the supervisor resolves channel/root from its registry and ignores destination fields in payloads. Failed sends remain queued. Final responses have stable per-batch outbox names.
 
+Supervisor and worker replies share a per-thread outbox lock and durable `.order` list. Delivery follows publication order regardless of filenames or clocks; retrying a delivery ID retains its original reply and position, including its sent marker. Existing JSON files retain their names and payloads and are adopted in their recorded timestamp/mtime order. A crash between publishing a reply and recording its position is recovered before later replies can be queued or drained.
+
 Repo policy defaults allow branch, branch push and draft PR. Merge, main pushes/edits, undraft, deploy, harness-sync and keeper edits default false. Each thread reads current policy before every turn. `thread-control policy-get owner/repo` is a public read. Only the resident endpoint accepts updates, for example:
 
 ```bash

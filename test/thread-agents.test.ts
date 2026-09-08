@@ -1,5 +1,5 @@
 // Unit and end-to-end mock checks. No real CLI, credentials, transport, poller reaper or supervisor.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import {
   chmodSync,
   existsSync,
@@ -9,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +17,7 @@ import { join, resolve } from "node:path";
 import { loadConfig, parseChannelMode, parseThreadCap } from "../src/config.ts";
 import { formatInboxPrompt } from "../src/inbox.ts";
 import { authorizedPosts, type HumanPost, Mattermost, receiptPath } from "../src/mattermost.ts";
+import { enqueueOutbox, readOutbox } from "../src/thread-outbox.ts";
 import { readJson, writeJson } from "../src/thread-store.ts";
 import { type RunTurn, repoPolicy, ThreadRouter, type TurnResult } from "../src/threads.ts";
 import { agentEnv } from "../src/workspace.ts";
@@ -252,8 +254,22 @@ test("failed outbox drains progress and finals in enqueue order across turns and
   if (!t) throw new Error("no thread");
   await r.tick();
   r.enqueueReply(t, "first progress", "zzzz");
+  const skew = join(f.dir, "skew.ts");
+  writeFileSync(
+    skew,
+    `Object.defineProperty(globalThis, "performance", {
+      value: { timeOrigin: ${performance.timeOrigin + performance.now() + 60_000}, now: () => 0 },
+    });`,
+  );
   const child = Bun.spawn(
-    [process.execPath, "--no-env-file", resolve(import.meta.dir, "../src/thread-cli.ts"), "outbox"],
+    [
+      process.execPath,
+      "--no-env-file",
+      "--preload",
+      skew,
+      resolve(import.meta.dir, "../src/thread-cli.ts"),
+      "outbox",
+    ],
     {
       cwd: f.dir,
       env: {
@@ -279,7 +295,8 @@ test("failed outbox drains progress and finals in enqueue order across turns and
   await until(() => r.snapshot().threads[0]?.status === "idle");
   await r.stop();
   const path = join(f.cfg.stateDir, "thread-outbox", t.key, "final-z.json");
-  const queuedAt = readJson<{ queuedAt: number }>(path, { queuedAt: 0 }).queuedAt;
+  const orderPath = join(f.cfg.stateDir, "thread-outbox", t.key, ".order");
+  const order = readJson<string[]>(orderPath, []);
   const sent: { text: string; id: string }[] = [];
   const next = new ThreadRouter(
     f.cfg,
@@ -305,7 +322,119 @@ test("failed outbox drains progress and finals in enqueue order across turns and
   ]);
   expect(sent[3]?.id).toBe("final-z");
   expect(sent[5]?.id).toBe("final-a");
-  expect(readJson<{ queuedAt: number }>(path, { queuedAt: 0 }).queuedAt).toBe(queuedAt);
+  expect(readJson<string[]>(orderPath, [])).toEqual(order);
+  // A replay cannot resurrect an earlier delivery behind replies already sent after it.
+  next.enqueueReply(t, "replayed first final", "final-z");
+  await next.drain();
+  expect(sent).toHaveLength(6);
+  expect(readJson(path, {})).toEqual({ text: "first final", sent: true });
+});
+
+test("tied enqueue clocks cannot put filename order ahead of publication order", async () => {
+  const f = fixture();
+  const r = f.router();
+  f.bind(r, f.post("root"));
+  const t = r.snapshot().threads[0];
+  if (!t) throw new Error("no thread");
+  await r.drain();
+  f.sent.length = 0;
+  const clock = spyOn(performance, "now").mockReturnValue(0);
+  try {
+    r.enqueueReply(t, "first", "zzzz");
+    r.enqueueReply(t, "second", "aaaa");
+  } finally {
+    clock.mockRestore();
+  }
+  await r.stop();
+  await f.router().drain();
+  expect(f.sent.map((item) => item.text)).toEqual(["first", "second"]);
+});
+
+test("outbox adopts legacy files and recovers publication before order checkpoint without changing IDs", () => {
+  const f = fixture();
+  const dir = join(f.cfg.stateDir, "thread-outbox", "legacy");
+  writeJson(join(dir, "sent.json"), { text: "sent", queuedAt: 1, sent: true });
+  writeJson(join(dir, "zz-first.json"), { text: "first", queuedAt: 2 });
+  writeJson(join(dir, "aa-second.json"), { text: "second", queuedAt: 3 });
+  const legacy = join(dir, "legacy.json");
+  writeJson(legacy, { text: "no timestamp" });
+  utimesSync(legacy, 0.004, 0.004);
+  expect(readOutbox(f.cfg.stateDir, "legacy").map(({ file }) => file)).toEqual([
+    "sent.json",
+    "zz-first.json",
+    "aa-second.json",
+    "legacy.json",
+  ]);
+  expect(readJson(join(dir, "sent.json"), {})).toEqual({ text: "sent", queuedAt: 1, sent: true });
+  expect(readJson(legacy, {})).toEqual({ text: "no timestamp" });
+  // Simulate death after the atomic payload rename but before the .order rename. Also leave
+  // a pre-publication temp file: it must never be delivered or reserve a queue position.
+  writeJson(join(dir, "zz-orphan.json"), { text: "published before crash" });
+  writeFileSync(join(dir, "unpublished.json.123.tmp"), '{"text":"not published"}');
+  enqueueOutbox(f.cfg.stateDir, "legacy", "after recovery", "0000");
+  enqueueOutbox(f.cfg.stateDir, "legacy", "retry must retain original payload", "zz-orphan");
+  const items = readOutbox(f.cfg.stateDir, "legacy");
+  expect(items.map(({ file }) => file)).toEqual([
+    "sent.json",
+    "zz-first.json",
+    "aa-second.json",
+    "legacy.json",
+    "zz-orphan.json",
+    "0000.json",
+  ]);
+  expect(items.at(-2)?.item.text).toBe("published before crash");
+  expect(items[0]?.item.sent).toBe(true);
+});
+
+test("concurrent supervisor and worker writers retain every reply in each writer's order", async () => {
+  const f = fixture();
+  const r = f.router();
+  f.bind(r, f.post("root"));
+  const t = r.snapshot().threads[0];
+  if (!t) throw new Error("no thread");
+  await r.drain();
+  f.sent.length = 0;
+  const writer = join(f.dir, "writer.ts");
+  writeFileSync(
+    writer,
+    `
+    import { enqueueOutbox } from ${JSON.stringify(resolve(import.meta.dir, "../src/thread-outbox.ts"))};
+    const [state, key, writer] = process.argv.slice(2);
+    for (let i = 0; i < 5; i++) enqueueOutbox(state, key, writer + ":" + i, writer + "-" + (5 - i));
+  `,
+  );
+  const children = ["a", "b", "c"].map((name) =>
+    Bun.spawn([process.execPath, "--no-env-file", writer, f.cfg.stateDir, t.key, name], {
+      cwd: f.dir,
+      env: { PATH: "/usr/bin:/bin" },
+      stdout: "pipe",
+      stderr: "pipe",
+    }),
+  );
+  try {
+    for (let i = 0; i < 5; i++) r.enqueueReply(t, `supervisor:${i}`, `supervisor-${5 - i}`);
+    await r.drain(); // snapshot may race publication; later replies must follow the snapshot
+    expect(await Promise.all(children.map((child) => child.exited))).toEqual([0, 0, 0]);
+    await r.stop();
+    await f.router().drain();
+    expect(f.sent).toHaveLength(20);
+    expect(new Set(f.sent.map(({ text }) => text)).size).toBe(20);
+    for (const writer of ["a", "b", "c", "supervisor"]) {
+      expect(
+        f.sent.filter(({ text }) => text.startsWith(`${writer}:`)).map(({ text }) => text),
+      ).toEqual(Array.from({ length: 5 }, (_, i) => `${writer}:${i}`));
+    }
+    expect(f.sent.map(({ text }) => text)).toEqual(
+      readOutbox(f.cfg.stateDir, t.key)
+        .slice(1)
+        .map(({ item }) => item.text),
+    );
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null) child.kill();
+      await child.exited;
+    }
+  }
 });
 
 test("resident-owned policy persists source/old/new, unverified worker grants cannot widen defaults", () => {
