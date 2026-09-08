@@ -9,7 +9,13 @@ interface Reply {
 }
 export interface OutboxEntry {
   file: string;
-  item: { text: string; sent?: boolean; queuedAt?: number };
+  item: {
+    text: string;
+    sent?: boolean;
+    queuedAt?: number;
+    chunks?: string[];
+    sentChunks?: number;
+  };
 }
 
 function outbox(state: string, key: string, reply: Reply | null): OutboxEntry[] {

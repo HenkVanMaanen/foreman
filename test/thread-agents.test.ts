@@ -151,6 +151,47 @@ test("crashed handoff is recovered from receipts and completed sessions survive 
   await until(() => next.snapshot().threads[0]?.status === "idle");
 });
 
+test("binding in Telegram emergency mode survives restart and resumes when Mattermost returns", async () => {
+  const f = fixture();
+  f.cfg.channelMode = "telegram";
+  const h = heldTurns();
+  const r = f.router(h.run);
+  const ref = f.post("root");
+  f.bind(r, ref);
+  const bound = r.snapshot();
+  expect(bound.threads).toHaveLength(1);
+  expect(readJson(join(f.cfg.stateDir, "threads/registry.json"), null)).toEqual(bound);
+  await r.stop();
+
+  const paused = f.router(h.run);
+  expect(paused.snapshot()).toEqual(bound);
+  expect(f.bind(paused, ref)).toEqual(bound.threads[0]);
+  f.post("followup", "root");
+  await paused.tick();
+  expect(h.calls).toHaveLength(0);
+  expect(f.sent).toHaveLength(0);
+  expect(f.resident).toHaveLength(0);
+  await paused.stop();
+
+  f.cfg.channelMode = "mattermost";
+  const resumed = f.router(h.run);
+  await resumed.tick();
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]?.key).toBe(bound.threads[0]?.key);
+  expect(h.calls[0]?.prompt).toContain('"id":"root"');
+  expect(h.calls[0]?.prompt).toContain('"id":"followup"');
+  expect(f.sent).toEqual([
+    {
+      channel: "channel1",
+      root: "root",
+      text: "Bound to a dedicated agent; queued for the next available slot.",
+    },
+  ]);
+  h.calls[0]?.end({ ok: true });
+  await until(() => resumed.snapshot().threads[0]?.status === "idle");
+  expect(resumed.snapshot().threads[0]?.done).toEqual(["root", "followup"]);
+});
+
 test("interrupted running batch replays with saved session and explicit at-least-once prompt", async () => {
   const f = fixture();
   const h = heldTurns();
@@ -353,6 +394,90 @@ test("outbox destination comes only from binding, transport failure retains deli
   expect(f.sent.filter((s) => s.text === "hello")).toEqual([
     { text: "hello", root: "root", channel: "channel2" },
   ]);
+});
+
+test.each([
+  { name: "ASCII", chunks: ["a".repeat(16383), "b".repeat(16383), "last chunk"] },
+  { name: "Unicode", chunks: [`${"a".repeat(16382)}😀`, "🧵".repeat(16383), "\nlast chunk"] },
+])("oversized $name replies resume durable chunks before later replies after restart", async ({
+  chunks,
+}) => {
+  const f = fixture();
+  const r = f.router();
+  f.bind(r, f.post("root", "root", "channel2"));
+  const t = r.snapshot().threads[0];
+  if (!t) throw new Error("no thread");
+  await r.drain();
+  const text = chunks.join("");
+  r.enqueueReply(t, text, "final-root");
+  enqueueOutbox(f.cfg.stateDir, t.key, "later reply", "aaaa");
+  await r.stop();
+
+  const path = join(f.cfg.stateDir, "thread-outbox", t.key, "final-root.json");
+  const orderPath = join(f.cfg.stateDir, "thread-outbox", t.key, ".order");
+  const order = readJson<string[]>(orderPath, []);
+  // Existing oversized entries also need recovery; they contain only the original text.
+  expect(readJson(path, {})).toEqual({ text });
+  const attempts: { text: string; id: string }[] = [];
+  const sent: { text: string; id: string; channel: string; root: string }[] = [];
+  let offline = true;
+  const restart = () => {
+    const next = new ThreadRouter(
+      f.cfg,
+      {},
+      () => {},
+      async () => ({ ok: false }),
+      async (thread, part, id) => {
+        attempts.push({ text: part, id });
+        if (Array.from(part).length > 16383 || Buffer.byteLength(part) > 65535 || !part.trim())
+          throw new Error("server rejected message size");
+        if (offline && sent.length === 1) throw new Error("offline after first chunk");
+        sent.push({ text: part, id, channel: thread.channel, root: thread.root });
+      },
+    );
+    routers.push(next);
+    return next;
+  };
+  const failing = restart();
+  await failing.drain();
+  expect(attempts.map((item) => item.text)).toEqual(chunks.slice(0, 2));
+  expect(sent.map((item) => item.text)).toEqual(chunks.slice(0, 1));
+  expect(readJson(path, {})).toEqual({ text, chunks, sentChunks: 1 });
+  await failing.stop();
+
+  offline = false;
+  const next = restart();
+  next.enqueueReply(t, "replayed final must not replace the chunk plan", "final-root");
+  await next.drain();
+  await next.drain();
+  expect(sent.map((item) => item.text)).toEqual([...chunks, "later reply"]);
+  expect(
+    sent
+      .slice(0, -1)
+      .map((item) => item.text)
+      .join(""),
+  ).toBe(text);
+  expect(sent.every((item) => item.channel === "channel2" && item.root === "root")).toBe(true);
+  expect(new Set(sent.map((item) => item.id)).size).toBe(sent.length);
+  expect(attempts[1]?.id).toBe(attempts[2]?.id);
+  expect(readJson(path, {})).toEqual({ text, chunks, sentChunks: chunks.length, sent: true });
+  expect(readJson<string[]>(orderPath, [])).toEqual(order);
+});
+
+test("whitespace-only reply chunks do not block later content or subsequent replies", async () => {
+  const f = fixture();
+  const r = f.router();
+  f.bind(r, f.post("root"));
+  const t = r.snapshot().threads[0];
+  if (!t) throw new Error("no thread");
+  await r.drain();
+  f.sent.length = 0;
+  r.enqueueReply(t, `${"a".repeat(16383)}${" ".repeat(16383)}last chunk`, "long");
+  r.enqueueReply(t, "later reply", "later");
+  await r.drain();
+  await r.drain();
+  expect(f.sent.map((item) => item.text)).toEqual(["a".repeat(16383), "last chunk", "later reply"]);
+  expect(readOutbox(f.cfg.stateDir, t.key).every(({ item }) => item.sent)).toBe(true);
 });
 
 test("failed outbox drains progress and finals in enqueue order across turns and restart", async () => {

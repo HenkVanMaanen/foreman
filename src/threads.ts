@@ -67,6 +67,15 @@ export type RunTurn = (
 ) => Promise<TurnResult>;
 export type SendReply = (thread: Thread, text: string, deliveryId: string) => Promise<unknown>;
 const reference = (p: HumanPost) => `mm:${p.channel}:${p.id}`;
+const MAX_REPLY_CHARACTERS = 16383; // Mattermost's post limit counts Unicode code points.
+
+function replyChunks(text: string): string[] {
+  const characters = Array.from(text);
+  const chunks: string[] = [];
+  for (let i = 0; i < characters.length; i += MAX_REPLY_CHARACTERS)
+    chunks.push(characters.slice(i, i + MAX_REPLY_CHARACTERS).join(""));
+  return chunks;
+}
 
 export class ThreadRouter {
   readonly token = randomUUID();
@@ -206,6 +215,7 @@ export class ThreadRouter {
         done: [],
       };
       this.registry.threads.push(thread);
+      this.save(); // Binding must survive even when emergency mode pauses collection.
       this.collect();
       this.enqueueReply(thread, "Bound to a dedicated agent; queued for the next available slot.");
       return thread;
@@ -261,9 +271,27 @@ export class ThreadRouter {
           if (item.sent) continue;
           if (typeof item.text !== "string" || !item.text.trim())
             throw new Error("invalid outbox text");
+          const chunks = item.chunks ?? replyChunks(item.text);
+          if (!item.chunks && chunks.length > 1) {
+            item.chunks = chunks;
+            writeJson(join(dir, file), item); // Persist chunk boundaries before any delivery.
+          }
           // No destination is accepted from the worker payload. The registry alone decides.
           try {
-            await this.sendReply(thread, item.text, file.slice(0, -5));
+            for (let i = item.sentChunks ?? 0; i < chunks.length; i++) {
+              const chunk = chunks[i];
+              // Mattermost rejects empty posts, including whitespace-only chunks.
+              if (chunk?.trim())
+                await this.sendReply(
+                  thread,
+                  chunk,
+                  item.chunks ? `${file.slice(0, -5)}:${i}` : file.slice(0, -5),
+                );
+              if (item.chunks) {
+                item.sentChunks = i + 1;
+                writeJson(join(dir, file), item);
+              }
+            }
             writeJson(join(dir, file), { ...item, sent: true });
           } catch {
             break;
