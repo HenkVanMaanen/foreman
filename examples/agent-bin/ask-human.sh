@@ -7,6 +7,7 @@
 #
 # Usage:
 #   ask-human "Need a token for gitlab.acme.com" [--options a,b,c] [--urgency blocking|background]
+#   ask-human "Send the new value" --secret  # Telegram: reserve before posting; lasts one hour
 #
 # Channels (any that are configured are used):
 #   Mattermost DM:   MATTERMOST_BASE_URL, MATTERMOST_BOT_TOKEN, MATTERMOST_TARGET_USER
@@ -15,22 +16,47 @@
 #
 # Routing id: on Mattermost it is the question's post id (so replies correlate by thread
 # root_id). On Telegram-only it is a generated id embedded as "#id" in the message.
+set +x # Questions and channel credentials must never reach shell tracing.
 set -euo pipefail
 
-question="${1:?usage: ask-human \"question\"|- [--options a,b] [--urgency blocking|background]}"
+question="${1:?usage: ask-human \"question\"|- [--secret] [--options a,b] [--urgency blocking|background]}"
 shift || true
 # "-" reads the question from stdin instead of argv. Use it whenever the text carries anything
 # sensitive (a sign-in URL, a one-time device code): /proc/<pid>/cmdline is world-readable, so an
 # argv-passed secret is visible to every local user for the life of the process. Matches `reply -`.
 [ "$question" = "-" ] && question="$(cat)"
-options=""; urgency="blocking"
+options=""; urgency="blocking"; secret=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --secret) secret=1; shift ;;
     --options) options="$2"; shift 2 ;;
     --urgency) urgency="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+
+# Reserve BEFORE sendMessage: a reply can arrive before this script returns its id.
+# Secret capture is Telegram-only and requires the updated resident inbox + age setup.
+if [ "$secret" = 1 ]; then
+  umask 077
+  export FOREMAN_STATE_DIR="${FOREMAN_STATE_DIR:-$HOME/.foreman}"
+  wm_dir="$FOREMAN_STATE_DIR/wait-reply"
+  mkdir -p "$wm_dir"
+  helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/secret-replies.ts"
+  id="$(flock "$wm_dir/.secret.lock" bun "$helper" reserve)"
+  sent=0
+  trap '[ "$sent" = 1 ] || flock "$wm_dir/.secret.lock" bun "$helper" cancel "$id" >/dev/null 2>&1' EXIT
+  # A failed/ambiguous send leaves a tombstone; any late reply is still suppressed.
+  printf '%s\n' "url = \"https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage\"" |
+    curl -fsS -K - --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${question}
+Reply to this message with the value only. This capture expires in one hour.
+(ref #${id})" --data-urlencode 'disable_web_page_preview=true' |
+    jq -e '.ok == true' >/dev/null
+  sent=1
+  printf '%s\n' "$id"
+  exit 0
+fi
 
 gen_id="q$(date +%s)$RANDOM"
 routing=""

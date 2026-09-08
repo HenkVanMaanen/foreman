@@ -21,9 +21,10 @@
 #
 # Usage:
 #   wait-reply <id>            # single-thread: prints the reply text + newline
-#   wait-reply <id> --raw      # single-thread, NO trailing newline — for piping a secret
-#                              # straight into the store, e.g.:
+#   wait-reply <id> --raw      # ONLY an id from ask-human --secret; no polling or trailing newline
+#                              # pipe straight into the store with shell pipefail enabled:
 #                              #   wait-reply <id> --raw | foreman secret set GITLAB_TOKEN
+#   wait-reply <id> --cancel   # discard a reserved capture; late replies remain private
 #   wait-reply                 # INBOX: drain all new human messages since the last look
 #   wait-reply --inbox         # same as the no-arg inbox form (explicit)
 #
@@ -34,8 +35,10 @@
 # On the FIRST ever call the watermark is seeded to "now" (no history dump); we then block for
 # the next new message. Each returned post is 👀-reacted, same as single-thread mode.
 #
-# Optional: FOREMAN_WAIT_TIMEOUT seconds (default: no timeout). Timeout with nothing new → exit 3
-# in either mode, so the caller can cheaply re-block.
+# Optional: FOREMAN_WAIT_TIMEOUT seconds (default: no timeout; secret waits: one hour).
+# Timeout → exit 3. Secret timeout closes the route; a killed waiter can resume until expiry.
+# Closed/expired/already-claimed secret route → exit 4. Configuration/failure → exit 1 or 2.
+set +x # A Telegram response may contain a reserved secret, even in ordinary inbox mode.
 set -euo pipefail
 
 # --- Mode + arg parsing ---------------------------------------------------------------------
@@ -53,6 +56,26 @@ else
     echo "wait-reply: invalid id '$id' (allowed chars: A-Za-z0-9_-)" >&2; exit 2
   fi
   [ "${2:-}" = "--raw" ] && raw=1
+fi
+
+# --raw is safe only for ids reserved by ask-human --secret BEFORE the question was
+# posted. Refuse retroactive claims: that reply may already be in a model prompt.
+if [[ "$id" == secret-* ]] || [ "$raw" = 1 ]; then
+  umask 077
+  if ! [[ "$id" =~ ^secret-[a-f0-9-]{36}$ ]] || { [ "$raw" != 1 ] && [ "${2:-}" != --cancel ]; }; then
+    echo 'wait-reply: use ask-human --secret, then wait-reply <new-id> --raw | foreman secret set NAME' >&2
+    exit 2
+  fi
+  export FOREMAN_STATE_DIR="${FOREMAN_STATE_DIR:-$HOME/.foreman}"
+  wm_dir="$FOREMAN_STATE_DIR/wait-reply"
+  helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/secret-replies.ts"
+  [ -d "$wm_dir/secret-replies/$id" ] || { echo 'wait-reply: unknown secret route' >&2; exit 2; }
+  if [ "${2:-}" = --cancel ]; then
+    exec flock "$wm_dir/.secret.lock" bun "$helper" cancel "$id"
+  fi
+  # OS lock survives only as long as the waiter; SIGKILL cannot leave a stale PID claim.
+  # The reservation and encrypted reply survive a killed waiter for a later turn to resume.
+  exec flock -n -E 4 "$wm_dir/secret-replies/$id/waiter.lock" bun "$helper" wait "$id"
 fi
 
 deadline=0
@@ -307,6 +330,16 @@ fi
 
 # --- Telegram ---
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  umask 077
+  # Serialize legacy single-thread/inbox requests, INCLUDING in-flight long polls.
+  # Raw waiters never acquire this lock or call getUpdates.
+  exec 9>"$wm_dir/.telegram-poll.lock"
+  flock 9
+  helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/secret-replies.ts"
+  route_secrets() {
+    FOREMAN_STATE_DIR="${FOREMAN_STATE_DIR:-$HOME/.foreman}" \
+      flock "$wm_dir/.secret.lock" bun "$helper" filter
+  }
   if [ "$mode" = "inbox" ]; then
     # ---- INBOX over Telegram -----------------------------------------------------------------
     # Telegram has no threads, so <root_id_or_-> is always "-". The update_id acts as a natural
@@ -315,12 +348,18 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
     # Token stays out of argv (URL embeds it): passed via a curl config read from stdin (-K -).
     tg_off_file="$wm_dir/inbox.tg.offset"
     if [ ! -f "$tg_off_file" ]; then
-      seed="$(curl -fsS -K - <<EOF | jq -r '.result[-1].update_id // empty' || true
+      # After a lost watermark, reservations still own their replies. Never use offset=-1
+      # here: Telegram would forget earlier pending updates before we could encrypt them.
+      if [ -d "$wm_dir/secret-replies" ]; then
+        printf '0' > "$tg_off_file"
+      else
+        seed="$(curl -fsS -K - <<EOF | jq -r '.result[-1].update_id // empty' || true
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=0&offset=-1"
 EOF
 )"
-      if [ -n "$seed" ]; then printf '%s' "$((seed + 1))" > "$tg_off_file" 2>/dev/null || true
-      else printf '0' > "$tg_off_file" 2>/dev/null || true; fi
+        if [ -n "$seed" ]; then printf '%s' "$((seed + 1))" > "$tg_off_file" 2>/dev/null || true
+        else printf '0' > "$tg_off_file" 2>/dev/null || true; fi
+      fi
     fi
     offset="$(cat "$tg_off_file" 2>/dev/null || echo 0)"; [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
     # Acknowledge a human message with a 👀 (same as Mattermost inbox) so the human sees at a
@@ -340,16 +379,14 @@ EOF
     fi
     while true; do
       # Yield getUpdates to any LIVE single-thread waiter (ask-human) rather than racing it — see
-      # the single-consumer note near the top. We back off briefly and honor our own timeout so the
-      # supervisor's poll cycles instead of spinning.
-      if single_thread_active; then
-        timed_out && { echo "wait-reply: inbox timed out (nothing new)" >&2; exit 3; }
-        sleep 1; continue
-      fi
+      # the single-consumer note near the top. Return to release the poll lock; the supervisor
+      # backs off on fast empty results before rearming.
+      if single_thread_active; then exit 3; fi
       resp="$(curl -fsS -K - <<EOF
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}"
 EOF
 )" || { sleep 2; continue; }
+      resp="$(printf '%s' "$resp" | route_secrets)" || exit 1
       # SECURITY: a Telegram bot can be DM'd by anyone who knows its @username. Restrict the inbox
       # to the owner's chat (TELEGRAM_CHAT_ID) so a stranger's message can't reach us as if it were
       # the human (a prompt-injection vector). Strangers' updates are still consumed (offset advances
@@ -388,6 +425,7 @@ TGINBOX
 url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=25&offset=${offset}"
 EOF
 )" || { sleep 2; continue; }
+      resp="$(printf '%s' "$resp" | route_secrets)" || exit 1
       last="$(echo "$resp" | jq -r '.result[-1].update_id // empty')"
       [ -n "$last" ] && offset=$((last + 1))
       # SECURITY: restrict to the owner's chat (TELEGRAM_CHAT_ID) so a stranger can't answer for the

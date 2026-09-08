@@ -13,8 +13,9 @@
 //   2) It is the ONLY caller of `wait-reply --inbox`. Every other reader — the parked path, and
 //      the re-login relay waiting for a sign-in code (src/relogin.ts) — consumes from the shared
 //      queue rather than spawning its own poll, so Telegram getUpdates has exactly one consumer.
-//      (ask-human's single-thread wait-reply is serialized against it by a sentinel in the
-//      script — see wait-reply.sh.)
+//      (legacy single-thread waits use the script's poll lock. Secret replies are reserved
+//      before posting, encrypted by this poller before MSG formatting, and read off-disk
+//      by --raw without another getUpdates consumer — see secret-replies.ts.)
 //   3) A line taken off the queue is GONE from it: the watermark moved when the poller read it,
 //      so the in-memory copy is the only one left. Whoever takes a line therefore owns it, and
 //      must either use it, deliver it to the agent, or hand it back — via InboxQueue.push (which
