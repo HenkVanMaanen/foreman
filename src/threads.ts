@@ -131,6 +131,10 @@ export class ThreadRouter {
       .sort((a, b) => a.at - b.at || a.id.localeCompare(b.id));
   }
 
+  private findThread(post: HumanPost): Thread | undefined {
+    return this.registry.threads.find((t) => t.channel === post.channel && t.root === post.root);
+  }
+
   /** Poller lines carry references; provenance always comes from the durable authorized receipt. */
   route(lines: string[]): string[] {
     this.collect();
@@ -141,9 +145,7 @@ export class ThreadRouter {
     if (this.cfg.channelMode === "telegram") return;
     const resident: string[] = [];
     for (const post of this.receipts()) {
-      const thread = this.registry.threads.find(
-        (t) => t.channel === post.channel && t.root === post.root,
-      );
+      const thread = this.findThread(post);
       if (thread) {
         if (!thread.done.includes(post.id) && !thread.pending.includes(post.id)) {
           thread.pending.push(post.id);
@@ -194,9 +196,7 @@ export class ThreadRouter {
       if (!repo || !value.startsWith("/"))
         throw new Error("bind needs repo and absolute isolated worktree path");
       const cwd = resolve(value);
-      const existing = this.registry.threads.find(
-        (t) => t.channel === source.channel && t.root === source.root,
-      );
+      const existing = this.findThread(source);
       if (existing) {
         if (existing.repo !== repo || existing.cwd !== cwd)
           throw new Error("thread already bound elsewhere");
@@ -226,9 +226,7 @@ export class ThreadRouter {
       return { ok: true };
     }
     if (command === "retry") {
-      const thread = this.registry.threads.find(
-        (t) => t.channel === source.channel && t.root === source.root,
-      );
+      const thread = this.findThread(source);
       if (thread?.status !== "failed") throw new Error("thread is not failed");
       delete thread.error;
       thread.status = "queued";
@@ -271,10 +269,12 @@ export class ThreadRouter {
           if (item.sent) continue;
           if (typeof item.text !== "string" || !item.text.trim())
             throw new Error("invalid outbox text");
+          const path = join(dir, file);
+          const deliveryId = file.slice(0, -5);
           const chunks = item.chunks ?? replyChunks(item.text);
           if (!item.chunks && chunks.length > 1) {
             item.chunks = chunks;
-            writeJson(join(dir, file), item); // Persist chunk boundaries before any delivery.
+            writeJson(path, item); // Persist chunk boundaries before any delivery.
           }
           // No destination is accepted from the worker payload. The registry alone decides.
           try {
@@ -285,14 +285,14 @@ export class ThreadRouter {
                 await this.sendReply(
                   thread,
                   chunk,
-                  item.chunks ? `${file.slice(0, -5)}:${i}` : file.slice(0, -5),
+                  item.chunks ? `${deliveryId}:${i}` : deliveryId,
                 );
               if (item.chunks) {
                 item.sentChunks = i + 1;
-                writeJson(join(dir, file), item);
+                writeJson(path, item);
               }
             }
-            writeJson(join(dir, file), { ...item, sent: true });
+            writeJson(path, { ...item, sent: true });
           } catch {
             break;
           } // retain and retry, preserving per-thread output order
