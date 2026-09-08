@@ -151,6 +151,107 @@ test("crashed handoff is recovered from receipts and completed sessions survive 
   await until(() => next.snapshot().threads[0]?.status === "idle");
 });
 
+test.each([
+  "receipt read",
+  "registry save",
+])("routing survives %s failure and the scheduled tick recovers without another message", async (fault) => {
+  const f = fixture();
+  const h = heldTurns();
+  const r = f.router(h.run);
+  r.start();
+  f.bind(r, f.post("root"));
+  const path = join(f.cfg.stateDir, "threads/registry.json");
+  const persisted = readJson(path, null);
+  const followup = f.post("followup", "root");
+  const triage = f.post("triage");
+  const obstruction =
+    fault === "receipt read"
+      ? join(f.cfg.stateDir, "thread-inbox/broken.json")
+      : `${path}.${process.pid}.tmp`;
+  if (fault === "receipt read") writeFileSync(obstruction, "{");
+  else mkdirSync(obstruction); // Force an atomic-write failure without changing the saved registry.
+
+  const ordinary = ["MSG 123 - emergency message", "ACK 124 - +1"];
+  expect(
+    r.route([
+      `MSG ${followup} root work followup`,
+      `MSG ${triage} triage work triage`,
+      ...ordinary,
+    ]),
+  ).toEqual(ordinary);
+  expect(r.route(["MSG 125 - still listening"])).toEqual(["MSG 125 - still listening"]);
+  await expect(r.tick()).rejects.toThrow();
+  expect(f.resident).toEqual([]);
+  expect(h.calls).toHaveLength(0);
+  expect(readJson(path, null)).toEqual(persisted);
+
+  rmSync(obstruction, { recursive: true });
+  // No new poller batch: the existing timer must replay the receipts, including unseen triage.
+  await until(() => h.calls.length === 1);
+  expect(f.resident).toEqual([`MSG ${triage} triage work triage`]);
+  expect(h.calls[0]?.prompt).toContain('"id":"followup"');
+  expect(h.calls[0]?.prompt).not.toContain('"id":"triage"');
+  expect(r.snapshot().threads[0]?.pending).toEqual(["root", "followup"]);
+  expect(readJson(path, null)).toEqual(r.snapshot());
+  r.collect();
+  expect(f.resident).toHaveLength(1);
+  h.calls[0]?.end({ ok: true });
+  await until(() => r.snapshot().threads[0]?.status === "idle");
+  await r.tick();
+  expect(h.calls).toHaveLength(1);
+  expect(r.snapshot().threads[0]?.done).toEqual(["root", "followup"]);
+});
+
+test("shutdown during a routing failure leaves receipts recoverable by the next router", async () => {
+  const f = fixture();
+  const r = f.router();
+  r.start();
+  f.bind(r, f.post("root"));
+  const followup = f.post("followup", "root");
+  const triage = f.post("triage");
+  const obstruction = join(f.cfg.stateDir, `threads/registry.json.${process.pid}.tmp`);
+  mkdirSync(obstruction);
+  await r.stop();
+  // A poll already in flight can return its last batch after shutdown has begun.
+  expect(
+    r.route([
+      `MSG ${followup} root work followup`,
+      `MSG ${triage} triage work triage`,
+      "MSG 123 - hand back on shutdown",
+    ]),
+  ).toEqual(["MSG 123 - hand back on shutdown"]);
+  await r.stop();
+  expect(f.resident).toEqual([]);
+
+  rmSync(obstruction, { recursive: true });
+  const h = heldTurns();
+  const restarted = f.router(h.run);
+  await restarted.tick();
+  expect(f.resident).toEqual([`MSG ${triage} triage work triage`]);
+  expect(h.calls).toHaveLength(1);
+  expect(h.calls[0]?.prompt).toContain('"id":"followup"');
+  h.calls[0]?.end({ ok: true });
+  await until(() => restarted.snapshot().threads[0]?.status === "idle");
+  expect(restarted.snapshot().threads[0]?.done).toEqual(["root", "followup"]);
+});
+
+test("resident delivery failure leaves triage eligible for retry after the registry was saved", () => {
+  const f = fixture();
+  let unavailable = true;
+  const r = new ThreadRouter(f.cfg, {}, (lines) => {
+    if (unavailable) throw new Error("resident unavailable");
+    f.resident.push(...lines);
+  });
+  routers.push(r);
+  const triage = f.post("triage");
+  expect(r.route([`MSG ${triage} triage work triage`])).toEqual([]);
+  expect(f.resident).toEqual([]);
+  unavailable = false;
+  r.collect();
+  r.collect();
+  expect(f.resident).toEqual([`MSG ${triage} triage work triage`]);
+});
+
 test("binding in Telegram emergency mode survives restart and resumes when Mattermost returns", async () => {
   const f = fixture();
   f.cfg.channelMode = "telegram";

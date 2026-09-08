@@ -137,13 +137,20 @@ export class ThreadRouter {
 
   /** Poller lines carry references; provenance always comes from the durable authorized receipt. */
   route(lines: string[]): string[] {
-    this.collect();
+    try {
+      this.collect();
+    } catch {
+      // Receipts were committed before the transport advanced its cursor. tick() retries even
+      // without another message; after shutdown the next router recovers them from disk. Keep
+      // polling non-durable lines, but never fall back to sending bound-thread work to resident.
+      console.error("[threads] routing deferred; receipts retained for retry");
+    }
     return lines.filter((line) => !line.startsWith("MSG mm:"));
   }
 
   collect(): void {
     if (this.cfg.channelMode === "telegram") return;
-    const resident: string[] = [];
+    const resident = new Map<string, string>();
     for (const post of this.receipts()) {
       const thread = this.findThread(post);
       if (thread) {
@@ -155,15 +162,18 @@ export class ThreadRouter {
       }
       const ref = reference(post);
       if (!this.residentSeen.has(ref) && !this.registry.dismissed.includes(ref)) {
-        this.residentSeen.add(ref);
-        resident.push(postLine(post));
+        resident.set(ref, postLine(post));
       }
     }
     this.save(); // queue durable before delivering triage or starting any CLI
     for (const thread of this.registry.threads) {
       if (thread.status === "failed") this.notifyFailure(thread);
     }
-    if (resident.length) this.resident(resident);
+    if (resident.size) {
+      this.resident([...resident.values()]);
+      // A failed save or delivery must leave these receipts eligible for the next collection.
+      for (const ref of resident.keys()) this.residentSeen.add(ref);
+    }
   }
 
   private notifyFailure(thread: Thread): void {

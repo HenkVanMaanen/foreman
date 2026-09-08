@@ -215,7 +215,8 @@ export interface InboxPoller {
 }
 
 export interface PollerHooks {
-  /** Divert durable bound-thread receipts before resident delivery. */
+  /** Divert durable receipts before resident delivery; retain failed deliveries for retry
+   *  without throwing, so polling and the final shutdown drain can still complete. */
   route?: (lines: string[]) => string[];
   /** True while the agent is mid-turn (not parked) — the poller auto-acks in that case. */
   isBusy: () => boolean;
