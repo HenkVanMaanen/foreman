@@ -1554,7 +1554,11 @@ test.each([
   }
 });
 
-test("stopping the auto-mode thread inbox releases its child and inbox lock", async () => {
+test.each([
+  ["auto", true],
+  ["auto", false],
+  ["mattermost", true],
+] as const)("thread inbox retains its wrapper and releases its child and lock (mode=%s, telegram=%j)", async (mode, telegram) => {
   const f = await shellFixture();
   symlinkSync(process.execPath, join(f.bin, "bun"));
   let polling = false;
@@ -1574,9 +1578,10 @@ test("stopping the auto-mode thread inbox releases its child and inbox lock", as
       env: {
         ...f.env,
         FOREMAN_THREAD_AGENTS: "1",
-        FOREMAN_CHANNEL_MODE: "auto",
+        FOREMAN_CHANNEL_MODE: mode,
         FOREMAN_WAIT_TIMEOUT: "60",
         MATTERMOST_BASE_URL: `http://127.0.0.1:${api.port}`,
+        TELEGRAM_BOT_TOKEN: telegram ? "fake" : "",
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -1584,6 +1589,11 @@ test("stopping the auto-mode thread inbox releases its child and inbox lock", as
   );
   try {
     await until(() => polling);
+    const command = Bun.spawnSync(["ps", "-p", String(child.pid), "-o", "args="], {
+      stdout: "pipe",
+    });
+    expect(command.exitCode).toBe(0);
+    expect(command.stdout.toString()).toContain("wait-reply.sh --inbox");
     child.kill();
     expect(await child.exited).toBe(143);
     expect(await new Response(child.stdout).text()).toBe("");

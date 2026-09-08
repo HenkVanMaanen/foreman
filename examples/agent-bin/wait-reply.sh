@@ -99,11 +99,8 @@ if [ "${FOREMAN_THREAD_AGENTS:-0}" = 1 ] && [ "${FOREMAN_CHANNEL_MODE:-auto}" !=
   if [ "${FOREMAN_CHANNEL_MODE:-auto}" = mattermost ] || { [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; }; then
     [ "$mode" = inbox ] || { echo 'Thread routing uses the supervisor inbox; do not start a single-thread waiter.' >&2; exit 2; }
     helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/mattermost.ts"
-    if [ "${FOREMAN_CHANNEL_MODE:-auto}" != auto ] || [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-      exec bun "$helper"
-    fi
-    # Only setup failures (exit 2) fall back. Keep successful polls, timeouts and
-    # failures after setup on Mattermost, and stop its child when the inbox is stopped.
+    # Keep the wait-reply wrapper recognizable to orphan cleanup in every mode,
+    # and stop its child when the inbox is stopped.
     bun "$helper" &
     mm_pid=$!
     trap 'kill "$mm_pid" 2>/dev/null || true; wait "$mm_pid" 2>/dev/null || true' EXIT
@@ -113,6 +110,10 @@ if [ "${FOREMAN_THREAD_AGENTS:-0}" = 1 ] && [ "${FOREMAN_CHANNEL_MODE:-auto}" !=
     mm_status=0
     wait "$mm_pid" || mm_status=$?
     trap - EXIT HUP INT TERM
+    # Only setup failures (exit 2) fall back, in auto mode with Telegram configured.
+    if [ "${FOREMAN_CHANNEL_MODE:-auto}" != auto ] || [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+      exit "$mm_status"
+    fi
     [ "$mm_status" = 2 ] || exit "$mm_status"
     # Skip the legacy Mattermost reader after feature transport setup failed.
     unset MATTERMOST_BASE_URL MATTERMOST_BOT_TOKEN
