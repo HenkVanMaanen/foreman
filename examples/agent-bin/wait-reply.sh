@@ -216,7 +216,7 @@ if [ -n "${MATTERMOST_BASE_URL:-}" ] && [ -n "${MATTERMOST_BOT_TOKEN:-}" ]; then
       # char that would otherwise collapse an empty field) keeps all four columns aligned. Unresolved
       # target identities fail closed; never accept arbitrary channel members.
       inbox_pick() {
-        jq -r --arg bot "$bot_id" --arg tgt "$tgt_id" --argjson wm "$wm" '
+        jq -r --arg tgt "$tgt_id" --argjson wm "$wm" '
           [ .posts[]?
             | select(.create_at > $wm)
             | select($tgt != "" and .user_id == $tgt)
@@ -289,7 +289,7 @@ RACT
 
       # Given a channel/thread posts JSON on stdin, print "<post_id>\t<create_at>\t<message>" of
       # the oldest matching human post NEWER than the watermark, or nothing. $1 = root_id selector.
-      pick() { jq -r --arg q "$id" --arg bot "$bot_id" --arg tgt "$tgt_id" --argjson wm "$wm_val" \
+      pick() { jq -r --arg q "$id" --arg tgt "$tgt_id" --argjson wm "$wm_val" \
         "[.posts[]? | select(\$tgt != \"\" and .user_id == \$tgt) | select(.create_at > \$wm) | select($1)]
          | sort_by(.create_at)
          | (.[0] | if . then (.id + \"\t\" + (.create_at|tostring) + \"\t\" + .message) else empty end)" 2>/dev/null || true; }

@@ -169,22 +169,23 @@ export class ThreadRouter {
     if (command === "bind") {
       if (!repo || !value.startsWith("/"))
         throw new Error("bind needs repo and absolute isolated worktree path");
+      const cwd = resolve(value);
       const existing = this.registry.threads.find(
         (t) => t.channel === source.channel && t.root === source.root,
       );
       if (existing) {
-        if (existing.repo !== repo || existing.cwd !== resolve(value))
+        if (existing.repo !== repo || existing.cwd !== cwd)
           throw new Error("thread already bound elsewhere");
         return existing;
       }
-      if (this.registry.threads.some((t) => t.cwd === resolve(value)))
+      if (this.registry.threads.some((t) => t.cwd === cwd))
         throw new Error("worktree already belongs to another thread");
       const thread: Thread = {
         key: randomUUID(),
         channel: source.channel,
         root: source.root,
         repo,
-        cwd: resolve(value),
+        cwd,
         status: "queued",
         pending: [],
         done: [],
@@ -220,7 +221,7 @@ export class ThreadRouter {
       }
       const path = join(this.cfg.notesDir, "policy/autonomy.json");
       const store = readJson<PolicyStore>(path, { version: 1, repos: {}, audit: [] });
-      const before = repoPolicy(this.cfg.notesDir, repo);
+      const before = { ...DEFAULT_POLICY, ...store.repos[repo] };
       const after = { ...before, ...patch } as Policy;
       store.repos[repo] = after;
       store.audit.push({ repo, before, after, source, at: new Date().toISOString() });
