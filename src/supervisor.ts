@@ -143,9 +143,15 @@ export async function supervise(cfg: Config): Promise<void> {
   // throttles the auto-ack to once per busy stretch so a burst of messages isn't a burst of acks.
   const inbox = new InboxQueue();
   const threads = cfg.threadAgents
-    ? new ThreadRouter(cfg, passthroughEnv, (lines) => inbox.push(lines))
+    ? new ThreadRouter(cfg, passthroughEnv, (lines) => {
+        inbox.push(lines);
+        if (currentSession && inboxHooks.isBusy()) {
+          void inboxHooks.onBusyMessage(lines).catch(() => {
+            // Keep queued receipts even if the busy-message notification fails.
+          });
+        }
+      })
     : undefined;
-  if (threads) Object.assign(passthroughEnv, threads.start());
   // `awaitingCheckpoint` mirrors the per-life local so the poller's urgent-interrupt hook (created
   // once, before the loop) can see it: never interrupt a turn that is already checkpointing to
   // recycle. `currentSession` is the live session the hook interrupts; reset each life.
@@ -173,10 +179,10 @@ export async function supervise(cfg: Config): Promise<void> {
   // keeps the dashboard fresh) and to the re-login relay, which can block on the human for the
   // better part of an hour — a status that old reads as "quiet"/wedged.
   const refresh = () => stat(PHASE_STATE[io.phase]);
-  const poller = startInboxPoller(cfg, passthroughEnv, inbox, {
+  const inboxHooks = {
     ...(threads ? { route: (lines: string[]) => threads.route(lines) } : {}),
     isBusy: () => io.phase === "busy",
-    onBusyMessage: async (lines) => {
+    onBusyMessage: async (lines: string[]) => {
       // Urgent (an explicit !/​/now token, or a follow-up after we already acked once): preempt the
       // in-flight turn so the human is answered in seconds instead of after the whole (maybe
       // hour-long) turn. The interrupt ends the current turn with an error result; the turn-boundary
@@ -236,7 +242,9 @@ export async function supervise(cfg: Config): Promise<void> {
       });
     },
     refresh,
-  });
+  };
+  if (threads) Object.assign(passthroughEnv, threads.start());
+  const poller = startInboxPoller(cfg, passthroughEnv, inbox, inboxHooks);
 
   // Re-login relay: a dead OAuth token makes every turn fail instantly, which the loop would
   // otherwise continue into forever with the model never running. The engine selector chooses the
@@ -489,7 +497,6 @@ export async function supervise(cfg: Config): Promise<void> {
       // has already moved past those lines (invariant 3).
       watchdog.stop();
       await poller.stop();
-      await threads?.stop();
       // We are about to exit, so this in-memory copy is the last one: the watermark moved past
       // these lines when the poller read them, and no future life will ever see them. The relay
       // hands back its own consumed-but-unused lines the same way; these are the ones it never
@@ -501,6 +508,7 @@ export async function supervise(cfg: Config): Promise<void> {
           "not recover — please re-send anything that still needs an answer:",
         [...heldBack, ...inbox.drain()],
       );
+      await threads?.stop();
       return;
     }
     if (ended === "recycle") {

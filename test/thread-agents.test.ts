@@ -390,6 +390,68 @@ test("credential-free thread-reply CLI spools only text and control endpoint rej
   expect(readdirSync(join(f.cfg.stateDir, "thread-outbox", t.key)).length).toBeGreaterThan(0);
 });
 
+test("resident reply and ask-human proxy reads stdin only when the helper needs it", async () => {
+  const f = fixture();
+  const socket = join(f.dir, "control.sock");
+  const server = Bun.serve({
+    unix: socket,
+    fetch: async (request) => Response.json(await request.json()),
+  });
+  try {
+    const cases = [
+      { args: ["reply", "root", "argument reply"] },
+      { args: ["reply", "root", "--dry-run", "argument reply"] },
+      { args: ["reply", "root", ""] },
+      { args: ["ask-human", "argument question", "--urgency", "background"] },
+      { args: ["reply", "root"], input: "piped reply" },
+      { args: ["reply", "root", "--dry-run"], input: "piped dry run" },
+      { args: ["reply", "root", "-"], input: "stray root field" },
+      { args: ["ask-human", "-", "--urgency", "background"], input: "piped question" },
+    ];
+    for (const { args, input } of cases) {
+      const command = [
+        process.execPath,
+        "--no-env-file",
+        resolve(import.meta.dir, "../src/thread-cli.ts"),
+        ...args,
+      ];
+      const child = Bun.spawn(
+        // Bun's piped stdin is a socket; use a shell pipe for the helper's stray '-' recovery.
+        input === undefined ? command : ["bash", "-c", 'cat | "$@"', "stdin-proxy", ...command],
+        {
+          cwd: f.dir,
+          env: {
+            HOME: f.dir,
+            PATH: "/usr/bin:/bin",
+            FOREMAN_ROUTER_TOKEN: "test-capability",
+            FOREMAN_ROUTER_SOCKET: socket,
+          },
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      try {
+        if (input !== undefined) {
+          child.stdin.write(input);
+          child.stdin.end();
+        } // Argument messages must complete with stdin still open.
+        await until(() => child.exitCode !== null);
+        expect(await child.exited).toBe(0);
+        expect(JSON.parse(await new Response(child.stdout).text())).toEqual({
+          args,
+          text: input ?? "",
+        });
+      } finally {
+        if (child.exitCode === null) child.kill();
+        await child.exited;
+      }
+    }
+  } finally {
+    server.stop(true);
+  }
+});
+
 test("surviving CLI locks count against the concurrency cap after restart", async () => {
   const f = fixture();
   f.cfg.maxThreadAgents = 1;

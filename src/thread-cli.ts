@@ -1,5 +1,6 @@
 // Credential-free agent helpers. Mutations travel to the resident-owned control endpoint.
 import { randomUUID } from "node:crypto";
+import { fstatSync } from "node:fs";
 import { join } from "node:path";
 import { safeId, writeJson } from "./thread-store.ts";
 import { repoPolicy } from "./threads.ts";
@@ -22,7 +23,12 @@ try {
     const socket = process.env["FOREMAN_ROUTER_SOCKET"];
     if (!token || !socket || process.env["FOREMAN_THREAD_KEY"])
       throw new Error("resident control capability required");
-    const text = command === "reply" || command === "ask-human" ? await Bun.stdin.text() : "";
+    const message = args[args[1] === "--dry-run" ? 2 : 1];
+    const readStdin =
+      (command === "ask-human" && args[0] === "-") ||
+      (command === "reply" &&
+        (message === undefined || (message === "-" && fstatSync(0).isFIFO())));
+    const text = readStdin ? await Bun.stdin.text() : "";
     const response = await fetch("http://localhost/control", {
       unix: socket,
       method: "POST",
