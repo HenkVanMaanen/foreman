@@ -137,11 +137,11 @@ export class ThreadRouter {
           thread.pending.push(post.id);
           if (thread.status === "idle") thread.status = "queued";
         }
-      } else if (
-        !this.residentSeen.has(reference(post)) &&
-        !this.registry.dismissed.includes(reference(post))
-      ) {
-        this.residentSeen.add(reference(post));
+        continue;
+      }
+      const ref = reference(post);
+      if (!this.residentSeen.has(ref) && !this.registry.dismissed.includes(ref)) {
+        this.residentSeen.add(ref);
         resident.push(postLine(post));
       }
     }
@@ -327,15 +327,14 @@ export class ThreadRouter {
       if (result.busy) {
         thread.status = "queued";
         this.retryAfter.set(thread.key, Date.now() + 5000);
-      } else {
-        if (!result.ok || !thread.sessionId)
-          throw new Error("CLI did not complete a resumable turn");
-        if (result.text?.trim()) this.enqueueReply(thread, result.text, `final-${batch[0]}`);
-        thread.done.push(...batch);
-        thread.pending = thread.pending.filter((id) => !batch.includes(id));
-        thread.status = thread.pending.length ? "queued" : "idle";
-        this.registry.threads = [...this.registry.threads.filter((t) => t !== thread), thread];
+        return;
       }
+      if (!result.ok || !thread.sessionId) throw new Error("CLI did not complete a resumable turn");
+      if (result.text?.trim()) this.enqueueReply(thread, result.text, `final-${batch[0]}`);
+      thread.done.push(...batch);
+      thread.pending = thread.pending.filter((id) => !batch.includes(id));
+      thread.status = thread.pending.length ? "queued" : "idle";
+      this.registry.threads = [...this.registry.threads.filter((t) => t !== thread), thread];
     } catch {
       if (this.stopped) {
         thread.status = "queued";

@@ -80,11 +80,12 @@ export function agentEnv(
 ): Record<string, string> {
   const result: Record<string, string> = {};
   const thread = Boolean(env["FOREMAN_THREAD_KEY"]);
+  const stripChannelCredentials = thread || env["FOREMAN_THREAD_AGENTS"] === "1";
+  const stripRouterCapability = !resident || thread;
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue;
-    if ((thread || env["FOREMAN_THREAD_AGENTS"] === "1") && /^(MATTERMOST_|TELEGRAM_)/.test(key))
-      continue;
-    if ((!resident || thread) && /^FOREMAN_ROUTER_/.test(key)) continue;
+    if (stripChannelCredentials && /^(MATTERMOST_|TELEGRAM_)/.test(key)) continue;
+    if (stripRouterCapability && /^FOREMAN_ROUTER_/.test(key)) continue;
     result[key] = value;
   }
   return result;
