@@ -123,6 +123,42 @@ export class Mattermost {
     return { channels, humans };
   }
 
+  /** Reordering ties can hide rows even when the overlap witness survives. The final
+   * page's offset plus its rows at/after `since` bounds the number of unread rows.
+   * Re-fetch the collected IDs AFTER that page: IDs observed before it and still live
+   * afterwards belonged to that set. Matching its size proves coverage; counting stale
+   * IDs alone would let an already-read deletion conceal a missing, reordered tie.
+   */
+  private async verifyCoverage(
+    posts: Map<string, Post>,
+    channel: string,
+    since: number,
+    expected: number,
+  ): Promise<boolean> {
+    const ids = [...posts.values()].filter((p) => p.create_at >= since).map((p) => p.id);
+    if (ids.length < expected) return false;
+    const live = new Map<string, Post>();
+    for (let offset = 0; offset < ids.length; offset += 1000) {
+      const requested = ids.slice(offset, offset + 1000);
+      const current = (await this.api("/posts/ids", requested)) as Post[];
+      if (!Array.isArray(current) || current.some((p) => !p || !Number.isFinite(p.create_at)))
+        throw new Error("invalid Mattermost posts verification response");
+      for (const post of current) {
+        if (
+          requested.includes(post.id) &&
+          post.channel_id === channel &&
+          !post.delete_at &&
+          post.create_at === posts.get(post.id)?.create_at
+        )
+          live.set(post.id, post);
+      }
+    }
+    if (live.size !== expected) return false;
+    posts.clear();
+    for (const [id, post] of live) posts.set(id, post);
+    return true;
+  }
+
   async poll(
     state: string,
     destinations: { channels: string[]; humans: string[] },
@@ -139,7 +175,7 @@ export class Mattermost {
     for (const { channel, cursor, since } of cursors) {
       const posts = new Map<string, Post>();
       // `since` is capped at 1,000 and `before` excludes equal-timestamp posts. Read
-      // overlapping ordinary pages, verifying continuity before advancing the cursor.
+      // overlapping ordinary pages, verifying both continuity and live ID coverage.
       let window = { page: 0, perPage: 200 };
       let boundary: string | undefined;
       let restarts = 0;
@@ -157,27 +193,44 @@ export class Mattermost {
         const batch = data.order
           ? data.order.map((id) => data.posts[id])
           : Object.values(data.posts);
-        if (batch.some((post) => !post || !Number.isFinite(post.create_at)))
+        if (
+          batch.some(
+            (post, i) =>
+              !post ||
+              !Number.isFinite(post.create_at) ||
+              (data.order && i > 0 && post.create_at > (batch[i - 1]?.create_at ?? 0)),
+          )
+        )
           throw new Error("invalid Mattermost posts response");
         if (boundary && !data.order)
           throw new Error("Mattermost pagination requires ordered posts");
-        if (boundary && !batch.some((post) => post?.id === boundary)) {
+        const continuous = !boundary || batch.some((post) => post?.id === boundary);
+        for (const post of batch) {
+          if (post && post.channel_id === channel) posts.set(post.id, post);
+        }
+        const complete =
+          batch.length < perPage ||
+          batch.some((post) => post?.channel_id === channel && post.create_at < since);
+        if (
+          !continuous ||
+          (complete &&
+            page > 0 &&
+            !(await this.verifyCoverage(
+              posts,
+              channel,
+              since,
+              page * perPage + batch.filter((post) => post && post.create_at >= since).length,
+            )))
+        ) {
           // Deletion can move the boundary before this offset (or delete it). A short
-          // page is not proof of completion until its overlap has been verified.
+          // page or surviving witness is not proof of completion without full coverage.
           if (++restarts >= 3) throw new Error("Mattermost posts changed during pagination; retry");
           posts.clear();
           window = { page: 0, perPage: 200 };
           boundary = undefined;
           continue;
         }
-        for (const post of batch) {
-          if (post && post.channel_id === channel) posts.set(post.id, post);
-        }
-        if (
-          batch.length < perPage ||
-          batch.some((post) => post?.channel_id === channel && post.create_at < since)
-        )
-          break;
+        if (complete) break;
         // Only the ordered page identifies its final row; map entries may be thread roots.
         if (!data.order) throw new Error("Mattermost pagination requires ordered posts");
         boundary = batch.at(-1)?.id;

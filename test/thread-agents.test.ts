@@ -925,7 +925,7 @@ test("first activation preserves later channels' messages when an earlier channe
   }
 });
 
-test("poll backfills over 1,000 mixed-author posts before committing the cursor, retrying failed pages", async () => {
+test("poll backfills over 1,000 mixed-author posts, retrying failed pages and ID verification", async () => {
   const f = fixture();
   const posts = Array.from({ length: 2607 }, (_, i) => ({
     id: `p${String(i).padStart(4, "0")}`,
@@ -939,9 +939,19 @@ test("poll backfills over 1,000 mixed-author posts before committing the cursor,
   const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
   writeJson(cursor, 100);
   let fail = true;
+  let failVerification = true;
+  let verifications = 0;
   const pages: number[] = [];
-  const request = (async (input) => {
-    const query = new URL(String(input)).searchParams;
+  const request = (async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v4/posts/ids") {
+      const ids = JSON.parse(String(init?.body)) as string[];
+      expect(ids.length).toBeLessThanOrEqual(1000);
+      if (++verifications === 2 && failVerification)
+        return new Response("offline", { status: 503 });
+      return Response.json(posts.filter((p) => ids.includes(p.id)));
+    }
+    const query = url.searchParams;
     const sorted = [...posts].sort((a, b) => b.create_at - a.create_at || b.id.localeCompare(a.id));
     const page = Number(query.get("page") ?? 0);
     const size = Number(query.get("per_page") ?? 60);
@@ -965,6 +975,11 @@ test("poll backfills over 1,000 mixed-author posts before committing the cursor,
   await expect(mm.poll(f.cfg.stateDir, dest)).rejects.toThrow("503");
   expect(readJson(cursor, 0)).toBe(100);
   fail = false;
+  await expect(mm.poll(f.cfg.stateDir, dest)).rejects.toThrow("503");
+  expect(verifications).toBe(2);
+  expect(readJson(cursor, 0)).toBe(100);
+  expect(existsSync(join(f.cfg.stateDir, "thread-inbox"))).toBe(false);
+  failVerification = false;
   pages.length = 0;
   const expected = authorizedPosts(posts, "c1", ["henk"]).filter((p) => p.at >= 100);
   const lines = await mm.poll(f.cfg.stateDir, dest);
@@ -1004,13 +1019,18 @@ test.each([
   const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
   writeJson(cursor, 100);
   let calls = 0;
-  const request = (async (input) => {
+  const request = (async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v4/posts/ids") {
+      const ids = JSON.parse(String(init?.body)) as string[];
+      return Response.json(posts.filter((p) => ids.includes(p.id)));
+    }
     // No partial scan may acknowledge posts, even when it has to restart.
     expect(readJson(cursor, 0)).toBe(100);
     if (++calls === 2) {
       for (const post of posts.slice(-deletions)) post.delete_at = 200;
     }
-    const query = new URL(String(input)).searchParams;
+    const query = url.searchParams;
     const page = Number(query.get("page") ?? 0);
     const size = Number(query.get("per_page") ?? 60);
     const before = posts.find((p) => p.id === query.get("before"));
@@ -1042,6 +1062,87 @@ test.each([
   expect(calls).toBeLessThan(30);
 });
 
+test.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+])("poll recovers reordered ties despite a surviving boundary (delete=%s, old rows=%s)", async (deletion, oldRows) => {
+  const f = fixture();
+  const tied = Array.from({ length: 250 }, (_, i) => ({
+    id: `p${String(i).padStart(4, "0")}`,
+    root_id: "",
+    channel_id: "c1",
+    user_id: i % 3 ? "henk" : "bot",
+    create_at: 101,
+    delete_at: 0,
+    message: `work ${i}`,
+  }));
+  const first = tied[0];
+  if (!first) throw new Error("missing fixture post");
+  const newest = { ...first, id: "newest", user_id: "henk", create_at: 102 };
+  const older = Array.from({ length: oldRows ? 400 : 0 }, (_, i) => ({
+    ...newest,
+    id: `old${i}`,
+    create_at: 99,
+  }));
+  const posts = [newest, ...tied, ...older];
+  let sorted = [...posts];
+  const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
+  writeJson(cursor, 100);
+  let calls = 0;
+  const request = (async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v4/posts/ids") {
+      const ids = JSON.parse(String(init?.body)) as string[];
+      return Response.json(posts.filter((p) => ids.includes(p.id)));
+    }
+    if (++calls === 2) {
+      const read = tied[0];
+      const boundary = tied[198];
+      const unread = tied[199];
+      if (!read || !boundary || !unread) throw new Error("missing fixture post");
+      if (deletion) {
+        read.delete_at = 200;
+        sorted = sorted.filter((p) => p !== read);
+        // The deleted, already-read ID can mask the missing ID in a naive count.
+        [sorted[198], sorted[199]] = [unread, boundary];
+      } else {
+        [sorted[1], sorted[200]] = [unread, read];
+      }
+      // Keep the overlap witness while moving an unread tie behind the offset.
+      expect(sorted[199]?.id).toBe(boundary.id);
+    }
+    if (calls > 30) throw new Error("poll did not finish");
+    const page = Number(url.searchParams.get("page") ?? 0);
+    const size = Number(url.searchParams.get("per_page") ?? 60);
+    const batch = sorted.slice(page * size, (page + 1) * size);
+    const oldRoot = { ...newest, id: "oldroot", create_at: 1 };
+    return Response.json({
+      order: batch.map((p) => p.id),
+      posts: Object.fromEntries([...batch, oldRoot].map((p) => [p.id, p])),
+    });
+  }) as typeof fetch;
+  const mm = new Mattermost(
+    { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
+    request,
+  );
+  const dest = { channels: ["c1"], humans: ["henk"] };
+  const expected = authorizedPosts(posts, "c1", dest.humans).filter((p) => p.at >= 100);
+  expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(
+    expected.map((p) => `MSG mm:c1:${p.id} ${p.root} ${p.text}`),
+  );
+  expect(existsSync(receiptPath(f.cfg.stateDir, "c1", "p0199"))).toBe(true);
+  expect(readJson(cursor, 0)).toBe(102);
+  // The skipped tie is older than the new cursor and cannot be rescued by the next poll.
+  expect(
+    await new Mattermost(
+      { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
+      request,
+    ).poll(f.cfg.stateDir, dest),
+  ).toEqual([]);
+});
+
 test("poll leaves the durable cursor untouched when deletions repeatedly break page continuity", async () => {
   const f = fixture();
   const posts = Array.from({ length: 1200 }, (_, i) => ({
@@ -1056,9 +1157,14 @@ test("poll leaves the durable cursor untouched when deletions repeatedly break p
   writeJson(cursor, 100);
   let mutate = true;
   let calls = 0;
-  const request = (async (input) => {
+  const request = (async (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v4/posts/ids") {
+      const ids = JSON.parse(String(init?.body)) as string[];
+      return Response.json(posts.filter((p) => ids.includes(p.id)));
+    }
     if (++calls > 30) throw new Error("poll did not finish");
-    const query = new URL(String(input)).searchParams;
+    const query = url.searchParams;
     const page = Number(query.get("page") ?? 0);
     const size = Number(query.get("per_page") ?? 60);
     if (mutate && page > 0) posts.splice(-200);
@@ -1082,6 +1188,77 @@ test("poll leaves the durable cursor untouched when deletions repeatedly break p
   );
   expect(readJson(cursor, 0)).toBe(posts.at(-1)?.create_at);
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual([]);
+});
+
+test.each([
+  "reordered ties",
+  "missing ID",
+  "duplicate ID",
+  "wrong channel",
+  "changed timestamp",
+  "malformed verification",
+])("poll retains its cursor and retries after unverifiable coverage (%s)", async (fault) => {
+  const f = fixture();
+  const posts = Array.from({ length: 251 }, (_, i) => ({
+    id: `p${String(i).padStart(4, "0")}`,
+    root_id: "",
+    channel_id: "c1",
+    user_id: "henk",
+    create_at: i === 0 ? 102 : 101,
+    message: `work ${i}`,
+  }));
+  const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
+  writeJson(cursor, 100);
+  let unstable = true;
+  let calls = 0;
+  const request = (async (input, init) => {
+    if (++calls > 30) throw new Error("poll did not finish");
+    const url = new URL(String(input));
+    if (url.pathname === "/api/v4/posts/ids") {
+      const ids = JSON.parse(String(init?.body)) as string[];
+      const current = posts.filter((p) => ids.includes(p.id));
+      if (unstable) {
+        const first = current[0];
+        const second = current[1];
+        if (!first || !second) throw new Error("missing fixture post");
+        if (fault === "missing ID") current.shift();
+        if (fault === "duplicate ID") current[0] = second;
+        if (fault === "wrong channel") current[0] = { ...first, channel_id: "c2" };
+        if (fault === "changed timestamp") current[0] = { ...first, create_at: 103 };
+        if (fault === "malformed verification") return Response.json({ posts: current });
+      }
+      return Response.json(current);
+    }
+    const page = Number(url.searchParams.get("page") ?? 0);
+    const size = Number(url.searchParams.get("per_page") ?? 60);
+    const sorted = [...posts];
+    if (unstable && fault === "reordered ties" && page > 0) {
+      const read = posts[1];
+      const unread = posts[200];
+      if (!read || !unread) throw new Error("missing fixture post");
+      [sorted[1], sorted[200]] = [unread, read];
+    }
+    const batch = sorted.slice(page * size, (page + 1) * size);
+    return Response.json({
+      order: batch.map((p) => p.id),
+      posts: Object.fromEntries(batch.map((p) => [p.id, p])),
+    });
+  }) as typeof fetch;
+  const env = { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" };
+  const dest = { channels: ["c1"], humans: ["henk"] };
+  await expect(new Mattermost(env, request).poll(f.cfg.stateDir, dest)).rejects.toThrow(
+    fault === "malformed verification" ? "verification response" : "changed during pagination",
+  );
+  expect(readJson(cursor, 0)).toBe(100);
+  expect(existsSync(join(f.cfg.stateDir, "thread-inbox"))).toBe(false);
+  unstable = false;
+  const expected = authorizedPosts(posts, "c1", dest.humans);
+  const recovered = new Mattermost(env, request);
+  expect(await recovered.poll(f.cfg.stateDir, dest)).toEqual(
+    expected.map((p) => `MSG mm:c1:${p.id} ${p.root} ${p.text}`),
+  );
+  expect(readJson(cursor, 0)).toBe(102);
+  expect(await recovered.poll(f.cfg.stateDir, dest)).toEqual([]);
 });
 
 test.each([
