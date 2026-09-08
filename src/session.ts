@@ -6,6 +6,7 @@ import type { Subprocess } from "bun";
 import { CodexSession } from "./codex-session.ts";
 import type { Config } from "./config.ts";
 import { interruptMessage, type StreamEvent, userMessage } from "./protocol.ts";
+import { agentEnv } from "./workspace.ts";
 
 export interface StartOptions {
   /** extra env for the subprocess (e.g. channel creds passed through to the agent). */
@@ -42,7 +43,7 @@ class ClaudeSession {
       stdin: "pipe",
       stdout: "pipe",
       stderr: "inherit",
-      env: { ...process.env, ...env },
+      env: agentEnv({ ...process.env, ...env }),
     });
   }
 

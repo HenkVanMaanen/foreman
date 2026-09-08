@@ -18,6 +18,15 @@
 # root_id). On Telegram-only it is a generated id embedded as "#id" in the message.
 set +x # Questions and channel credentials must never reach shell tracing.
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/channel-mode.sh"
+if [ -n "${FOREMAN_ROUTER_TOKEN:-}" ]; then
+  helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/thread-cli.ts"
+  exec bun "$helper" ask-human "$@"
+fi
+if [ -n "${FOREMAN_THREAD_KEY:-}" ]; then
+  echo 'Use thread-reply with text on stdin; questions resume on the next human message.' >&2
+  exit 2
+fi
 
 question="${1:?usage: ask-human \"question\"|- [--secret] [--options a,b] [--urgency blocking|background]}"
 shift || true

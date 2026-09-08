@@ -1,4 +1,4 @@
-// Real scripts + real age, fake Telegram. No .env, network or user credentials.
+// Real scripts + real age, fake Telegram. Only isolated fixtures; no network or user credentials.
 import { afterEach, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import {
@@ -147,6 +147,45 @@ if (config.includes('/sendMessage')) {
   const route = (id: string) => join(wm, "secret-replies", id);
   return { dir, wm, state, env, spawn, run, reserve, updates, reply, ordinary, route };
 }
+
+test("Telegram emergency mode keeps dotenv Mattermost credentials disabled during secret capture", async () => {
+  const f = await fixture();
+  const transports = {
+    MATTERMOST_BASE_URL: "https://fabricated.invalid",
+    MATTERMOST_BOT_TOKEN: "FABRICATED_MM_TOKEN",
+    TELEGRAM_BOT_TOKEN: f.env.TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID: f.env.TELEGRAM_CHAT_ID,
+  };
+  await writeFile(
+    join(f.dir, ".env"),
+    Object.entries(transports)
+      .map(([key, value]) => `${key}=${value}\n`)
+      .join(""),
+  );
+  const question = ["bash", ask, "Fabricated test question", "--secret"];
+  const auto = await f.run(question, { ...transports, FOREMAN_CHANNEL_MODE: "auto" });
+  expect(auto.code).toBe(1);
+  expect(existsSync(join(f.dir, "posted-id"))).toBe(false);
+
+  const telegram = { ...transports, FOREMAN_CHANNEL_MODE: "telegram" };
+  const reserved = await f.run(question, telegram);
+  expect(reserved.code).toBe(0);
+  expect(reserved.err).toBe("");
+  const id = reserved.out.trim();
+  expect(id).toMatch(/^secret-[a-f0-9-]+$/);
+  await f.updates([f.reply(id), f.ordinary()]);
+  expect(await f.run(["bash", script, "--inbox"], telegram)).toEqual({
+    out: "MSG 101 - ordinary follow-up\n",
+    err: "",
+    code: 0,
+  });
+  expect(await readFile(join(f.route(id), "reply.age"), "utf8")).not.toContain(sentinel);
+  expect(await f.run(["bash", script, id, "--raw"], telegram)).toEqual({
+    out: sentinel,
+    err: "",
+    code: 0,
+  });
+});
 
 test("in-flight supervisor poll + raw waiter: encrypt before MSG output, exactly one API owner", async () => {
   const f = await fixture();

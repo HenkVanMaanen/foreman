@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import type { Subprocess } from "bun";
 import type { Config } from "./config.ts";
 import type { StreamEvent } from "./protocol.ts";
+import { agentEnv } from "./workspace.ts";
 
 type AgentProcess = Subprocess<"pipe", "pipe", "inherit">;
 
@@ -97,6 +98,7 @@ function rawType(value: unknown): string | undefined {
 }
 
 export class CodexSession {
+  exitCode: number | null = null;
   private started = false;
   private stopping = false;
   private childEnv: Record<string, string> = {};
@@ -104,7 +106,16 @@ export class CodexSession {
   private run: CodexRun | undefined;
   private sendChain: Promise<void> = Promise.resolve();
 
-  constructor(private cfg: Config) {}
+  constructor(
+    private cfg: Config,
+    private options: {
+      sessionId?: string;
+      cwd?: string;
+      commandPrefix?: string[];
+    } = {},
+  ) {
+    this.threadId = options.sessionId;
+  }
 
   start(env: Record<string, string> = {}): void {
     if (this.started) throw new Error("session already started");
@@ -127,12 +138,16 @@ export class CodexSession {
       throw new Error("codex completed a turn without emitting a thread id");
     }
 
-    const proc = Bun.spawn(codexTurnCommand(this.cfg, this.threadId), {
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "inherit",
-      env: { ...process.env, ...this.childEnv },
-    });
+    const proc = Bun.spawn(
+      [...(this.options.commandPrefix ?? []), ...codexTurnCommand(this.cfg, this.threadId)],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "inherit",
+        env: agentEnv({ ...process.env, ...this.childEnv }),
+        ...(this.options.cwd ? { cwd: this.options.cwd } : {}),
+      },
+    );
     this.run = { proc, terminal: false, interrupted: false };
     proc.stdin.write(text);
     proc.stdin.end();
@@ -204,7 +219,7 @@ export class CodexSession {
         const event = this.consumeLine(tail, run);
         if (event) yield event;
       }
-      await run.proc.exited;
+      this.exitCode = await run.proc.exited;
 
       // SIGINT may close the process without a formal turn.failed frame. Synthesize exactly one
       // failed boundary so the supervisor can deliver the urgent queued message via exec resume.

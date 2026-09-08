@@ -10,6 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      - name: Install crypto test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends age
+          age --version
+          age-keygen --version
       - run: bun install --frozen-lockfile
       - name: Strict gate (Biome + tsc)
         run: bun run check
