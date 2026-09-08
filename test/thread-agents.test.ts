@@ -172,6 +172,68 @@ test("interrupted running batch replays with saved session and explicit at-least
   await until(() => restarted.snapshot().threads[0]?.status === "idle");
 });
 
+test.each([
+  false,
+  true,
+])("crash after final enqueue keeps follow-ups separate (sent=%j)", async (sent) => {
+  const f = fixture();
+  const h = heldTurns();
+  const r = f.router(h.run);
+  const ref = f.post("root");
+  f.post("root2", "root");
+  f.bind(r, ref);
+  await r.tick();
+  f.post("followup1", "root");
+  r.collect();
+  const path = join(f.cfg.stateDir, "threads/registry.json");
+  const persisted = readJson(path, r.snapshot());
+  h.calls[0]?.end({ ok: true, text: "original final" });
+  await until(() => r.snapshot().threads[0]?.status === "queued");
+  if (sent) await r.drain();
+  await r.stop();
+  // Keep the published final, but restore the registry from before batch acknowledgement.
+  writeJson(path, persisted);
+  f.post("followup2", "root");
+  const replay = heldTurns();
+  const restarted = f.router(replay.run);
+  await restarted.tick();
+  expect(replay.calls[0]?.resume).toBe(persisted.threads[0]?.sessionId);
+  expect(replay.calls[0]?.prompt).toContain('"id":"root"');
+  expect(replay.calls[0]?.prompt).toContain('"id":"root2"');
+  expect(replay.calls[0]?.prompt).not.toContain('"id":"followup1"');
+  expect(replay.calls[0]?.prompt).not.toContain('"id":"followup2"');
+  replay.calls[0]?.end({ ok: true, text: "replayed final" });
+  await until(() => restarted.snapshot().threads[0]?.status === "queued");
+  expect(restarted.snapshot().threads[0]?.done).toEqual(["root", "root2"]);
+  expect(restarted.snapshot().threads[0]?.pending).toEqual(["followup1", "followup2"]);
+  await restarted.tick();
+  expect(replay.calls).toHaveLength(2);
+  expect(replay.calls[1]?.prompt).toContain('"id":"followup1"');
+  expect(replay.calls[1]?.prompt).toContain('"id":"followup2"');
+  expect(replay.calls[1]?.prompt).not.toContain('"id":"root"');
+  expect(replay.calls[1]?.prompt).not.toContain('"id":"root2"');
+  replay.calls[1]?.end({ ok: true, text: "follow-up final" });
+  await until(() => restarted.snapshot().threads[0]?.status === "idle");
+  await restarted.drain();
+  await restarted.drain();
+  expect(restarted.snapshot().threads[0]?.done).toEqual([
+    "root",
+    "root2",
+    "followup1",
+    "followup2",
+  ]);
+  expect(restarted.snapshot().threads[0]?.pending).toEqual([]);
+  expect(f.sent.filter(({ text }) => text.endsWith("final"))).toEqual([
+    { channel: "channel1", root: "root", text: "original final" },
+    { channel: "channel1", root: "root", text: "follow-up final" },
+  ]);
+  expect(
+    readOutbox(f.cfg.stateDir, persisted.threads[0]?.key ?? "missing")
+      .filter(({ file }) => file.startsWith("final-"))
+      .map(({ file }) => file),
+  ).toEqual(["final-root.json", "final-followup1.json"]);
+});
+
 test("failed start retains queue, does not hot-loop, requires resident retry and does not invent a session", async () => {
   const f = fixture();
   let count = 0;

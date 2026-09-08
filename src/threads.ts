@@ -46,6 +46,7 @@ export interface Thread {
   sessionId?: string;
   status: "queued" | "running" | "idle" | "failed";
   pending: string[];
+  inFlight?: string[];
   done: string[];
   error?: string;
 }
@@ -295,14 +296,15 @@ export class ThreadRouter {
         continue;
       this.active.add(thread.key);
       thread.status = "running";
+      // Preserve batch membership across replay, even as collect() appends follow-ups.
+      thread.inFlight ??= [...thread.pending];
       this.save();
-      void this.turn(thread).finally(() => this.active.delete(thread.key));
+      void this.turn(thread, thread.inFlight).finally(() => this.active.delete(thread.key));
     }
     await this.drain();
   }
 
-  private async turn(thread: Thread): Promise<void> {
-    const batch = [...thread.pending];
+  private async turn(thread: Thread, batch: string[]): Promise<void> {
     try {
       const messages = batch.map((id) =>
         readJson<HumanPost | null>(receiptPath(this.cfg.stateDir, thread.channel, id), null),
@@ -329,6 +331,7 @@ export class ThreadRouter {
       if (result.text?.trim()) this.enqueueReply(thread, result.text, `final-${batch[0]}`);
       thread.done.push(...batch);
       thread.pending = thread.pending.filter((id) => !batch.includes(id));
+      delete thread.inFlight;
       thread.status = thread.pending.length ? "queued" : "idle";
       this.registry.threads = [...this.registry.threads.filter((t) => t !== thread), thread];
     } catch {
