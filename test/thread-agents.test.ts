@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { loadConfig, parseChannelMode, parseThreadCap } from "../src/config.ts";
+import { type Config, loadConfig, parseChannelMode, parseThreadCap } from "../src/config.ts";
 import { formatInboxPrompt } from "../src/inbox.ts";
 import { authorizedPosts, type HumanPost, Mattermost, receiptPath } from "../src/mattermost.ts";
 import { enqueueOutbox, readOutbox } from "../src/thread-outbox.ts";
@@ -31,10 +31,10 @@ afterEach(async () => {
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "fm-thread-"));
   dirs.push(dir);
-  const cfg = {
+  const cfg: Config = {
     ...loadConfig(),
     threadAgents: true,
-    channelMode: "mattermost" as const,
+    channelMode: "mattermost",
     maxThreadAgents: 2,
     stateDir: join(dir, "state"),
     notesDir: join(dir, "notes"),
@@ -663,7 +663,7 @@ test("explicit channel modes, cap validation and flag-off environment compatibil
   expect(clean["TELEGRAM_BOT_TOKEN"]).toBeUndefined();
   expect(clean["FOREMAN_ROUTER_TOKEN"]).toBeUndefined();
   const f = fixture();
-  f.cfg.channelMode = "telegram" as "mattermost";
+  f.cfg.channelMode = "telegram";
   const held = heldTurns();
   const r = f.router(held.run);
   f.bind(r, f.post("old"));
@@ -923,7 +923,7 @@ else console.log(JSON.stringify({id:'posted'}));
 
 async function proxyFixture(mode: "auto" | "mattermost" | "telegram") {
   const f = await shellFixture();
-  f.cfg.channelMode = mode as "mattermost";
+  f.cfg.channelMode = mode;
   symlinkSync(process.execPath, join(f.bin, "bun"));
   for (const name of ["reply", "ask-human"])
     symlinkSync(resolve(import.meta.dir, `../examples/agent-bin/${name}.sh`), join(f.bin, name));
@@ -1027,7 +1027,7 @@ test("resident auto proxy preserves lookup-failure fallback and bypasses lookup 
     expect((await f.proxy("ask-human", ["question"])).code).toBe(1);
     expect(lookups).toBe(2);
     expect(f.calls()).toHaveLength(0);
-    f.cfg.channelMode = "auto" as "mattermost";
+    f.cfg.channelMode = "auto";
     // With both inboxes configured, the existing secret helper must still reject capture.
     expect((await f.proxy("ask-human", ["-", "--secret"], "fabricated question")).code).toBe(1);
     expect(lookups).toBe(2);

@@ -330,7 +330,8 @@ export class ThreadRouter {
       if (!result.ok || !thread.sessionId) throw new Error("CLI did not complete a resumable turn");
       if (result.text?.trim()) this.enqueueReply(thread, result.text, `final-${batch[0]}`);
       thread.done.push(...batch);
-      thread.pending = thread.pending.filter((id) => !batch.includes(id));
+      const completed = new Set(batch);
+      thread.pending = thread.pending.filter((id) => !completed.has(id));
       delete thread.inFlight;
       thread.status = thread.pending.length ? "queued" : "idle";
       this.registry.threads = [...this.registry.threads.filter((t) => t !== thread), thread];
