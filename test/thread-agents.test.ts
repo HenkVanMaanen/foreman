@@ -865,7 +865,7 @@ const args=process.argv.slice(2); const config=args.includes('-K') ? await Bun.s
 const url=args.find(a=>a.startsWith('https://') || a.startsWith('http://')) || config;
 const tg=url.includes('telegram.org');
 appendFileSync(process.env.MOCK_LOG,JSON.stringify({tg,args})+'\\n');
-if(tg) console.log(JSON.stringify({ok:true,result:{message_id:7}}));
+if(tg) console.log(JSON.stringify({ok:true,result:url.includes('getUpdates') ? JSON.parse(process.env.MOCK_UPDATES || '[]') : {message_id:7}}));
 else if(url.endsWith('/users/me')) console.log(JSON.stringify({id:process.env.MOCK_BAD ? null:'bot'}));
 else if(url.includes('/users/username/')) console.log(JSON.stringify({id:'henk'}));
 else if(url.includes('/posts/root')) console.log(JSON.stringify({id:'root',root_id:'',channel_id:'actualchannel'}));
@@ -1084,6 +1084,149 @@ test("real reply/ask/wait scripts obey primary/emergency modes and auto compatib
   f.clear();
   expect((await f.run("reply", "typo", ["root"])).code).toBe(2);
   expect(f.calls()).toHaveLength(0);
+});
+
+test.each([
+  ["auto", false],
+  ["auto", true],
+  ["mattermost", false],
+  ["mattermost", true],
+] as const)("thread inbox setup failure falls back only in auto mode (mode=%s, lookup=%j)", async (mode, lookup) => {
+  const f = await shellFixture();
+  symlinkSync(process.execPath, join(f.bin, "bun"));
+  const offset = join(f.cfg.stateDir, "wait-reply/inbox.tg.offset");
+  writeJson(offset, 100);
+  let lookups = 0;
+  const api = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => {
+      lookups++;
+      return new Response("offline", { status: 503 });
+    },
+  });
+  try {
+    const result = await f.run("wait-reply", mode, ["--inbox"], {
+      FOREMAN_THREAD_AGENTS: "1",
+      MATTERMOST_BASE_URL: `http://127.0.0.1:${api.port}`,
+      MATTERMOST_TARGET_USER: lookup ? "henk" : "",
+      MOCK_UPDATES: JSON.stringify([
+        { update_id: 100, message: { message_id: 7, chat: { id: 123 }, text: "fallback reply" } },
+      ]),
+    });
+    expect(lookups).toBe(lookup ? 1 : 0);
+    expect(result.stderr).toContain(lookup ? "503" : "MATTERMOST_ALLOWED_USERS");
+    if (mode === "auto") {
+      expect(result.code).toBe(0);
+      expect(result.stdout).toBe("MSG 100 - fallback reply\n");
+      expect(readJson(offset, 0)).toBe(101);
+      expect(f.calls().length).toBeGreaterThan(0);
+      expect(f.calls().every((c) => c.tg)).toBe(true);
+    } else {
+      expect(result.code).toBe(2);
+      expect(result.stdout).toBe("");
+      expect(readJson(offset, 0)).toBe(100);
+      expect(f.calls()).toHaveLength(0);
+    }
+  } finally {
+    api.stop(true);
+  }
+});
+
+test.each([
+  "success",
+  "timeout",
+  "failure",
+] as const)("thread inbox auto mode stays on Mattermost after setup (poll=%s)", async (outcome) => {
+  const f = await shellFixture();
+  symlinkSync(process.execPath, join(f.bin, "bun"));
+  writeJson(join(f.cfg.stateDir, "wait-reply/mm-configuredchannel.json"), 0);
+  let polls = 0;
+  const api = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: (request) => {
+      if (request.url.includes("/users/username/")) return Response.json({ id: "henk" });
+      polls++;
+      if (outcome === "failure") return new Response("offline", { status: 503 });
+      const posts =
+        outcome === "success"
+          ? [
+              {
+                id: "post",
+                root_id: "root",
+                channel_id: "configuredchannel",
+                user_id: "henk",
+                create_at: 100,
+                message: "Mattermost reply",
+              },
+            ]
+          : [];
+      return Response.json({
+        order: posts.map((p) => p.id),
+        posts: Object.fromEntries(posts.map((p) => [p.id, p])),
+      });
+    },
+  });
+  try {
+    const result = await f.run("wait-reply", "auto", ["--inbox"], {
+      FOREMAN_THREAD_AGENTS: "1",
+      MATTERMOST_BASE_URL: `http://127.0.0.1:${api.port}`,
+    });
+    expect(polls).toBeGreaterThan(0);
+    expect(result.code).toBe(outcome === "success" ? 0 : outcome === "timeout" ? 3 : 1);
+    expect(result.stdout).toBe(
+      outcome === "success" ? "MSG mm:configuredchannel:post root Mattermost reply\n" : "",
+    );
+    expect(f.calls()).toHaveLength(0);
+  } finally {
+    api.stop(true);
+  }
+});
+
+test("stopping the auto-mode thread inbox releases its child and inbox lock", async () => {
+  const f = await shellFixture();
+  symlinkSync(process.execPath, join(f.bin, "bun"));
+  let polling = false;
+  const api = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: (request) => {
+      if (request.url.includes("/users/username/")) return Response.json({ id: "henk" });
+      polling = true;
+      return Response.json({ order: [], posts: {} });
+    },
+  });
+  const child = Bun.spawn(
+    ["bash", resolve(import.meta.dir, "../examples/agent-bin/wait-reply.sh"), "--inbox"],
+    {
+      cwd: f.dir,
+      env: {
+        ...f.env,
+        FOREMAN_THREAD_AGENTS: "1",
+        FOREMAN_CHANNEL_MODE: "auto",
+        FOREMAN_WAIT_TIMEOUT: "60",
+        MATTERMOST_BASE_URL: `http://127.0.0.1:${api.port}`,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  try {
+    await until(() => polling);
+    child.kill();
+    expect(await child.exited).toBe(143);
+    expect(await new Response(child.stdout).text()).toBe("");
+    expect(f.calls()).toHaveLength(0);
+    expect(
+      Bun.spawnSync(["flock", "-n", join(f.cfg.stateDir, "wait-reply/.inbox.lock"), "true"])
+        .exitCode,
+    ).toBe(0);
+  } finally {
+    if (child.exitCode === null) child.kill();
+    await child.exited;
+    api.stop(true);
+  }
 });
 
 test("existing single inbox script runs feature transport for two named channels and persists authorized receipts before routing", async () => {

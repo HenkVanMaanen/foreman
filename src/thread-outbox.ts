@@ -73,11 +73,11 @@ if (import.meta.main) {
   // Adopt old queues in their existing timestamp/mtime order without renaming delivery IDs.
   // A crash after publishing a new file but before saving .order leaves one unknown file;
   // adopt it before any later enqueue. No sequence reservation can outlive its publication.
-  const unlisted = [...entries.keys()]
-    .filter((file) => !known.has(file))
-    .map((file) => ({
+  const unlisted = [...entries]
+    .filter(([file]) => !known.has(file))
+    .map(([file, item]) => ({
       file,
-      at: entries.get(file)?.queuedAt ?? statSync(join(dir, file)).mtimeMs,
+      at: item?.queuedAt ?? statSync(join(dir, file)).mtimeMs,
     }))
     .sort((a, b) => a.at - b.at || a.file.localeCompare(b.file));
   order.push(...unlisted.map(({ file }) => file));

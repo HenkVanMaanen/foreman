@@ -167,9 +167,11 @@ export class Mattermost {
 }
 
 if (import.meta.main) {
+  let setupComplete = false;
   try {
     const mm = new Mattermost(process.env);
     const destinations = await mm.destinations();
+    setupComplete = true;
     const state = process.env["FOREMAN_STATE_DIR"] || "state";
     const deadline = Date.now() + Number(process.env["FOREMAN_WAIT_TIMEOUT"] || 250) * 1000;
     do {
@@ -183,6 +185,7 @@ if (import.meta.main) {
     process.exit(3);
   } catch (error) {
     console.error(`wait-reply: ${error instanceof Error ? error.message : "Mattermost failed"}`);
-    process.exit(1);
+    // The shell may use Telegram in auto mode only when Mattermost setup failed.
+    process.exit(setupComplete ? 1 : 2);
   }
 }
