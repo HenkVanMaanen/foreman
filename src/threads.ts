@@ -138,7 +138,7 @@ export class ThreadRouter {
   /** Poller lines carry references; provenance always comes from the durable authorized receipt. */
   route(lines: string[]): string[] {
     this.collect();
-    return lines.filter((line) => !/^MSG mm:/.test(line));
+    return lines.filter((line) => !line.startsWith("MSG mm:"));
   }
 
   collect(): void {

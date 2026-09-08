@@ -85,7 +85,7 @@ export function agentEnv(
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue;
     if (stripChannelCredentials && /^(MATTERMOST_|TELEGRAM_)/.test(key)) continue;
-    if (stripRouterCapability && /^FOREMAN_ROUTER_/.test(key)) continue;
+    if (stripRouterCapability && key.startsWith("FOREMAN_ROUTER_")) continue;
     result[key] = value;
   }
   return result;

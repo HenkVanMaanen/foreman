@@ -185,8 +185,8 @@ export class Mattermost {
       }
       let newest = since;
       for (const post of authorizedPosts([...posts.values()], channel, destinations.humans)) {
-        const path = receiptPath(state, channel, post.id);
         if (post.at < since) continue;
+        const path = receiptPath(state, channel, post.id);
         if (!existsSync(path)) {
           // Commit the receipt BEFORE the cursor. Supervisor scans these after a crash even if
           // stdout never reached it. The timestamp overlap + receipt id handles equal timestamps.
