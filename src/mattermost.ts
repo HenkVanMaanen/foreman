@@ -20,6 +20,7 @@ interface Post {
   create_at: number;
   delete_at?: number;
   type?: string;
+  props?: { from_webhook?: string | boolean };
 }
 export const receiptPath = (state: string, channel: string, id: string) =>
   join(state, "thread-inbox", `${safeId(channel)}.${safeId(id)}.json`);
@@ -33,6 +34,8 @@ export function authorizedPosts(posts: Post[], channel: string, humans: string[]
       (p) =>
         p.channel_id === channel &&
         humans.includes(p.user_id) &&
+        // Webhooks inherit their owner's user_id without authenticating that human.
+        !p.props?.from_webhook &&
         !p.delete_at &&
         !p.type &&
         typeof p.message === "string",

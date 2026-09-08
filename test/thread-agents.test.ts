@@ -271,6 +271,8 @@ test("authorization filters sender/channel, fails closed without humans, dedupli
     post,
     { ...post, id: "stranger", user_id: "stranger" },
     { ...post, id: "wrong", channel_id: "c2" },
+    { ...post, id: "webhook", type: "", props: { from_webhook: "true" } },
+    { ...post, id: "webhookBoolean", type: "", props: { from_webhook: true } },
   ];
   expect(authorizedPosts(posts, "c1", ["henk"])).toHaveLength(1);
   expect(authorizedPosts(posts, "c1", [])).toHaveLength(0);
@@ -285,6 +287,8 @@ test("authorization filters sender/channel, fails closed without humans, dedupli
   const dest = { channels: ["c1"], humans: ["henk"] };
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(["MSG mm:c1:p1 p1 work"]);
   expect(existsSync(receiptPath(f.cfg.stateDir, "c1", "p1"))).toBe(true);
+  expect(existsSync(receiptPath(f.cfg.stateDir, "c1", "webhook"))).toBe(false);
+  expect(existsSync(receiptPath(f.cfg.stateDir, "c1", "webhookBoolean"))).toBe(false);
   expected = [...posts, { ...post, id: "sameTime" }];
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(["MSG mm:c1:sameTime sameTime work"]);
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual([]);
