@@ -248,6 +248,7 @@ test("failed start retains queue, does not hot-loop, requires resident retry and
   await r.tick();
   await r.tick();
   expect(count).toBe(1);
+  expect(f.resident).toHaveLength(1);
   expect(r.snapshot().threads[0]?.pending).toEqual(["root"]);
   expect(r.snapshot().threads[0]?.sessionId).toBeUndefined();
   expect(() => r.command("worker", ["retry", ref])).toThrow("resident authorization");
@@ -255,6 +256,62 @@ test("failed start retains queue, does not hot-loop, requires resident retry and
   await r.tick();
   await until(() => r.snapshot().threads[0]?.status === "failed");
   expect(count).toBe(2);
+  expect(f.resident).toHaveLength(2);
+});
+
+test("failed threads replay resident notifications after restart and recover queued follow-ups on retry", async () => {
+  const f = fixture();
+  const h = heldTurns();
+  const r = f.router(h.run);
+  f.bind(r, f.post("root"));
+  await r.tick();
+  h.calls[0]?.end({ ok: false });
+  await until(() => r.snapshot().threads[0]?.status === "failed");
+  const failed = r.snapshot().threads[0];
+  expect(f.resident).toHaveLength(1);
+  await r.stop();
+  f.resident.length = 0; // A supervisor crash loses the in-memory resident inbox.
+
+  const resumed = heldTurns();
+  const next = f.router(resumed.run);
+  next.start();
+  expect(f.resident).toEqual([`MSG mm:channel1:root root [harness] ${failed?.error}`]);
+  await next.tick();
+  await next.tick();
+  expect(f.resident).toHaveLength(1);
+  expect(resumed.calls).toHaveLength(0);
+  expect(next.snapshot().threads[0]?.status).toBe("failed");
+
+  const followup = f.post("followup", "root");
+  next.collect();
+  await next.tick();
+  expect(f.resident).toEqual([
+    `MSG mm:channel1:root root [harness] ${failed?.error}`,
+    `MSG mm:channel1:followup root [harness] ${failed?.error}`,
+  ]);
+  expect(next.snapshot().threads[0]?.pending).toEqual(["root", "followup"]);
+  expect(resumed.calls).toHaveLength(0);
+
+  next.command(next.token, ["retry", followup]);
+  await next.tick();
+  expect(resumed.calls[0]?.resume).toBe(failed?.sessionId);
+  expect(resumed.calls[0]?.prompt).toContain('"id":"root"');
+  expect(resumed.calls[0]?.prompt).not.toContain('"id":"followup"');
+  resumed.calls[0]?.end({ ok: true });
+  await until(() => next.snapshot().threads[0]?.status === "queued");
+  await next.tick();
+  expect(resumed.calls[1]?.resume).toBe(failed?.sessionId);
+  expect(resumed.calls[1]?.prompt).toContain('"id":"followup"');
+  expect(resumed.calls[1]?.prompt).not.toContain('"id":"root"');
+  resumed.calls[1]?.end({ ok: true });
+  await until(() => next.snapshot().threads[0]?.status === "idle");
+  expect(next.snapshot().threads[0]?.pending).toEqual([]);
+  expect(next.snapshot().threads[0]?.done).toEqual(["root", "followup"]);
+  expect(next.snapshot().threads[0]?.error).toBeUndefined();
+  await next.stop();
+  f.resident.length = 0;
+  f.router().start();
+  expect(f.resident).toHaveLength(0);
 });
 
 test("empty success without thread.started fails; busy orphan lock retains queue without failure", async () => {

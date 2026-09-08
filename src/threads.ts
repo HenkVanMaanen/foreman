@@ -74,6 +74,7 @@ export class ThreadRouter {
   private path: string;
   private registry: Registry;
   private residentSeen = new Set<string>();
+  private residentFailures = new Map<string, number>();
   private active = new Set<string>();
   private retryAfter = new Map<string, number>();
   private sessions = new Set<CodexSession>();
@@ -148,7 +149,19 @@ export class ThreadRouter {
       }
     }
     this.save(); // queue durable before delivering triage or starting any CLI
+    for (const thread of this.registry.threads) {
+      if (thread.status === "failed") this.notifyFailure(thread);
+    }
     if (resident.length) this.resident(resident);
+  }
+
+  private notifyFailure(thread: Thread): void {
+    // Replay once per supervisor lifetime, and wake the resident again for new follow-ups.
+    if (this.residentFailures.get(thread.key) === thread.pending.length) return;
+    this.resident([
+      `MSG mm:${thread.channel}:${thread.pending.at(-1)} ${thread.root} [harness] ${thread.error}`,
+    ]);
+    this.residentFailures.set(thread.key, thread.pending.length);
   }
 
   private source(ref: string): HumanPost {
@@ -209,6 +222,7 @@ export class ThreadRouter {
       if (thread?.status !== "failed") throw new Error("thread is not failed");
       delete thread.error;
       thread.status = "queued";
+      this.residentFailures.delete(thread.key);
       this.save();
       return thread;
     }
@@ -344,11 +358,9 @@ export class ThreadRouter {
       thread.error =
         "Turn failed; messages retained. Resident must inspect and use thread-control retry.";
       this.enqueueReply(thread, thread.error);
-      this.resident([
-        `MSG mm:${thread.channel}:${batch[0]} ${thread.root} [harness] ${thread.error}`,
-      ]);
     } finally {
       this.save();
+      if (thread.status === "failed") this.notifyFailure(thread);
     }
   }
 
