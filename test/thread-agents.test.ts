@@ -8,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -233,6 +234,80 @@ test("outbox destination comes only from binding, transport failure retains deli
   ]);
 });
 
+test("failed outbox drains progress and finals in enqueue order across turns and restart", async () => {
+  const f = fixture();
+  const h = heldTurns();
+  const r = new ThreadRouter(
+    f.cfg,
+    {},
+    () => {},
+    h.run,
+    async () => {
+      throw new Error("offline");
+    },
+  );
+  routers.push(r);
+  f.bind(r, f.post("z"));
+  const t = r.snapshot().threads[0];
+  if (!t) throw new Error("no thread");
+  await r.tick();
+  r.enqueueReply(t, "first progress", "zzzz");
+  const child = Bun.spawn(
+    [process.execPath, "--no-env-file", resolve(import.meta.dir, "../src/thread-cli.ts"), "outbox"],
+    {
+      cwd: f.dir,
+      env: {
+        HOME: f.dir,
+        PATH: "/usr/bin:/bin",
+        FOREMAN_STATE_DIR: f.cfg.stateDir,
+        FOREMAN_THREAD_KEY: t.key,
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  child.stdin.write("worker progress");
+  child.stdin.end();
+  expect(await child.exited).toBe(0);
+  h.calls[0]?.end({ ok: true, text: "first final" });
+  await until(() => r.snapshot().threads[0]?.status === "idle");
+  f.post("a", "z");
+  await r.tick();
+  r.enqueueReply(t, "second progress", "0000");
+  h.calls[1]?.end({ ok: true, text: "second final" });
+  await until(() => r.snapshot().threads[0]?.status === "idle");
+  await r.stop();
+  const path = join(f.cfg.stateDir, "thread-outbox", t.key, "final-z.json");
+  const queuedAt = readJson<{ queuedAt: number }>(path, { queuedAt: 0 }).queuedAt;
+  const sent: { text: string; id: string }[] = [];
+  const next = new ThreadRouter(
+    f.cfg,
+    {},
+    () => {},
+    h.run,
+    async (_thread, text, id) => {
+      sent.push({ text, id });
+    },
+  );
+  routers.push(next);
+  // Replaying an enqueue must retain its original place, independent of the final post ID.
+  next.enqueueReply(t, "first final", "final-z");
+  await next.drain();
+  await next.drain();
+  expect(sent.map((item) => item.text)).toEqual([
+    "Bound to a dedicated agent; queued for the next available slot.",
+    "first progress",
+    "worker progress",
+    "first final",
+    "second progress",
+    "second final",
+  ]);
+  expect(sent[3]?.id).toBe("final-z");
+  expect(sent[5]?.id).toBe("final-a");
+  expect(readJson<{ queuedAt: number }>(path, { queuedAt: 0 }).queuedAt).toBe(queuedAt);
+});
+
 test("resident-owned policy persists source/old/new, unverified worker grants cannot widen defaults", () => {
   const f = fixture();
   const r = f.router();
@@ -293,6 +368,68 @@ test("authorization filters sender/channel, fails closed without humans, dedupli
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(["MSG mm:c1:sameTime sameTime work"]);
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual([]);
   expect(await new Mattermost({}, request).destinations().catch(() => "closed")).toBe("closed");
+});
+
+test("poll backfills over 1,000 mixed-author posts before committing the cursor, retrying failed pages", async () => {
+  const f = fixture();
+  const posts = Array.from({ length: 2607 }, (_, i) => ({
+    id: `p${String(i).padStart(4, "0")}`,
+    root_id: "",
+    channel_id: "c1",
+    user_id: i % 7 === 0 && (i < 1400 || i >= 2000) ? "henk" : i % 2 ? "bot" : "stranger",
+    props: { from_webhook: i % 11 === 0 },
+    create_at: 90 + Math.floor(i / 3),
+    message: `work ${i}`,
+  }));
+  const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
+  writeJson(cursor, 100);
+  let fail = true;
+  const pages: number[] = [];
+  const request = (async (input) => {
+    const query = new URL(String(input)).searchParams;
+    const sorted = [...posts].sort((a, b) => b.create_at - a.create_at || b.id.localeCompare(a.id));
+    const page = Number(query.get("page") ?? 0);
+    const size = Number(query.get("per_page") ?? 60);
+    pages.push(page);
+    if (fail && page === 2) return new Response("offline", { status: 503 });
+    // Model the old since endpoint's cap as well as ordinary channel pagination.
+    const batch = query.has("since")
+      ? sorted.filter((p) => p.create_at > Number(query.get("since"))).slice(0, 1000)
+      : sorted.slice(page * size, (page + 1) * size);
+    const oldRoot = { ...posts[0], id: "oldroot", create_at: 1 };
+    return Response.json({
+      order: batch.map((p) => p.id),
+      posts: Object.fromEntries([...batch, oldRoot].map((p) => [p.id, p])),
+    });
+  }) as typeof fetch;
+  const mm = new Mattermost(
+    { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
+    request,
+  );
+  const dest = { channels: ["c1"], humans: ["henk"] };
+  await expect(mm.poll(f.cfg.stateDir, dest)).rejects.toThrow("503");
+  expect(readJson(cursor, 0)).toBe(100);
+  fail = false;
+  pages.length = 0;
+  const expected = authorizedPosts(posts, "c1", ["henk"]).filter((p) => p.at >= 100);
+  const lines = await mm.poll(f.cfg.stateDir, dest);
+  expect(lines).toEqual(expected.map((p) => `MSG mm:c1:${p.id} ${p.root} ${p.text}`));
+  expect(pages.length).toBeGreaterThan(5);
+  expect(readdirSync(join(f.cfg.stateDir, "thread-inbox"))).toHaveLength(expected.length);
+  const newest = expected.at(-1);
+  if (!newest) throw new Error("no expected posts");
+  expect(readJson(cursor, 0)).toBe(newest.at);
+  expect(await mm.poll(f.cfg.stateDir, dest)).toEqual([]);
+  posts.push({
+    id: "late",
+    root_id: "",
+    channel_id: "c1",
+    user_id: "henk",
+    props: { from_webhook: false },
+    create_at: newest.at,
+    message: "same timestamp",
+  });
+  expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(["MSG mm:c1:late late same timestamp"]);
 });
 
 test("explicit channel modes, cap validation and flag-off environment compatibility", async () => {
@@ -410,6 +547,8 @@ test("resident reply and ask-human proxy reads stdin only when the helper needs 
       { args: ["reply", "root"], input: "piped reply" },
       { args: ["reply", "root", "--dry-run"], input: "piped dry run" },
       { args: ["reply", "root", "-"], input: "stray root field" },
+      { args: ["reply", "root", "--dry-run", "-"], input: "piped dash dry run" },
+      { args: ["reply", "root", "-"], input: "" },
       { args: ["ask-human", "-", "--urgency", "background"], input: "piped question" },
     ];
     for (const { args, input } of cases) {
@@ -510,7 +649,7 @@ async function shellFixture() {
     `#!${process.execPath}
 import {appendFileSync} from 'node:fs';
 const args=process.argv.slice(2); const config=args.includes('-K') ? await Bun.stdin.text() : '';
-const url=args.find(a=>a.startsWith('https://')) || config;
+const url=args.find(a=>a.startsWith('https://') || a.startsWith('http://')) || config;
 const tg=url.includes('telegram.org');
 appendFileSync(process.env.MOCK_LOG,JSON.stringify({tg,args})+'\\n');
 if(tg) console.log(JSON.stringify({ok:true,result:{message_id:7}}));
@@ -568,6 +707,142 @@ else console.log(JSON.stringify({id:'posted'}));
   const clear = () => rmSync(log, { force: true });
   return { ...f, bin, env, run, calls, clear };
 }
+
+async function proxyFixture(mode: "auto" | "mattermost" | "telegram") {
+  const f = await shellFixture();
+  f.cfg.channelMode = mode as "mattermost";
+  symlinkSync(process.execPath, join(f.bin, "bun"));
+  for (const name of ["reply", "ask-human"])
+    symlinkSync(resolve(import.meta.dir, `../examples/agent-bin/${name}.sh`), join(f.bin, name));
+  const env = {
+    ...f.env,
+    FOREMAN_THREAD_KEY: "",
+    FOREMAN_AGE_IDENTITY: join(f.cfg.stateDir, "age-identity.txt"),
+    FOREMAN_AGE_RECIPIENT: "",
+    MATTERMOST_TEAM: "",
+    MATTERMOST_CHANNELS: "",
+    MATTERMOST_ALLOWED_USERS: "henk",
+    MOCK_BAD: "",
+  };
+  const router = new ThreadRouter(
+    f.cfg,
+    env,
+    () => {},
+    async () => ({ ok: false }),
+    async () => {},
+  );
+  routers.push(router);
+  const access = router.start();
+  const proxy = async (name: string, args: string[], input = "") => {
+    const child = Bun.spawn(
+      ["bash", "-c", 'cat | "$@"', "proxy-test", join(f.bin, name), ...args],
+      {
+        cwd: f.dir,
+        env: { HOME: f.dir, PATH: env.PATH, FOREMAN_HOME: env.FOREMAN_HOME, ...access },
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    child.stdin.write(input);
+    child.stdin.end();
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    return { stdout, stderr, code };
+  };
+  return { ...f, env, router, proxy };
+}
+
+test("resident proxy forwards consumed dash input through the real reply helper", async () => {
+  const f = await proxyFixture("mattermost");
+  const cwd = process.cwd();
+  process.chdir(f.dir); // binPath resolves the fixture's helpers, never the live workspace's bin/.
+  try {
+    for (const dryRun of [false, true]) {
+      for (const input of ["piped 'reply'\nsecond line\n", "", "\n"]) {
+        f.clear();
+        const result = await f.proxy(
+          "reply",
+          ["root", ...(dryRun ? ["--dry-run"] : []), "-"],
+          input,
+        );
+        expect(result.code).toBe(0);
+        const send = f.calls().find((c) => c.args.includes("-d"));
+        const body = dryRun
+          ? JSON.parse(result.stdout.slice(result.stdout.indexOf("{")))
+          : JSON.parse(send.args[send.args.indexOf("-d") + 1]);
+        expect(body.message).toBe(input.replace(/\n+$/, "") || "-");
+        expect(body.root_id).toBe("root");
+        expect(body.channel_id).toBe("actualchannel");
+        if (dryRun) expect(send).toBeUndefined();
+      }
+    }
+  } finally {
+    await f.router.stop();
+    process.chdir(cwd);
+  }
+});
+
+test("resident auto proxy preserves lookup-failure fallback and bypasses lookup for Telegram-only secrets", async () => {
+  const f = await proxyFixture("auto");
+  let lookups = 0;
+  const api = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () => {
+      lookups++;
+      return new Response("offline", { status: 503 });
+    },
+  });
+  f.env.MATTERMOST_BASE_URL = `http://127.0.0.1:${api.port}`;
+  f.env.MATTERMOST_CHANNEL_ID = "";
+  f.env.MOCK_BAD = "1";
+  const cwd = process.cwd();
+  process.chdir(f.dir);
+  try {
+    const result = await f.proxy("ask-human", ["question", "--options", "--secret"]);
+    expect(result.code).toBe(0);
+    expect(result.stdout.trim()).toMatch(/^q\d+$/);
+    expect(lookups).toBe(1);
+    expect(f.calls().some((c) => c.tg)).toBe(true);
+    // Explicit Mattermost mode still fails closed instead of falling back to Telegram.
+    f.clear();
+    f.cfg.channelMode = "mattermost";
+    expect((await f.proxy("ask-human", ["question"])).code).toBe(1);
+    expect(lookups).toBe(2);
+    expect(f.calls()).toHaveLength(0);
+    f.cfg.channelMode = "auto" as "mattermost";
+    // With both inboxes configured, the existing secret helper must still reject capture.
+    expect((await f.proxy("ask-human", ["-", "--secret"], "fabricated question")).code).toBe(1);
+    expect(lookups).toBe(2);
+    expect(f.calls()).toHaveLength(0);
+    // A dormant MM token alone must not block an otherwise Telegram-only secret question.
+    f.env.MATTERMOST_BASE_URL = "";
+    const wm = join(f.cfg.stateDir, "wait-reply");
+    mkdirSync(wm, { recursive: true });
+    writeFileSync(join(wm, "inbox.tg.offset"), "100");
+    expect(
+      Bun.spawnSync(["age-keygen", "-o", f.env.FOREMAN_AGE_IDENTITY], {
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exitCode,
+    ).toBe(0);
+    const secret = await f.proxy("ask-human", ["-", "--secret"], "fabricated question");
+    expect(secret.code).toBe(0);
+    expect(secret.stdout.trim()).toMatch(/^secret-[a-f0-9-]+$/);
+    expect(lookups).toBe(2);
+    expect(f.calls()).toHaveLength(1);
+    expect(f.calls()[0].tg).toBe(true);
+    expect(existsSync(join(wm, "secret-replies", secret.stdout.trim(), "route.json"))).toBe(true);
+  } finally {
+    await f.router.stop();
+    api.stop(true);
+    process.chdir(cwd);
+  }
+});
 
 test("real reply/ask/wait scripts obey primary/emergency modes and auto compatibility using mock curl", async () => {
   const f = await shellFixture();

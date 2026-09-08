@@ -13,7 +13,10 @@ try {
     if (!state) throw new Error("thread state directory required");
     const text = await Bun.stdin.text();
     if (!text.trim()) throw new Error("reply text required on stdin");
-    writeJson(join(state, "thread-outbox", key, `${Date.now()}-${randomUUID()}.json`), { text });
+    writeJson(join(state, "thread-outbox", key, `${Date.now()}-${randomUUID()}.json`), {
+      text,
+      queuedAt: performance.timeOrigin + performance.now(),
+    });
   } else if (command === "policy-get") {
     console.log(
       JSON.stringify(repoPolicy(process.env["FOREMAN_NOTES_DIR"] || "notes", args[0] || "")),

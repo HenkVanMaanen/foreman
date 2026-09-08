@@ -114,13 +114,33 @@ export class Mattermost {
       const cursor = join(state, "wait-reply", `mm-${safeId(channel)}.json`);
       const since = readJson<number>(cursor, Date.now());
       if (!existsSync(cursor)) writeJson(cursor, since);
-      const data = (await this.api(
-        `/channels/${channel}/posts?since=${Math.max(0, since - 1)}`,
-      )) as { posts: Record<string, Post> };
-      if (!data.posts || typeof data.posts !== "object")
-        throw new Error("invalid Mattermost posts response");
+      const posts = new Map<string, Post>();
+      // `since` is capped at 1,000 and may have holes. Read ordinary pages back through
+      // the cursor instead, including every post at its timestamp before advancing it.
+      for (let page = 0; ; page++) {
+        const data = (await this.api(`/channels/${channel}/posts?page=${page}&per_page=200`)) as {
+          posts: Record<string, Post>;
+          order?: string[];
+        };
+        if (!data.posts || typeof data.posts !== "object")
+          throw new Error("invalid Mattermost posts response");
+        // The map can also contain old thread roots that are not part of this page.
+        const batch = data.order
+          ? data.order.map((id) => data.posts[id])
+          : Object.values(data.posts);
+        if (batch.some((post) => !post || !Number.isFinite(post.create_at)))
+          throw new Error("invalid Mattermost posts response");
+        for (const post of batch) {
+          if (post && post.channel_id === channel) posts.set(post.id, post);
+        }
+        if (
+          batch.length < 200 ||
+          batch.some((post) => post?.channel_id === channel && post.create_at < since)
+        )
+          break;
+      }
       let newest = since;
-      for (const post of authorizedPosts(Object.values(data.posts), channel, destinations.humans)) {
+      for (const post of authorizedPosts([...posts.values()], channel, destinations.humans)) {
         const path = receiptPath(state, channel, post.id);
         if (post.at < since) continue;
         if (!existsSync(path)) {

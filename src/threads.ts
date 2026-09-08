@@ -1,7 +1,7 @@
 // Supervisor-owned thread registry, queues, outbox and resident control interface.
 // This is a cooperative boundary: the shared uid/filesystem cannot isolate a hostile worker.
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readdirSync } from "node:fs";
+import { mkdirSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { CodexSession } from "./codex-session.ts";
 import type { Config } from "./config.ts";
@@ -232,7 +232,13 @@ export class ThreadRouter {
   }
 
   enqueueReply(thread: Thread, text: string, id: string = randomUUID()): void {
-    writeJson(join(this.cfg.stateDir, "thread-outbox", thread.key, `${safeId(id)}.json`), { text });
+    const path = join(this.cfg.stateDir, "thread-outbox", thread.key, `${safeId(id)}.json`);
+    const previous = readJson<{ queuedAt?: number } | null>(path, null);
+    // Sub-millisecond epoch time also orders replies from the separate worker CLI process.
+    const queuedAt = previous
+      ? (previous.queuedAt ?? statSync(path).mtimeMs)
+      : performance.timeOrigin + performance.now();
+    writeJson(path, { text, queuedAt });
   }
 
   async drain(): Promise<void> {
@@ -242,18 +248,24 @@ export class ThreadRouter {
       for (const thread of this.registry.threads) {
         const dir = join(this.cfg.stateDir, "thread-outbox", thread.key);
         mkdirSync(dir, { recursive: true, mode: 0o700 });
-        for (const file of readdirSync(dir)
+        const items = readdirSync(dir)
           .filter((s) => s.endsWith(".json"))
-          .sort()) {
-          const path = join(dir, file);
-          const item = readJson<{ text: string; sent?: boolean }>(path, { text: "" });
+          .map((file) => {
+            const path = join(dir, file);
+            const item = readJson<{ text: string; sent?: boolean; queuedAt?: number }>(path, {
+              text: "",
+            });
+            return { file, path, item, queuedAt: item.queuedAt ?? statSync(path).mtimeMs };
+          })
+          .sort((a, b) => a.queuedAt - b.queuedAt || a.file.localeCompare(b.file));
+        for (const { file, path, item, queuedAt } of items) {
           if (item.sent) continue;
           if (typeof item.text !== "string" || !item.text.trim())
             throw new Error("invalid outbox text");
           // No destination is accepted from the worker payload. The registry alone decides.
           try {
             await this.sendReply(thread, item.text, file.slice(0, -5));
-            writeJson(path, { text: item.text, sent: true });
+            writeJson(path, { text: item.text, queuedAt, sent: true });
           } catch {
             break;
           } // retain and retry, preserving per-thread output order
@@ -412,15 +424,39 @@ export class ThreadRouter {
             const script = args[0];
             const childEnv = harnessChildEnv(this.cfg, this.env);
             delete childEnv["FOREMAN_ROUTER_TOKEN"];
+            let secret = false;
+            if (script === "ask-human") {
+              for (let i = 2; i < args.length; i++) {
+                if (args[i] === "--secret") secret = true;
+                if (args[i] === "--options" || args[i] === "--urgency") i++;
+              }
+            }
             if (
+              !secret &&
               this.cfg.channelMode !== "telegram" &&
               childEnv["MATTERMOST_BOT_TOKEN"] &&
               !childEnv["MATTERMOST_CHANNEL_ID"]
             ) {
-              const { channels } = await new Mattermost(childEnv).destinations();
-              childEnv["MATTERMOST_CHANNEL_ID"] = channels[0] ?? "";
+              try {
+                const { channels } = await new Mattermost(childEnv).destinations();
+                childEnv["MATTERMOST_CHANNEL_ID"] = channels[0] ?? "";
+              } catch (error) {
+                if (this.cfg.channelMode !== "auto") throw error;
+                // Let the helper retain its existing Telegram fallback in auto mode.
+              }
             }
-            const proc = Bun.spawn([binPath(script), ...args.slice(1)], {
+            const helperArgs = args.slice(1);
+            const messageIndex = helperArgs[1] === "--dry-run" ? 2 : 1;
+            if (
+              script === "reply" &&
+              helperArgs[messageIndex] === "-" &&
+              text?.replace(/\n+$/, "")
+            ) {
+              // The CLI already consumed the FIFO. Bun supplies socket stdin to the helper,
+              // so omit the recovered dash and let reply read that forwarded text normally.
+              helperArgs.length = messageIndex;
+            }
+            const proc = Bun.spawn([binPath(script), ...helperArgs], {
               env: childEnv,
               stdin: "pipe",
               stdout: "pipe",
