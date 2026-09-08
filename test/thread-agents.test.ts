@@ -680,6 +680,148 @@ test("poll backfills over 1,000 mixed-author posts before committing the cursor,
   expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(["MSG mm:c1:late late same timestamp"]);
 });
 
+test.each([
+  1, 75, 200,
+])("poll retains unread posts when %i already-read posts are deleted between pages", async (deletions) => {
+  const f = fixture();
+  const posts = Array.from({ length: 1250 }, (_, i) => ({
+    id: `p${String(i).padStart(4, "0")}`,
+    root_id: "",
+    channel_id: "c1",
+    user_id: i % 3 ? "henk" : "bot",
+    // More than a page shares a timestamp, including the durable cursor boundary.
+    create_at: i < 1050 ? 100 : 101,
+    delete_at: 0,
+    message: `work ${i}`,
+  }));
+  const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
+  writeJson(cursor, 100);
+  let calls = 0;
+  const request = (async (input) => {
+    // No partial scan may acknowledge posts, even when it has to restart.
+    expect(readJson(cursor, 0)).toBe(100);
+    if (++calls === 2) {
+      for (const post of posts.slice(-deletions)) post.delete_at = 200;
+    }
+    const query = new URL(String(input)).searchParams;
+    const page = Number(query.get("page") ?? 0);
+    const size = Number(query.get("per_page") ?? 60);
+    const before = posts.find((p) => p.id === query.get("before"));
+    const sorted = posts
+      .filter((p) => !p.delete_at && (!before || p.create_at < before.create_at))
+      .sort((a, b) => b.create_at - a.create_at || b.id.localeCompare(a.id));
+    const batch = query.has("since")
+      ? sorted.filter((p) => p.create_at > Number(query.get("since"))).slice(0, 1000)
+      : sorted.slice(page * size, (page + 1) * size);
+    // Thread roots in the map are outside the actual page and must not end the scan.
+    const oldRoot = { ...posts[0], id: "oldroot", create_at: 1 };
+    return Response.json({
+      order: batch.map((p) => p.id),
+      posts: Object.fromEntries([...batch, oldRoot].map((p) => [p.id, p])),
+    });
+  }) as typeof fetch;
+  const mm = new Mattermost(
+    { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
+    request,
+  );
+  const lines = await mm.poll(f.cfg.stateDir, { channels: ["c1"], humans: ["henk"] });
+  const expected = authorizedPosts(posts, "c1", ["henk"]);
+  for (const post of expected) {
+    expect(lines).toContain(`MSG mm:c1:${post.id} ${post.root} ${post.text}`);
+    expect(readJson(receiptPath(f.cfg.stateDir, "c1", post.id), null)).toEqual(post);
+  }
+  expect(new Set(lines).size).toBe(lines.length);
+  expect(readJson(cursor, 0)).toBe(expected.at(-1)?.at);
+  expect(calls).toBeLessThan(30);
+});
+
+test("poll leaves the durable cursor untouched when deletions repeatedly break page continuity", async () => {
+  const f = fixture();
+  const posts = Array.from({ length: 1200 }, (_, i) => ({
+    id: `p${String(i).padStart(4, "0")}`,
+    root_id: "",
+    channel_id: "c1",
+    user_id: "henk",
+    create_at: 101 + i,
+    message: `work ${i}`,
+  }));
+  const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
+  writeJson(cursor, 100);
+  let mutate = true;
+  let calls = 0;
+  const request = (async (input) => {
+    if (++calls > 30) throw new Error("poll did not finish");
+    const query = new URL(String(input)).searchParams;
+    const page = Number(query.get("page") ?? 0);
+    const size = Number(query.get("per_page") ?? 60);
+    if (mutate && page > 0) posts.splice(-200);
+    const batch = [...posts].reverse().slice(page * size, (page + 1) * size);
+    return Response.json({
+      order: batch.map((p) => p.id),
+      posts: Object.fromEntries(batch.map((p) => [p.id, p])),
+    });
+  }) as typeof fetch;
+  const mm = new Mattermost(
+    { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
+    request,
+  );
+  const dest = { channels: ["c1"], humans: ["henk"] };
+  await expect(mm.poll(f.cfg.stateDir, dest)).rejects.toThrow("changed during pagination");
+  expect(readJson(cursor, 0)).toBe(100);
+  expect(existsSync(join(f.cfg.stateDir, "thread-inbox"))).toBe(false);
+  mutate = false;
+  expect(await mm.poll(f.cfg.stateDir, dest)).toEqual(
+    posts.map((p) => `MSG mm:c1:${p.id} ${p.id} ${p.message}`),
+  );
+  expect(readJson(cursor, 0)).toBe(posts.at(-1)?.create_at);
+  expect(await mm.poll(f.cfg.stateDir, dest)).toEqual([]);
+});
+
+test.each([
+  "empty",
+  "root",
+  "unordered",
+])("poll verifies the boundary before accepting a short page (%s)", async (response) => {
+  const f = fixture();
+  const posts = Array.from({ length: 250 }, (_, i) => ({
+    id: `p${String(i).padStart(4, "0")}`,
+    root_id: "",
+    channel_id: "c1",
+    user_id: "henk",
+    create_at: 101 + i,
+    message: `work ${i}`,
+  }));
+  const cursor = join(f.cfg.stateDir, "wait-reply/mm-c1.json");
+  writeJson(cursor, 100);
+  let calls = 0;
+  const request = (async (input) => {
+    const removed = ++calls === 2 ? posts.splice(-200) : [];
+    const query = new URL(String(input)).searchParams;
+    const page = Number(query.get("page") ?? 0);
+    const size = Number(query.get("per_page") ?? 60);
+    const batch = [...posts].reverse().slice(page * size, (page + 1) * size);
+    // A thread root outside `order` must not stand in for the missing page boundary.
+    const extra = response !== "empty" ? removed.slice(0, 1) : [];
+    return Response.json({
+      ...(calls === 2 && response === "unordered" ? {} : { order: batch.map((p) => p.id) }),
+      posts: Object.fromEntries([...batch, ...extra].map((p) => [p.id, p])),
+    });
+  }) as typeof fetch;
+  const mm = new Mattermost(
+    { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
+    request,
+  );
+  const poll = mm.poll(f.cfg.stateDir, { channels: ["c1"], humans: ["henk"] });
+  if (response === "unordered") {
+    await expect(poll).rejects.toThrow("requires ordered posts");
+    expect(readJson(cursor, 0)).toBe(100);
+    expect(existsSync(join(f.cfg.stateDir, "thread-inbox"))).toBe(false);
+    return;
+  }
+  expect(await poll).toEqual(posts.map((p) => `MSG mm:c1:${p.id} ${p.id} ${p.message}`));
+  expect(readJson(cursor, 0)).toBe(posts.at(-1)?.create_at);
+});
+
 test("explicit channel modes, cap validation and flag-off environment compatibility", async () => {
   expect(parseChannelMode("auto")).toBe("auto");
   expect(parseChannelMode("telegram")).toBe("telegram");

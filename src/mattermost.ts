@@ -51,6 +51,24 @@ export function authorizedPosts(posts: Post[], channel: string, humans: string[]
     }));
 }
 
+/** Pick a window crossing the last read index using Mattermost's page * per_page offset.
+ * E.g. after [0, 200), page=1/per_page=199 reads [199, 398), retaining a boundary witness.
+ */
+function overlappingPage(end: number): { page: number; perPage: number } {
+  let next: { page: number; perPage: number } | undefined;
+  let nextEnd = end;
+  for (let perPage = 200; perPage >= 2; perPage--) {
+    const page = Math.floor((end - 1) / perPage);
+    const candidateEnd = (page + 1) * perPage;
+    if (candidateEnd > nextEnd) {
+      next = { page, perPage };
+      nextEnd = candidateEnd;
+    }
+  }
+  if (!next) throw new Error("cannot overlap Mattermost posts page");
+  return next;
+}
+
 export class Mattermost {
   constructor(
     private env: Record<string, string | undefined>,
@@ -115,10 +133,16 @@ export class Mattermost {
       const since = readJson<number>(cursor, Date.now());
       if (!existsSync(cursor)) writeJson(cursor, since);
       const posts = new Map<string, Post>();
-      // `since` is capped at 1,000 and may have holes. Read ordinary pages back through
-      // the cursor instead, including every post at its timestamp before advancing it.
-      for (let page = 0; ; page++) {
-        const data = (await this.api(`/channels/${channel}/posts?page=${page}&per_page=200`)) as {
+      // `since` is capped at 1,000 and `before` excludes equal-timestamp posts. Read
+      // overlapping ordinary pages, verifying continuity before advancing the cursor.
+      let window = { page: 0, perPage: 200 };
+      let boundary: string | undefined;
+      let restarts = 0;
+      for (;;) {
+        const { page, perPage } = window;
+        const data = (await this.api(
+          `/channels/${channel}/posts?page=${page}&per_page=${perPage}`,
+        )) as {
           posts: Record<string, Post>;
           order?: string[];
         };
@@ -130,14 +154,29 @@ export class Mattermost {
           : Object.values(data.posts);
         if (batch.some((post) => !post || !Number.isFinite(post.create_at)))
           throw new Error("invalid Mattermost posts response");
+        if (boundary && !data.order)
+          throw new Error("Mattermost pagination requires ordered posts");
+        if (boundary && !batch.some((post) => post?.id === boundary)) {
+          // Deletion can move the boundary before this offset (or delete it). A short
+          // page is not proof of completion until its overlap has been verified.
+          if (++restarts >= 3) throw new Error("Mattermost posts changed during pagination; retry");
+          posts.clear();
+          window = { page: 0, perPage: 200 };
+          boundary = undefined;
+          continue;
+        }
         for (const post of batch) {
           if (post && post.channel_id === channel) posts.set(post.id, post);
         }
         if (
-          batch.length < 200 ||
+          batch.length < perPage ||
           batch.some((post) => post?.channel_id === channel && post.create_at < since)
         )
           break;
+        // Only the ordered page identifies its final row; map entries may be thread roots.
+        if (!data.order) throw new Error("Mattermost pagination requires ordered posts");
+        boundary = batch.at(-1)?.id;
+        window = overlappingPage((page + 1) * perPage);
       }
       let newest = since;
       for (const post of authorizedPosts([...posts.values()], channel, destinations.humans)) {
