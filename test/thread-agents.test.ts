@@ -743,6 +743,52 @@ test("authorization filters sender/channel, fails closed without humans, dedupli
   expect(await new Mattermost({}, request).destinations().catch(() => "closed")).toBe("closed");
 });
 
+test("first activation preserves later channels' messages when an earlier channel fails", async () => {
+  const f = fixture();
+  const post = {
+    id: "duringFailure",
+    channel_id: "c2",
+    root_id: "",
+    user_id: "henk",
+    message: "work",
+    create_at: 200,
+  };
+  const oldPost = { ...post, id: "beforeActivation", create_at: 99 };
+  let fail = true;
+  const requested: string[] = [];
+  const request = (async (input) => {
+    const path = new URL(String(input)).pathname;
+    requested.push(path);
+    if (path === "/api/v4/channels/c1/posts") {
+      if (fail) return new Response("offline", { status: 503 });
+      return Response.json({ posts: {} });
+    }
+    return Response.json({ posts: { [post.id]: post, [oldPost.id]: oldPost } });
+  }) as typeof fetch;
+  const env = { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" };
+  const dest = { channels: ["c1", "c2"], humans: ["henk"] };
+  const clock = spyOn(Date, "now").mockReturnValue(100);
+  try {
+    await expect(new Mattermost(env, request).poll(f.cfg.stateDir, dest)).rejects.toThrow("503");
+    expect(requested).toEqual(["/api/v4/channels/c1/posts"]);
+    for (const channel of dest.channels) {
+      expect(readJson(join(f.cfg.stateDir, "wait-reply", `mm-${channel}.json`), 0)).toBe(100);
+    }
+    fail = false;
+    clock.mockReturnValue(300);
+    const recovered = new Mattermost(env, request);
+    expect(await recovered.poll(f.cfg.stateDir, dest)).toEqual([
+      "MSG mm:c2:duringFailure duringFailure work",
+    ]);
+    expect(existsSync(receiptPath(f.cfg.stateDir, "c2", post.id))).toBe(true);
+    expect(existsSync(receiptPath(f.cfg.stateDir, "c2", oldPost.id))).toBe(false);
+    expect(readJson(join(f.cfg.stateDir, "wait-reply/mm-c2.json"), 0)).toBe(200);
+    expect(await recovered.poll(f.cfg.stateDir, dest)).toEqual([]);
+  } finally {
+    clock.mockRestore();
+  }
+});
+
 test("poll backfills over 1,000 mixed-author posts before committing the cursor, retrying failed pages", async () => {
   const f = fixture();
   const posts = Array.from({ length: 2607 }, (_, i) => ({

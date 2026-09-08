@@ -128,10 +128,15 @@ export class Mattermost {
     destinations: { channels: string[]; humans: string[] },
   ): Promise<string[]> {
     const lines: string[] = [];
-    for (const channel of destinations.channels) {
+    const startedAt = Date.now();
+    // Persist every initial cursor before a polling failure can interrupt activation.
+    const cursors = destinations.channels.map((channel) => {
       const cursor = join(state, "wait-reply", `mm-${safeId(channel)}.json`);
-      const since = readJson<number>(cursor, Date.now());
+      const since = readJson<number>(cursor, startedAt);
       if (!existsSync(cursor)) writeJson(cursor, since);
+      return { channel, cursor, since };
+    });
+    for (const { channel, cursor, since } of cursors) {
       const posts = new Map<string, Post>();
       // `since` is capped at 1,000 and `before` excludes equal-timestamp posts. Read
       // overlapping ordinary pages, verifying continuity before advancing the cursor.
