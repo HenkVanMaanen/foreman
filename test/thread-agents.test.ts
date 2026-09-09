@@ -1148,11 +1148,12 @@ test("credential-free approval-request CLI publishes an idempotent request but c
       stdout: "pipe",
       stderr: "pipe",
     });
-    return {
-      code: await child.exited,
-      output: await new Response(child.stdout).text(),
-      error: await new Response(child.stderr).text(),
-    };
+    const [code, output, error] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return { code, output, error };
   };
   const args = [
     "approval-request",

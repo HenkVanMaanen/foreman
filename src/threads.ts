@@ -621,12 +621,14 @@ export class ThreadRouter {
       this.collectApprovals();
       if (grants.some((approval) => currentApprovalGrant(this.cfg.stateDir, approval)))
         throw new Error("granted workflow ended without an action result");
-      if (result.text?.trim())
-        this.enqueueReply(
-          thread,
-          result.text,
-          `final-${batch[0] ?? (approvals[0] ? `approval-${approvals[0].id}` : `grant-${thread.inFlightGrants?.[0]?.grant}`)}`,
-        );
+      if (result.text?.trim()) {
+        const batchId =
+          batch[0] ??
+          (approvals[0]
+            ? `approval-${approvals[0].id}`
+            : `grant-${thread.inFlightGrants?.[0]?.grant}`);
+        this.enqueueReply(thread, result.text, `final-${batchId}`);
+      }
       thread.done.push(...batch);
       const completed = new Set(batch);
       thread.pending = thread.pending.filter((id) => !completed.has(id));

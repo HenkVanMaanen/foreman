@@ -141,7 +141,7 @@ if (mode === "error") process.exit(5);
 `,
   );
   chmodSync(gate, 0o700);
-  const cli = (args: string[], mode = "clean", thread = key, worktree = cwd) => {
+  const cli = async (args: string[], mode = "clean", thread = key, worktree = cwd) => {
     const child = Bun.spawn(
       [process.execPath, resolve(import.meta.dir, "../src/thread-cli.ts"), ...args],
       {
@@ -161,11 +161,12 @@ if (mode === "error") process.exit(5);
       },
     );
     children.push(child);
-    return (async () => ({
-      code: await child.exited,
-      output: await new Response(child.stdout).text(),
-      error: await new Response(child.stderr).text(),
-    }))();
+    const [code, output, error] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    return { code, output, error };
   };
   return { dir, cwd, git, head, cfg, ref, id, key, target, r, router, calls, resident, post, cli };
 }

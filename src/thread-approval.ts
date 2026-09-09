@@ -1,6 +1,6 @@
 // The supervisor alone grants authority. Worker helpers check its exact scope and run the gate.
 import { createHash } from "node:crypto";
-import { linkSync, mkdirSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { linkSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import type { HumanPost } from "./mattermost.ts";
 import { readJson, safeId, writeJson } from "./thread-store.ts";
@@ -257,7 +257,6 @@ export function enqueueApproval(state: string, key: string, value: unknown): str
   const request = approvalRequest(value);
   const id = approvalId(key, request);
   const dir = join(state, "thread-approvals", safeId(key));
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${id}.json`);
   const temp = `${path}.${process.pid}.publish`;
   writeJson(temp, request);
