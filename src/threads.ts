@@ -218,9 +218,11 @@ export class ThreadRouter {
         if (this.registry.approvals?.some((item) => `${item.id}.json` === file)) continue;
         let request: ApprovalRequest;
         let source: HumanPost;
+        let id: string;
         try {
           request = approvalRequest(readJson(join(dir, file), null));
-          if (`${approvalId(thread.key, request)}.json` !== file) continue;
+          id = approvalId(thread.key, request);
+          if (`${id}.json` !== file) continue;
           source = this.source(request.source);
           if (this.findThread(source)?.key !== thread.key) continue;
         } catch {
@@ -228,7 +230,7 @@ export class ThreadRouter {
         }
         this.registry.approvals ??= [];
         this.registry.approvals.push({
-          id: approvalId(thread.key, request),
+          id,
           thread: thread.key,
           repo: thread.repo,
           cwd: thread.cwd,
@@ -401,16 +403,15 @@ export class ThreadRouter {
       if (!approval) throw new Error("unknown approval handoff; read approval-list first");
       if ((repo !== "completed" && repo !== "declined") || !value.trim())
         throw new Error("approval-resolve needs id, completed|declined, and result note");
+      const thread = this.registry.threads.find((item) => item.key === approval.thread);
       if (approval.resolution) {
         if (approval.resolution.outcome !== repo || approval.resolution.note !== value)
           throw new Error("approval handoff already resolved");
       } else {
-        const thread = this.registry.threads.find((item) => item.key === approval.thread);
         if (repo === "completed" && thread && this.workerBusy(thread))
           throw new Error("worker turn still active; wait before final review and action");
         approval.resolution = { outcome: repo, note: value, at: new Date().toISOString() };
       }
-      const thread = this.registry.threads.find((item) => item.key === approval.thread);
       if (thread?.status === "idle" && !approval.delivered) thread.status = "queued";
       this.save(); // Disposition and wakeup are one checkpoint. Never change repo policy.
       return structuredClone(approval);

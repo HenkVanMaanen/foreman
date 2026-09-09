@@ -42,9 +42,10 @@ interface Review {
 }
 
 export function approvalReceipts(state: string, approval: Approval): string[] {
-  return readdirSync(join(state, "thread-inbox"))
+  const dir = join(state, "thread-inbox");
+  return readdirSync(dir)
     .filter((file) => file.endsWith(".json"))
-    .map((file) => readJson<HumanPost | null>(join(state, "thread-inbox", file), null))
+    .map((file) => readJson<HumanPost | null>(join(dir, file), null))
     .filter(
       (post): post is HumanPost =>
         post?.channel === approval.source.channel && post?.root === approval.source.root,
@@ -119,14 +120,14 @@ export function cleanApprovalReview(
   head: string,
 ): boolean {
   const review = readJson<Review | null>(approvalArtifact(state, approval, grant, "review"), null);
-  return Boolean(
+  return (
     review?.clean === true &&
-      review.grant === grant.id &&
-      review.head === head &&
-      typeof review.startedAt === "string" &&
-      review.startedAt >= grant.at &&
-      typeof review.finishedAt === "string" &&
-      review.finishedAt >= review.startedAt,
+    review.grant === grant.id &&
+    review.head === head &&
+    typeof review.startedAt === "string" &&
+    review.startedAt >= grant.at &&
+    typeof review.finishedAt === "string" &&
+    review.finishedAt >= review.startedAt
   );
 }
 
