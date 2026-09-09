@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Resident: bind/ref/repo/worktree, dismiss/ref, retry/ref, policy-set/ref/repo/JSON.
+# Resident: bind/ref/repo/worktree, dismiss/ref, retry/ref, policy-set/ref/repo/JSON/--repo-wide,
+# approval-list, approval-resolve/id/completed|declined/result-note.
+# Thread worker: approval-request/ref/PR-URL/full-head-hash/JSON-actions (requests, never grants).
 # Everyone: policy-get/repo. Source refs are mm:channel:post from authorized inbox receipts.
 set -euo pipefail
 helper="${FOREMAN_HOME:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../..}/src/thread-cli.ts"

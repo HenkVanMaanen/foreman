@@ -1,6 +1,7 @@
 // Credential-free agent helpers. Mutations travel to the resident-owned control endpoint.
 import { randomUUID } from "node:crypto";
 import { fstatSync } from "node:fs";
+import { enqueueApproval } from "./thread-approval.ts";
 import { enqueueOutbox } from "./thread-outbox.ts";
 import { safeId } from "./thread-store.ts";
 import { repoPolicy } from "./threads.ts";
@@ -14,6 +15,16 @@ try {
     const text = await Bun.stdin.text();
     if (!text.trim()) throw new Error("reply text required on stdin");
     enqueueOutbox(state, key, text, `${Date.now()}-${randomUUID()}`);
+  } else if (command === "approval-request") {
+    const key = safeId(process.env["FOREMAN_THREAD_KEY"] || "");
+    const state = process.env["FOREMAN_STATE_DIR"];
+    if (!state) throw new Error("thread state directory required");
+    const [source, target, head, actions] = args;
+    if (args.length !== 4)
+      throw new Error("approval-request needs source, PR URL, head, JSON actions");
+    console.log(
+      enqueueApproval(state, key, { source, target, head, actions: JSON.parse(actions || "") }),
+    );
   } else if (command === "policy-get") {
     console.log(
       JSON.stringify(repoPolicy(process.env["FOREMAN_NOTES_DIR"] || "notes", args[0] || "")),
