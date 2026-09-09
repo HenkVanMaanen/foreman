@@ -1,7 +1,12 @@
 // Credential-free agent helpers. Mutations travel to the resident-owned control endpoint.
 import { randomUUID } from "node:crypto";
 import { fstatSync } from "node:fs";
-import { enqueueApproval } from "./thread-approval.ts";
+import {
+  checkApproval,
+  enqueueApproval,
+  finishApproval,
+  reviewApproval,
+} from "./thread-approval.ts";
 import { enqueueOutbox } from "./thread-outbox.ts";
 import { safeId } from "./thread-store.ts";
 import { repoPolicy } from "./threads.ts";
@@ -25,6 +30,28 @@ try {
     console.log(
       enqueueApproval(state, key, { source, target, head, actions: JSON.parse(actions || "") }),
     );
+  } else if (
+    command === "approval-review" ||
+    command === "approval-check" ||
+    command === "approval-finish"
+  ) {
+    const key = safeId(process.env["FOREMAN_THREAD_KEY"] || "");
+    const state = process.env["FOREMAN_STATE_DIR"];
+    if (!state) throw new Error("thread state directory required");
+    const [id = "", target = "", head = "", action = ""] = args;
+    if (command === "approval-review") {
+      if (args.length !== 1) throw new Error("approval-review needs a handoff id");
+      console.log(await reviewApproval(state, key, id, process.cwd()));
+    } else if (command === "approval-check") {
+      if (args.length !== 4) throw new Error("approval-check needs id, PR URL, head, action");
+      console.log(
+        JSON.stringify(checkApproval(state, key, id, process.cwd(), target, head, action)),
+      );
+    } else {
+      if (args.length !== 3)
+        throw new Error("approval-finish needs id, reviewed head, result note");
+      finishApproval(state, key, id, process.cwd(), target, head);
+    }
   } else if (command === "policy-get") {
     console.log(
       JSON.stringify(repoPolicy(process.env["FOREMAN_NOTES_DIR"] || "notes", args[0] || "")),
