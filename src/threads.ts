@@ -276,6 +276,9 @@ export class ThreadRouter {
 
   private hasWork(thread: Thread): boolean {
     return (
+      thread.inFlight !== undefined ||
+      thread.inFlightApprovals !== undefined ||
+      thread.inFlightGrants !== undefined ||
       thread.pending.length > 0 ||
       this.approvalResults(thread).length > 0 ||
       this.taskGrants(thread).some((approval) => !approval.grants?.at(-1)?.delivered)
@@ -349,12 +352,16 @@ export class ThreadRouter {
       return structuredClone(
         (this.registry.approvals ?? []).map((approval) => {
           const thread = this.registry.threads.find((item) => item.key === approval.thread);
+          const messages = receipts.filter(
+            (post) => this.findThread(post)?.key === approval.thread,
+          );
           return {
             ...approval,
             threadStatus: thread?.status,
             workerBusy: thread ? this.workerBusy(thread) : true,
             grantCurrent: Boolean(currentApprovalGrant(this.cfg.stateDir, approval)),
-            messages: receipts.filter((post) => this.findThread(post)?.key === approval.thread),
+            receipts: messages.map((post) => post.id).sort(),
+            messages,
           };
         }),
       );
@@ -369,6 +376,12 @@ export class ThreadRouter {
         throw new Error("grant source must belong to this binding");
       if (this.workerBusy(thread))
         throw new Error("worker turn still active; wait before granting its next turn");
+      const expected: unknown = JSON.parse(value || "null");
+      const receipts = approvalReceipts(this.cfg.stateDir, approval);
+      if (!Array.isArray(expected) || JSON.stringify(expected) !== JSON.stringify(receipts))
+        throw new Error(
+          "receipt snapshot changed or missing; read approval-list and pass its receipts JSON to approval-grant",
+        );
       const current = currentApprovalGrant(this.cfg.stateDir, approval);
       if (!current || reference(current.source) !== repo) {
         approval.grants ??= [];
@@ -376,7 +389,7 @@ export class ThreadRouter {
           id: randomUUID(),
           source,
           at: new Date().toISOString(),
-          receipts: approvalReceipts(this.cfg.stateDir, approval),
+          receipts,
         });
       }
       if (thread.status === "idle" && !approval.grants?.at(-1)?.delivered) thread.status = "queued";

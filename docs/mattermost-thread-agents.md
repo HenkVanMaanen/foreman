@@ -56,10 +56,10 @@ Once the active worker turn ends, unresolved requests notify the resident throug
 The resident verifies **actual content approval** for the exact repo, PR and starting head, using the authenticated original source and subsequent messages. Quoted text and worker requests are never grants. When `approval-list` reports `workerBusy=false` (including surviving CLI locks after restart), the resident applies that approval:
 
 ```bash
-thread-control approval-grant <handoff-id> mm:<channel>:<original-approval-post>
+thread-control approval-grant <handoff-id> mm:<channel>:<original-approval-post> '<receipts JSON array from approval-list>'
 ```
 
-The resident capability and an authorized receipt from the same binding are required. This atomically records an audited grant and queues the saved worker session, even if its previous turn completed and there is no new human message. **The bound agent then owns review and merge.** This is a task exception to draft-only worker guidance; it does not change repository policy. The grant permits the required review and in-scope review fixes descended from the approved starting head, followed only by the requested actions on the named PR. Material content changes still require human approval. Independent tasks and other PRs acquire no authority.
+The resident capability, an authorized receipt from the same binding, and the exact `receipts` snapshot returned alongside the messages by `approval-list` are required. If that snapshot has changed, the grant is rejected; the resident must read the new messages before retrying. This atomically records an audited grant and queues the saved worker session, even if its previous turn completed and there is no new human message. **The bound agent then owns review and merge.** This is a task exception to draft-only worker guidance; it does not change repository policy. The grant permits the required review and in-scope review fixes descended from the approved starting head, followed only by the requested actions on the named PR. Material content changes still require human approval. Independent tasks and other PRs acquire no authority.
 
 The agent runs the following workflow after the verified content approval:
 

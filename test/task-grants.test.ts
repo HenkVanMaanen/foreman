@@ -14,6 +14,7 @@ import { join, resolve } from "node:path";
 import { loadConfig } from "../src/config.ts";
 import { receiptPath } from "../src/mattermost.ts";
 import { approvalArtifact, enqueueApproval } from "../src/thread-approval.ts";
+import { readOutbox } from "../src/thread-outbox.ts";
 import { readJson, writeJson } from "../src/thread-store.ts";
 import { type RunTurn, repoPolicy, ThreadRouter, type TurnResult } from "../src/threads.ts";
 
@@ -27,6 +28,16 @@ async function until(check: () => boolean) {
     await Bun.sleep(5);
   }
   throw new Error("mock barrier timed out");
+}
+
+function grantCommand(router: ThreadRouter, id: string, ref: string): string[] {
+  const approvals = router.command(router.token, ["approval-list"]) as {
+    id: string;
+    receipts: string[];
+  }[];
+  const approval = approvals.find((item) => item.id === id);
+  if (!approval) throw new Error("missing approval");
+  return ["approval-grant", id, ref, JSON.stringify(approval.receipts)];
 }
 
 async function fixture() {
@@ -161,7 +172,7 @@ if (mode === "error") process.exit(5);
 
 test("verified approval resumes the same agent to review then merge only its PR, consuming task authority", async () => {
   const f = await fixture();
-  const grant = ["approval-grant", f.id, f.ref];
+  const grant = grantCommand(f.r, f.id, f.ref);
   expect((await f.cli(["approval-review", f.id])).code).toBe(1);
   expect(existsSync(join(f.dir, "gate-calls"))).toBe(false);
   expect((await f.cli(grant)).error).toContain("resident control capability required");
@@ -226,9 +237,79 @@ test("verified approval resumes the same agent to review then merge only its PR,
   expect(existsSync(join(f.cfg.notesDir, "policy/autonomy.json"))).toBe(false);
 });
 
+test.each([
+  false,
+  true,
+])("a revocation between approval-list and approval-grant rejects the stale receipt snapshot (existing grant=%s)", async (existingGrant) => {
+  const f = await fixture();
+  const grant = grantCommand(f.r, f.id, f.ref);
+  if (existingGrant) f.r.command(f.r.token, grant);
+  expect(() => f.r.command(f.r.token, grant.slice(0, 3))).toThrow("receipt snapshot");
+  const before = f.r.snapshot();
+  f.post("revoked", "Do not merge; I revoke approval.");
+  expect(() => f.r.command(f.r.token, grant)).toThrow("receipt snapshot changed");
+  expect(f.r.snapshot()).toEqual(before);
+  expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).error).toContain(
+    "current resident-verified task grant required",
+  );
+  expect(f.r.command(f.r.token, ["approval-list"])).toMatchObject([
+    {
+      receipts: ["revoked", "root"],
+      grantCurrent: false,
+      messages: expect.arrayContaining([
+        expect.objectContaining({ id: "revoked", text: "Do not merge; I revoke approval." }),
+      ]),
+    },
+  ]);
+  f.r.command(f.r.token, ["approval-resolve", f.id, "declined", "Human revoked approval."]);
+});
+
+test.each([
+  false,
+  true,
+])("restart resumes the saved grant-only batch after approval-finish (result already collected=%s)", async (collected) => {
+  const f = await fixture();
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
+  await f.r.tick();
+  const thread = f.r.snapshot().threads[0];
+  expect(thread?.pending).toEqual([]);
+  expect(thread?.inFlight).toEqual([]);
+  expect(thread?.inFlightApprovals).toEqual([]);
+  const grant = thread?.inFlightGrants?.[0]?.grant;
+  expect(grant).toBeString();
+  expect((await f.cli(["approval-review", f.id])).code).toBe(0);
+  expect((await f.cli(["approval-finish", f.id, f.head, "Merged PR 123."])).code).toBe(0);
+  if (collected) f.r.collect();
+  await f.r.stop(); // Crash before the granted turn finishes and publishes its final reply.
+
+  const next = f.router();
+  await next.tick();
+  expect(next.snapshot().approvals?.[0]).toMatchObject({
+    resolution: { outcome: "completed", actor: "worker" },
+    delivered: true,
+  });
+  expect(f.calls).toHaveLength(3);
+  expect(f.calls[2]?.resume).toBe("saved-session");
+  expect(f.calls[2]?.prompt).toContain(
+    "Current resident-verified task grants (exceptions to draft-only guidance for these exact workflows):\n[]",
+  );
+  expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).code).toBe(1);
+  f.calls[2]?.end({ ok: true, text: "Merged after CLEAN review." });
+  await until(() => next.snapshot().threads[0]?.status === "idle");
+  expect(next.snapshot().threads[0]?.inFlight).toBeUndefined();
+  expect(next.snapshot().threads[0]?.inFlightApprovals).toBeUndefined();
+  expect(next.snapshot().threads[0]?.inFlightGrants).toBeUndefined();
+  await next.tick();
+  expect(f.calls).toHaveLength(3);
+  expect(
+    readOutbox(f.cfg.stateDir, f.key).find((item) => item.file === `final-grant-${grant}.json`)
+      ?.item,
+  ).toMatchObject({ text: "Merged after CLEAN review.", sent: true });
+});
+
 test("new human receipts suspend active grants before collection and invalidate an in-flight review", async () => {
   const f = await fixture();
-  f.r.command(f.r.token, ["approval-grant", f.id, f.ref]);
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
   const review = f.cli(["approval-review", f.id], "hold");
   await until(() => existsSync(join(f.dir, "gate-ready")));
   await f.r.stop(); // Its review process survives; the review lock still blocks new turns.
@@ -258,14 +339,14 @@ test("new human receipts suspend active grants before collection and invalidate 
 
 test("regrant needs a new gate and a successful turn cannot silently abandon an authorized workflow", async () => {
   const f = await fixture();
-  f.r.command(f.r.token, ["approval-grant", f.id, f.ref]);
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
   expect((await f.cli(["approval-review", f.id])).code).toBe(0);
   f.git("commit", "--allow-empty", "-m", "change after final review");
   const changedHead = f.git("rev-parse", "HEAD");
   expect((await f.cli(["approval-check", f.id, f.target, changedHead, "merge"])).code).toBe(1);
   f.post("status", "What is the status?");
   // Resident reads the follow-up and verifies that the existing actual approval still applies.
-  f.r.command(f.r.token, ["approval-grant", f.id, f.ref]);
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
   expect(f.r.snapshot().approvals?.[0]?.grants).toHaveLength(2);
   expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).code).toBe(1);
   await f.r.tick();
@@ -287,12 +368,13 @@ test("regrant needs a new gate and a successful turn cannot silently abandon an 
 
 test("failed grant checkpoint exposes no worker authority and retry saves grant plus idle-session wakeup together", async () => {
   const f = await fixture();
+  const grant = grantCommand(f.r, f.id, f.ref);
   const path = join(f.cfg.stateDir, "threads/registry.json");
   const persisted = readJson(path, null);
   const obstruction = `${path}.${process.pid}.tmp`;
   mkdirSync(obstruction);
   try {
-    expect(() => f.r.command(f.r.token, ["approval-grant", f.id, f.ref])).toThrow();
+    expect(() => f.r.command(f.r.token, grant)).toThrow();
     expect(readJson(path, null)).toEqual(persisted);
     expect((await f.cli(["approval-review", f.id])).code).toBe(1);
     expect(existsSync(join(f.dir, "gate-calls"))).toBe(false);
