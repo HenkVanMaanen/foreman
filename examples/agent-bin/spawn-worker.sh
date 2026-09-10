@@ -260,7 +260,18 @@ qlast="$(printf '%q' "$last_msg_file")"
 run_cmd="$(worker_run_cmd "$engine" "$qbrief" "$qlog" "$qlast")" \
   || { echo "spawn-worker: no launch command for engine '$engine'" >&2; exit 2; }
 
-json_string() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"; printf '"%s"' "$s"; }
+json_string() {
+  local s="$1" code char escape
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  # Bash strings cannot contain NUL; escape every other JSON control byte.
+  for ((code=1; code<32; code++)); do
+    printf -v char '\\%03o' "$code"
+    printf -v char '%b' "$char"
+    printf -v escape '\\u%04x' "$code"
+    s="${s//"$char"/"$escape"}"
+  done
+  printf '"%s"' "$s"
+}
 
 # The runner owns registration and finalization. Its acknowledgement records the ACTUAL runner
 # PID (setsid may fork), and its EXIT trap publishes result + registry BEFORE the wake marker.
@@ -282,6 +293,8 @@ EOF
   cat <<'EOF'
 child=""
 interrupted=""
+launching=0
+interrupt_status=0
 child_group_running() {
   local processes pgid stat
   kill -0 -- "-$child" 2>/dev/null || return 1
@@ -336,8 +349,10 @@ finish() {
 }
 interrupt() {
   interrupted="$1"
+  interrupt_status="$2"
   trap '' TERM INT HUP
-  exit "$2"
+  [ "$launching" -eq 0 ] || return 0
+  exit "$interrupt_status"
 }
 trap 'finish $?' EXIT
 trap 'interrupt TERM 143' TERM
@@ -361,9 +376,13 @@ EOF
 # Job control gives the engine an owned process group and preserves foreground SIGINT.
 # Restore the historical background stdin; codex's explicit brief redirect overrides it.
 set -m
+# Defer interruption until the engine PID is available to finalization.
+launching=1
 </dev/null $run_cmd &
 child=\$!
 set +m
+launching=0
+[ -z "\$interrupted" ] || exit "\$interrupt_status"
 if child_identity="\$(worker_identity "\$child")"; then :
 elif [ "\$?" -eq 2 ]; then child_identity=unknown
 else child_identity=exited
