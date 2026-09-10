@@ -1139,7 +1139,7 @@ run_claude() {
   return "${PIPESTATUS[0]}"
 }
 
-# Scan only CLI diagnostics and FAILED command events, never prompts or successful command output.
+# Scan only CLI diagnostics and explicit error events, never repository command output.
 CODEX_SANDBOX_RE="^bwrap:|^warning: Codex.s Linux sandbox uses bubblewrap"
 CODEX_SANDBOX_CONFIRMED=0
 CODEX_RUN_DIR=""       # private per-invocation files, also cleaned by the EXIT trap
@@ -1241,11 +1241,14 @@ run_codex() {
   fi
   # Preserve the complete local diagnostic transcript; findings only enter the capture below.
   sed 's/^/    | /' "$run_dir/stderr" || { [ "$rc" -ne 0 ] || rc=1; }
+  # command_execution has no sandbox-failure discriminator: aggregated_output can quote a
+  # fixture even when status=failed/exit_code=2 (e.g. rg also read a missing file). Only CLI
+  # stderr and error-event messages establish this latch; turn/report validation stays separate.
   if grep -aqE "$CODEX_SANDBOX_RE" "$run_dir/stderr" || \
      jq -se --arg re "$CODEX_SANDBOX_RE" '
-       any(.[]; .type == "item.completed" and .item.type == "command_execution" and
-         (.item.status == "failed" or (.item.exit_code != null and .item.exit_code != 0)) and
-         ((.item.aggregated_output // "") | split("\n") | any(.[]; test($re))))
+       any(.[] | if .type == "turn.failed" then .error.message
+                 elif .type == "error" then .message else empty end | strings;
+         split("\n") | any(.[]; test($re)))
      ' "$run_dir/events" >/dev/null 2>&1; then
     CODEX_SANDBOX_CONFIRMED=1
     echo "    codex: SANDBOX/STARTUP FAILURE — repository commands could not run"

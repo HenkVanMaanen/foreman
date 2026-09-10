@@ -133,12 +133,13 @@ export function freshAfterInjection(queued: string[], injected: Set<string>): st
 }
 
 /** The prompt delivered when the supervisor wakes a parked agent because a worker it was waiting
- *  on has finished (as opposed to a human message). */
+ *  on completed or lost verified liveness (as opposed to a human message). */
 export function formatWorkerWakePrompt(done: string[]): string {
   return (
-    `[wake] Worker(s) finished while you were parked: ${done.join(", ")}.\n` +
+    `[wake] Worker(s) completed or need lifecycle attention: ${done.join(", ")}.\n` +
     "Check each with `worker-status <name>` (it reads the worker's result.json), collect the " +
-    "result, take the MR to the human if it is ready, then continue — start or wait on the next task."
+    "result or investigate LOST/ORPHANED/UNKNOWN status. Missing completion does not imply success or " +
+    "a particular kill cause. Take the MR to the human if it is ready, then continue."
   );
 }
 

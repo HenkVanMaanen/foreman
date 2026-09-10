@@ -23,6 +23,7 @@ import { handBackLines, makeAuthDetector, makeAuthRecovery } from "./relogin.ts"
 import { Session } from "./session.ts";
 import { ThreadRouter } from "./threads.ts";
 import { startWatchdog } from "./watchdog.ts";
+import { workerNeedsAttention } from "./workers.ts";
 import { ensureWorkspace, syncNotes } from "./workspace.ts";
 
 const CONTINUE = "continue";
@@ -79,8 +80,8 @@ export async function supervise(cfg: Config): Promise<void> {
   // blocking on. While parked the supervisor also wakes on any of their done-markers, not only on
   // a human message — so the agent no longer re-arms a 10-min bash waiter across an hours-long run.
   const waitOnSentinel = join(cfg.stateDir, "wait-on");
-  // A parked-on worker has finished iff spawn-worker's wrapper has touched its done-marker.
-  const workerDone = (name: string) => existsSync(join(cfg.stateDir, `${name}.done`));
+  // Missing completion can mean a vanished wrapper, including untrappable SIGKILL.
+  const workerDone = (name: string) => workerNeedsAttention(cfg.stateDir, name);
   const hardTokens = Math.floor(cfg.contextWindow * cfg.hardMark);
   const softTokens = Math.floor(cfg.contextWindow * cfg.softMark);
 

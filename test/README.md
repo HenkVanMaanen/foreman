@@ -13,19 +13,16 @@ npm test             # unit tests (bun test) + lifecycle (bash test/run-lifecycl
 
 ## spawn-worker engine test
 
-`spawn-worker-engine.sh` covers `FOREMAN_WORKER_ENGINE` (`claude`, the default, vs `codex`). It
-extracts `worker_run_cmd` and `codex_did_not_run` verbatim from
-`examples/agent-bin/spawn-worker.sh`, then drives the real spawn-worker against PATH-shim
-`claude`/`codex` binaries in a throwaway `FOREMAN_STATE_DIR` (no agent, no network, no token spend).
+`spawn-worker-engine.sh` exercises both CLI engines against harmless stubs in an empty
+environment and temporary working directory. It preserves the engine flags, brief delivery,
+model defaults and result/exit contract. Sandbox prose with a missing result is an unverified
+hint; it cannot prove that no commands ran or synthesize exit 86.
 
-It locks: `claude` stays the default and its command line stays byte-identical; the `codex` line
-passes the brief on **stdin** (never as an argv string) and always carries `-s danger-full-access`
-(bubblewrap cannot start in this container); an unknown engine is refused before anything spawns;
-and — the one that matters — a **bubblewrap startup failure is reported as a FAILURE**
-(`WORKER_EXIT=86`, `result.json` status `blocked`) even though `codex exec` exits 0 and the model
-still claims the work is done, while the same error text merely *quoted* by a worker that really ran
-does not false-trigger. Both engines are asserted against the identical log / `WORKER_EXIT` /
-`<name>.done` / `<name>.result.json` / `workers.jsonl` contract that `worker-status` reads.
+`worker-lifecycle.test.ts` drives the real shell helpers with similarly isolated stubs. It checks
+result-before-done ordering, TERM finalization, SIGKILL/orphan liveness and parked wakeup, capacity,
+PID identity mismatch, pending launch failure, all launch modes, name reuse refusal, and actual
+artifact output quoting sandbox docs without a result file. See
+[worker lifecycle](../docs/worker-lifecycle.md) for the operational contract and limits.
 
 ## review-loop verdict + codex-sandbox test
 
