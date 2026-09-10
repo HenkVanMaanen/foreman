@@ -246,6 +246,55 @@ test("SIGKILL loses the wrapper, frees capacity, and wakes without a done marker
   await until(() => existsSync(join(f.state, "next.done")));
 });
 
+test("SIGKILL retains capacity after the engine exits while its descendant is live", async () => {
+  const f = fixture();
+  f.shim(
+    "claude",
+    `sleep 30 &
+echo "$!" > "$FOREMAN_STATE_DIR/descendant"
+echo "$$" > "$FOREMAN_STATE_DIR/engine"
+wait`,
+  );
+  const running = (target: number) => {
+    const r = Bun.spawnSync(["/usr/bin/ps", "-p", String(target), "-o", "stat="]);
+    const stat = r.stdout.toString().trim();
+    return stat !== "" && !/^[ZX]/.test(stat);
+  };
+  const owned: number[] = [];
+  try {
+    expect(f.launch("orphan-tree", { FOREMAN_MAX_WORKERS: "1" }).code).toBe(0);
+    await until(() =>
+      ["engine", "descendant", "orphan-tree.child"].every((file) =>
+        existsSync(join(f.state, file)),
+      ),
+    );
+    const wrapper = pid(f, "orphan-tree");
+    const engine = Number(read(f, "engine"));
+    const descendant = Number(read(f, "descendant"));
+    owned.push(wrapper, engine, descendant);
+    process.kill(wrapper, "SIGKILL");
+    await until(() => f.run("worker-state", [f.state, "orphan-tree"]).out.trim() === "ORPHANED");
+    process.kill(engine, "SIGTERM");
+    await until(() => !running(engine));
+    expect(running(descendant)).toBe(true);
+    expect(f.run("worker-state", [f.state, "orphan-tree"]).out.trim()).toBe("ORPHANED");
+    expect(f.launch("still-capped", { FOREMAN_MAX_WORKERS: "1" }).code).toBe(3);
+    expect(existsSync(join(f.state, "orphan-tree.done"))).toBe(false);
+    process.kill(descendant, "SIGTERM");
+    await until(() => f.run("worker-state", [f.state, "orphan-tree"]).out.trim() === "LOST");
+    expect(running(descendant)).toBe(false);
+    f.shim("claude", "exit 0");
+    expect(f.launch("next", { FOREMAN_MAX_WORKERS: "1" }).code).toBe(0);
+    await until(() => existsSync(join(f.state, "next.done")));
+  } finally {
+    for (const target of owned) {
+      try {
+        process.kill(target, "SIGKILL");
+      } catch {}
+    }
+  }
+});
+
 test("stale identities, missing legacy PIDs and old pending launches cannot report running", () => {
   const f = fixture();
   writeFileSync(join(f.state, "stale.launch"), `1 ${process.pid} linux:wrong-start\n`);

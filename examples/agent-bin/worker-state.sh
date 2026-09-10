@@ -33,7 +33,7 @@ worker_field() { # state name field — last non-null registry value, tolerant o
 }
 
 worker_lost_state() {
-  local state="$1" name="$2" child identity actual
+  local state="$1" name="$2" child identity actual processes pgid proc_state
   if [ -f "$state/$name.child" ]; then
     read -r child identity < "$state/$name.child" || true
     if ! [[ "${child:-}" =~ ^[1-9][0-9]*$ ]] || [ -z "${identity:-}" ] || [ "$identity" = unknown ]; then
@@ -43,6 +43,16 @@ worker_lost_state() {
       if [ "$actual" = "$identity" ]; then echo ORPHANED; return; fi
     elif [ "$?" -eq 2 ]; then echo UNKNOWN; return
     fi
+    # Job control makes the engine PID its process group ID; descendants can outlive it.
+    processes="$(ps -eo pgid=,stat= 2>/dev/null)" || { echo UNKNOWN; return; }
+    while read -r pgid proc_state; do
+      if [ "$pgid" = "$child" ]; then
+        case "$proc_state" in
+          Z*|X*) ;; # Zombies cannot do work or hold capacity.
+          *) echo ORPHANED; return;;
+        esac
+      fi
+    done <<< "$processes"
   fi
   echo LOST
 }
