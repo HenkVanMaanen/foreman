@@ -85,7 +85,7 @@
 # the loops do 0 productive rounds and exit 0 fast (idempotent).
 #
 # Usage:
-#   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
+#   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--pr URL] [--max-rounds N]
 #               [--simplify-rounds N] [--security auto|on|off] [--escalation-attempts N]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
@@ -178,6 +178,7 @@ orig_args=("$@")
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
+review_pr=""      # exact approved PR URL; suppresses branch-based PR discovery
 target="auto"     # default: best-effort derive the MR/PR target branch, else the historical base
 max_rounds=6
 # /simplify gets its OWN, much lower cap. It is a TASTE pass with no fixpoint to find (there is
@@ -229,7 +230,7 @@ usage() {
 review-loop — run review + simplify + codex + security over this branch's changes.
 
 Usage:
-  review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
+  review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--pr URL] [--max-rounds N]
               [--simplify-rounds N] [--security auto|on|off] [--escalation-attempts N]
               [--codex|--no-codex] [--codex-model MODEL] [--force]
   review-loop --stop-hook [ ...same opts... ]
@@ -248,7 +249,13 @@ override for when you knowingly want to exceed FOREMAN_MAX_WORKERS. Without it, 
 as 2 slots against FOREMAN_MAX_WORKERS (shared with spawn-worker) and blocks until 2 slots are free,
 or until FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds elapse (default 3600 → exit 4).
 
-Scope: --base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
+Scope: --pr URL resolves exactly that open GitHub PR or GitLab MR through its forge CLI (or the public github.com API). It
+requires matching returned URL, full base/head commit IDs, and a local HEAD containing the PR
+head. Missing base commits are fetched from that exact repository. Every phase uses the resolved
+diff; branch-based discovery and Claude /review selection are suppressed. Lookup/validation
+failures stop the gate; --pr cannot be combined with --base or a non-auto --target.
+
+--base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
 commit or it is a usage error. --target REF diffs from the merge-base with the branch this work
 merges INTO, so the review scope equals the MR/PR even for a branch stacked on another unmerged
 branch; an explicit REF that does not resolve locally (try `git fetch`) or shares no history with
@@ -319,6 +326,7 @@ while [ "$#" -gt 0 ]; do
     --dir)        [ "$#" -ge 2 ] || die_usage "--dir needs DIR"; dir="$2"; shift 2;;
     --base)       [ "$#" -ge 2 ] || die_usage "--base needs REF"; base="$2"; shift 2;;
     --target)     [ "$#" -ge 2 ] || die_usage "--target needs REF|auto|none"; target="$2"; shift 2;;
+    --pr)         [ "$#" -ge 2 ] || die_usage "--pr needs an exact PR URL"; review_pr="$2"; shift 2;;
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
     --simplify-rounds) [ "$#" -ge 2 ] || die_usage "--simplify-rounds needs N"; simplify_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
@@ -837,6 +845,64 @@ detect_mr_context() {
   done
   return 0
 }
+
+# Resolve the actual approved PR, never an arbitrary first PR sharing its source branch.
+# Metadata lookup is mandatory and bounded. The forge CLI owns authentication; no token is
+# copied into this script, its argv, or the review prompt. Only full commit IDs reach git.
+resolve_review_pr() {
+  [ -z "$base" ] && [ "$target" = "auto" ] \
+    || die_usage "--pr cannot be combined with --base or an explicit --target"
+  command -v jq >/dev/null 2>&1 || die "--pr requires jq"
+  local host project number raw repo_url pr_base pr_head
+  if [[ "$review_pr" =~ ^https://([A-Za-z0-9.-]+(:[0-9]+)?)/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)$ ]]; then
+    host="${BASH_REMATCH[1]}"; project="${BASH_REMATCH[3]}"; number="${BASH_REMATCH[4]}"
+    if ! raw="$(_tmo 20 gh api --hostname "$host" "repos/$project/pulls/$number" </dev/null 2>/dev/null)"; then
+      # Public github.com repositories need no new login/token. Private/enterprise metadata
+      # still requires the existing forge CLI authentication; never inspect credential files.
+      [ "$host" = "github.com" ] || die "could not read the exact approved GitHub PR"
+      raw="$(_tmo 20 curl --fail --silent --show-error --max-time 18 \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$project/pulls/$number" </dev/null 2>/dev/null)" \
+        || die "could not read the exact approved GitHub PR"
+    fi
+    jq -e --arg url "$review_pr" --argjson number "$number" \
+      '.html_url == $url and .number == $number and .state == "open" and .merged == false' \
+      <<<"$raw" >/dev/null 2>&1 || die "GitHub PR metadata does not match the requested open PR"
+    pr_base="$(jq -er '.base.sha | strings' <<<"$raw")" || die "GitHub PR base is missing"
+    pr_head="$(jq -er '.head.sha | strings' <<<"$raw")" || die "GitHub PR head is missing"
+  elif [[ "$review_pr" =~ ^https://([A-Za-z0-9.-]+(:[0-9]+)?)/([A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+)/-/merge_requests/([1-9][0-9]*)$ ]]; then
+    host="${BASH_REMATCH[1]}"; project="${BASH_REMATCH[3]}"; number="${BASH_REMATCH[5]}"
+    command -v glab >/dev/null 2>&1 || die "--pr requires glab for GitLab MR metadata"
+    local project_id="${project//\//%2F}"
+    raw="$(_tmo 20 glab api --hostname "$host" "projects/$project_id/merge_requests/$number" </dev/null 2>/dev/null)" \
+      || die "could not read the exact approved GitLab MR"
+    jq -e --arg url "$review_pr" --argjson number "$number" \
+      '.web_url == $url and .iid == $number and .state == "opened" and .sha == .diff_refs.head_sha' \
+      <<<"$raw" >/dev/null 2>&1 || die "GitLab MR metadata does not match the requested open MR"
+    pr_base="$(jq -er '.diff_refs.base_sha | strings' <<<"$raw")" || die "GitLab MR base is missing"
+    pr_head="$(jq -er '.diff_refs.head_sha | strings' <<<"$raw")" || die "GitLab MR head is missing"
+  else
+    die_usage "--pr needs an exact HTTPS GitHub /pull/N or GitLab /-/merge_requests/N URL"
+  fi
+  [[ "$pr_base" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ && "$pr_head" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ ]] \
+    || die "approved PR metadata contains invalid commit IDs"
+  git -C "$dir" merge-base --is-ancestor "$pr_head" HEAD >/dev/null 2>&1 \
+    || die "local HEAD does not contain the current approved PR head"
+  repo_url="https://$host/$project.git"
+  if ! git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null; then
+    _tmo 30 git -C "$dir" fetch --no-tags -- "$repo_url" "$pr_base" </dev/null >/dev/null 2>&1 \
+      || die "could not fetch the approved PR base commit"
+  fi
+  git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null \
+    || die "approved PR base commit is unavailable"
+  # Explicit base makes every phase use this diff. An empty PR number deliberately chooses
+  # the scoped report prompt for Claude too, rather than /review's independent PR lookup.
+  base="$pr_base"; target="none"
+  MR_CTX_DONE=1; MR_TARGET_BRANCH=""; MR_PR_NUMBER=""
+  echo "$prog: scoping every review phase to approved PR $review_pr"
+}
+
+if [ -n "$review_pr" ]; then resolve_review_pr; fi
 
 # A resolved ref in its short display form (origin/main, main) — the full refs/ path exists only to
 # keep resolution unambiguous, and reads as noise in a log line.

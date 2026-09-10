@@ -159,6 +159,8 @@ export async function reviewApproval(
       "review-loop",
       "--dir",
       approval.cwd,
+      "--pr",
+      approval.request.target,
     ],
     {
       cwd: approval.cwd,

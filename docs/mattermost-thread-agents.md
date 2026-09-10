@@ -84,3 +84,9 @@ The resident can decline or revoke with `thread-control approval-resolve <id> de
 Shared filesystem and process identity are **not a strong hostile-worker isolation boundary**. A hostile process could read other processes/shared credentials or tamper with policy, registry and outboxes. Environment scrubbing and the local capability prevent normal accidental routing and unverified worker API updates; they do not provide OS isolation. Atomic writes cover process crashes, not power-loss durability. Turn side effects and outbound delivery are at-least-once: ambiguous HTTP success can produce a duplicate reply after retry, always in the registered thread. No retention/compaction, wall-clock job timeout or live Mattermost integration validation is included.
 
 Quick checks: `bun run check`, `bun test test/unit.test.ts test/thread-agents.test.ts test/task-grants.test.ts test/secret-replies.test.ts`, and `bash -n` on changed scripts. Tests use mock transports/CLI and temporary HOME/state; they do not launch real agents or supervisor lifecycle tests. Do not run review-loop before human approval of the draft.
+
+The task review invokes `review-loop --pr <approved URL>`. The gate resolves that
+exact open PR/MR through its forge CLI, verifies the returned URL and commit IDs,
+and checks that the local head contains the current PR head. It uses that PR's
+base for every review phase, including the report pass. Missing or mismatched
+metadata stops the gate; another PR sharing the source branch cannot substitute.

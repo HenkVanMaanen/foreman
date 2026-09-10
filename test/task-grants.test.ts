@@ -126,6 +126,7 @@ async function fixture() {
     `#!${process.execPath}
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 appendFileSync(${JSON.stringify(join(dir, "gate-calls"))}, "review\\n");
+writeFileSync(${JSON.stringify(join(dir, "gate-args"))}, JSON.stringify(process.argv.slice(2)));
 const mode = process.env.GATE_MODE;
 if (mode === "hold") {
   writeFileSync(${JSON.stringify(join(dir, "gate-ready"))}, "ready");
@@ -201,6 +202,12 @@ test("verified approval resumes the same agent to review then merge only its PR,
   expect((await f.cli(["approval-review", f.id], "error")).code).toBe(1);
   expect((await check(f.head)).code).toBe(1);
   expect((await f.cli(["approval-review", f.id], "fix")).code).toBe(0);
+  expect(JSON.parse(readFileSync(join(f.dir, "gate-args"), "utf8"))).toEqual([
+    "--dir",
+    f.cwd,
+    "--pr",
+    f.target,
+  ]);
   const reviewed = f.git("rev-parse", "HEAD");
   expect(reviewed).not.toBe(f.head); // In-scope review fixes stay inside the approved workflow.
   expect((await check(f.head)).code).toBe(1);
