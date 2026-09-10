@@ -112,14 +112,34 @@ for spec in \
 done
 echo "  OK  actual final review/security/cross-check/escalation findings survive"
 
+# A search with no matches or a red-before-green test is a normal tool outcome. The
+# actual final report remains authoritative, including any unresolved test finding.
+for status in completed failed; do
+  for answer in 'SECFINDING: NONE' 'SECFINDING: RISKY | HIGH | test:7 | required check still fails -- NOT APPLIED: unresolved'; do
+    healthy "$answer"
+    jq -c --arg status "$status" 'if .item.type? == "command_execution" then
+      .item.status=$status | .item.exit_code=1 | .item.command="rg absent file" |
+      .item.aggregated_output="" else . end' "$WS/events" > "$WS/probe-events"
+    mv "$WS/probe-events" "$WS/events"
+    run
+    [ "$rc" -eq 0 ] && [ "$(cat "$WS/capture")" = "$answer" ] || fail "nonzero probe hid final report"
+    [ "$CODEX_SANDBOX_CONFIRMED" -eq 0 ] || fail "nonzero probe became sandbox failure"
+  done
+done
+echo "  OK  ordinary nonzero tool outcomes preserve the actual final verdict"
+
 healthy 'SECFINDING: NONE'; export STUB_RC=17
 case_name='nonzero CLI with valid final'; expect_failure
 [ "$rc" -eq 17 ] || fail "CLI exit code was hidden"
-for failure in command sandbox turn error malformed truncated missing_message mismatched_message; do
+for failure in command_incomplete command_no_exit sandbox turn error malformed truncated missing_message mismatched_message; do
   healthy 'SECFINDING: NONE'
   case "$failure" in
-    command|sandbox)
-      output='tests failed'; [ "$failure" != sandbox ] || output="$(cat "$WS/quoted")"
+    command_incomplete|command_no_exit)
+      jq -c --arg failure "$failure" 'if .item.type? == "command_execution" then
+        if $failure == "command_incomplete" then .item.status="in_progress"
+        else .item.exit_code=null end else . end' "$WS/events" > "$WS/bad-events";;
+    sandbox)
+      output="$(cat "$WS/quoted")"
       jq -c --arg output "$output" 'if .item.type? == "command_execution" then
         .item.status="failed" | .item.exit_code=1 | .item.aggregated_output=$output else . end' \
         "$WS/events" > "$WS/bad-events";;

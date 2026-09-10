@@ -1187,7 +1187,7 @@ codex_final_report() { # $1=last-message file, $2=contract (token[:report|apply]
 }
 
 # Codex counterpart of run_claude: run one `codex exec` pass in DIR with the given full prompt,
-# stream diagnostics indented, and return nonzero for CLI, command or final-report failures. Only
+# stream diagnostics indented, and return nonzero for CLI, startup or final-report failures. Only
 # the validated final report is appended to RUN_CLAUDE_CAPTURE for callers to parse.
 # `</dev/null` is MANDATORY — without it codex blocks forever on
 # "Reading additional input from stdin...". -m pins the model. run_fix_phase (not codex) does the
@@ -1250,7 +1250,10 @@ run_codex() {
     [ "$rc" -ne 0 ] || rc=1
   fi
   # The JSON event contract is also used by src/codex-session.ts. Successful completion and a
-  # final answer are BOTH required. Status/exit_code, not quoted command text, identify failures.
+  # final answer are BOTH required. A completed shell command may intentionally return nonzero
+  # (rg with no matches, a red regression test before its fix). Those outcomes are evidence for
+  # the reviewer, not a failed agent turn. Require terminal tool records but leave repository
+  # findings to the final report; required tests still have their independent CI gate.
   if ! jq -se --rawfile final "$run_dir/final" '
     length > 0 and all(.[]; type == "object" and (.type | type == "string")) and
     .[-1].type == "turn.completed" and
@@ -1258,13 +1261,14 @@ run_codex() {
       last | type == "string" and (sub("[\\r\\n]+$"; "") == ($final | sub("[\\r\\n]+$"; "")))) and
     all(.[]; .type != "error" and .type != "turn.failed" and
       (if .type == "item.completed" then
-         .item.type != "error" and .item.status != "failed" and
+         .item.type != "error" and
          (if .item.type == "command_execution" then
-            .item.status == "completed" and .item.exit_code == 0
-          else true end)
+            (.item.status == "completed" or .item.status == "failed") and
+            (.item.exit_code | type == "number" and floor == .)
+          else .item.status != "failed" end)
        else true end))
   ' "$run_dir/events" >/dev/null 2>&1; then
-    echo "    codex: failed command/turn or incomplete/malformed CLI events"
+    echo "    codex: failed turn or incomplete/malformed CLI events"
     [ "$rc" -ne 0 ] || rc=1
   fi
   if ! codex_final_report "$run_dir/final" "$contract" > "$run_dir/report"; then
