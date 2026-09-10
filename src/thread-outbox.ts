@@ -6,6 +6,7 @@ import { readJson, safeId, writeJson } from "./thread-store.ts";
 interface Reply {
   id: string;
   text: string;
+  sendOnce?: boolean;
 }
 export interface OutboxEntry {
   file: string;
@@ -15,6 +16,8 @@ export interface OutboxEntry {
     queuedAt?: number;
     chunks?: string[];
     sentChunks?: number;
+    sendOnce?: boolean;
+    attemptedAt?: number;
   };
 }
 
@@ -44,8 +47,14 @@ function outbox(state: string, key: string, reply: Reply | null): OutboxEntry[] 
   return JSON.parse(result.stdout.toString()) as OutboxEntry[];
 }
 
-export function enqueueOutbox(state: string, key: string, text: string, id: string): void {
-  outbox(state, key, { text, id: safeId(id) });
+export function enqueueOutbox(
+  state: string,
+  key: string,
+  text: string,
+  id: string,
+  sendOnce = false,
+): void {
+  outbox(state, key, { text, id: safeId(id), ...(sendOnce ? { sendOnce } : {}) });
 }
 
 export function readOutbox(state: string, key: string): OutboxEntry[] {
@@ -93,7 +102,10 @@ if (import.meta.main) {
     // A delivery ID names one immutable reply, including after it has been sent or replayed.
     // This also lets the supervisor mark sent without racing a worker payload replacement.
     if (!entries.has(file)) {
-      writeJson(join(dir, file), { text: reply.text });
+      writeJson(join(dir, file), {
+        text: reply.text,
+        ...(reply.sendOnce ? { sendOnce: true } : {}),
+      });
       order.push(file);
       writeJson(orderPath, order);
     }

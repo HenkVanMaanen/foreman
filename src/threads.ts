@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { CodexQuotaMonitor, type QuotaWindow, readCodexQuota } from "./codex-quota.ts";
 import { CodexSession } from "./codex-session.ts";
 import type { Config } from "./config.ts";
 import { type HumanPost, Mattermost, postLine, receiptPath } from "./mattermost.ts";
@@ -107,6 +108,7 @@ export class ThreadRouter {
   private stopped = false;
   private runTurn: RunTurn;
   private sendReply: SendReply;
+  private quota: CodexQuotaMonitor | undefined;
 
   constructor(
     private cfg: Config,
@@ -114,6 +116,7 @@ export class ThreadRouter {
     private resident: (lines: string[]) => void,
     run?: RunTurn,
     send?: SendReply,
+    readQuota?: () => Promise<QuotaWindow[]>,
   ) {
     this.path = join(cfg.stateDir, "threads/registry.json");
     this.socket = join(resolve(cfg.stateDir), `thread-router-${this.token.slice(0, 8)}.sock`);
@@ -127,6 +130,18 @@ export class ThreadRouter {
     this.runTurn = run ?? ((thread, prompt, session) => this.codexTurn(thread, prompt, session));
     const mm = new Mattermost({ ...process.env, ...env });
     this.sendReply = send ?? ((t, text) => mm.reply(t.channel, t.root, text));
+    if (cfg.codexQuotaThread && cfg.threadAgents && cfg.channelMode !== "telegram") {
+      this.quota = new CodexQuotaMonitor(
+        cfg.stateDir,
+        cfg.codexQuotaPollMs,
+        readQuota ??
+          (() =>
+            readCodexQuota(
+              cfg.codexBin,
+              agentEnv({ ...process.env, ...env, FOREMAN_THREAD_AGENTS: "1" }, false),
+            )),
+      );
+    }
   }
 
   snapshot(): Registry {
@@ -501,6 +516,8 @@ export class ThreadRouter {
         const dir = join(this.cfg.stateDir, "thread-outbox", thread.key);
         for (const { file, item } of readOutbox(this.cfg.stateDir, thread.key)) {
           if (item.sent) continue;
+          // Quota heads-ups prefer a possible missed send over duplicate alerts after ambiguity.
+          if (item.sendOnce && item.attemptedAt !== undefined) continue;
           if (typeof item.text !== "string" || !item.text.trim())
             throw new Error("invalid outbox text");
           const path = join(dir, file);
@@ -512,6 +529,11 @@ export class ThreadRouter {
           }
           // No destination is accepted from the worker payload. The registry alone decides.
           try {
+            if (item.sendOnce) {
+              if (chunks.length !== 1) throw new Error("send-once reply must fit in one post");
+              item.attemptedAt = Date.now();
+              writeJson(path, item); // Persist before HTTP, including a crash during the send.
+            }
             for (let i = item.sentChunks ?? 0; i < chunks.length; i++) {
               const chunk = chunks[i];
               // Mattermost rejects empty posts, including whitespace-only chunks.
@@ -539,6 +561,12 @@ export class ThreadRouter {
 
   async tick(): Promise<void> {
     if (this.stopped || this.cfg.channelMode === "telegram") return;
+    const quotaThread = this.registry.threads.find(
+      (thread) => `mm:${thread.channel}:${thread.root}` === this.cfg.codexQuotaThread,
+    );
+    void this.quota
+      ?.tick(quotaThread?.key)
+      .catch(() => console.error("[quota] check deferred; state retained"));
     this.collect();
     // Surviving CLIs count against the cap after a supervisor crash, before any new launches.
     const orphans = new Set(
@@ -781,6 +809,7 @@ export class ThreadRouter {
     this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.server?.stop(true);
+    await this.quota?.stop();
     await Promise.all([...this.sessions].map((s) => s.stop()));
   }
 }

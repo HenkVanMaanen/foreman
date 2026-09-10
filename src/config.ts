@@ -14,6 +14,9 @@ export interface Config {
   // codex CLI, used by both the resident session and the codex re-login relay.
   codexBin: string;
   codexExtraArgs: string[];
+  // Empty disables quota warnings; otherwise an existing bound mm:channel:root destination.
+  codexQuotaThread: string;
+  codexQuotaPollMs: number;
   // Which CLI's auth failure the supervisor detects and recovers. Kept independently selectable so
   // the recovery flow can still be rehearsed against a mock without changing the session engine.
   reloginEngine: "claude" | "codex";
@@ -97,6 +100,8 @@ export function loadConfig(): Config {
     claudeBin: str("FOREMAN_CLAUDE_BIN", "claude"),
     claudeExtraArgs: str("FOREMAN_CLAUDE_EXTRA_ARGS", "").split(" ").filter(Boolean),
     codexBin: str("FOREMAN_CODEX_BIN", "codex"),
+    codexQuotaThread: parseQuotaThread(str("FOREMAN_CODEX_QUOTA_THREAD", "")),
+    codexQuotaPollMs: parseQuotaPollMs(str("FOREMAN_CODEX_QUOTA_POLL_MS", "60000")),
     codexExtraArgs: str(
       "FOREMAN_CODEX_EXTRA_ARGS",
       "--model gpt-6-astra -c model_reasoning_effort=xhigh",
@@ -134,4 +139,16 @@ export function parseThreadCap(value: string): number {
   const cap = Number(value);
   if (Number.isSafeInteger(cap) && cap >= 1) return cap;
   throw new Error("FOREMAN_MAX_THREAD_AGENTS must be a positive safe integer");
+}
+
+export function parseQuotaThread(value: string): string {
+  if (value === "" || /^mm:[a-zA-Z0-9_-]{1,100}:[a-zA-Z0-9_-]{1,100}$/.test(value)) return value;
+  throw new Error("FOREMAN_CODEX_QUOTA_THREAD must be empty or mm:channel:root");
+}
+
+export function parseQuotaPollMs(value: string): number {
+  const interval = Number(value);
+  if (Number.isSafeInteger(interval) && interval >= 10_000 && interval <= 3_600_000)
+    return interval;
+  throw new Error("FOREMAN_CODEX_QUOTA_POLL_MS must be 10000..3600000 milliseconds");
 }
