@@ -147,6 +147,75 @@ test("recovery and forward reset rearm; backwards or missing reset metadata do n
   expect(new Set(f.entries().map((entry) => entry.file)).size).toBe(3);
 });
 
+test("duration metadata changes preserve suppression and recovery across restarts", async () => {
+  for (const durationMins of [10080, null]) {
+    for (const resetsAt of [reset, null]) {
+      const f = fixture();
+      const first = { ...sample(4, resetsAt)[0], durationMins };
+      const changed = { ...first, durationMins: durationMins === null ? 10080 : null };
+      await f.poll(f.monitor(), [first]);
+      await f.poll(f.monitor(), [changed]);
+      await f.poll(f.monitor(), []);
+      await f.poll(f.monitor(), [first]);
+      expect(f.entries()).toHaveLength(1);
+
+      await f.poll(f.monitor(), [{ ...changed, remaining: 30 }]);
+      await f.poll(f.monitor(), [first]);
+      expect(f.entries()).toHaveLength(2);
+      await f.poll(f.monitor(), [{ ...first, remaining: 30 }]);
+      await f.poll(f.monitor(), [changed]);
+      expect(f.entries()).toHaveLength(3);
+      await f.poll(f.monitor(), [first]);
+      expect(f.entries()).toHaveLength(3);
+    }
+  }
+});
+
+test("duration identities remain independent after slot swaps and missing metadata", async () => {
+  const f = fixture();
+  const weekly = { ...sample(4)[0], slot: "secondary" as const };
+  const short = { ...sample(4)[0], durationMins: 300 };
+  await f.poll(f.monitor(), [short, weekly]);
+  await f.poll(f.monitor(), [
+    { ...weekly, slot: "primary" },
+    { ...short, slot: "secondary" },
+  ]);
+  await f.poll(f.monitor(), [
+    { ...weekly, slot: "primary", durationMins: null, remaining: 30 },
+    { ...short, slot: "secondary", durationMins: null },
+  ]);
+  expect(f.entries()).toHaveLength(1);
+  await f.poll(f.monitor(), [short, weekly]);
+  expect(f.entries()).toHaveLength(2);
+  expect(f.entries().filter((entry) => entry.item.text.includes("5h:"))).toHaveLength(1);
+});
+
+test("existing quota state supplies identities when duration metadata disappears", async () => {
+  const f = fixture();
+  const path = join(f.state, "codex-quota/monitor.json");
+  writeJson(path, {
+    version: 1,
+    observed: sample(4),
+    episodes: { "10080": { resetsAt: reset, alertId: "quota-existing" } },
+  });
+  await f.poll(f.monitor(), [{ ...sample(4)[0], durationMins: null }]);
+  expect(f.entries()).toHaveLength(0);
+  await f.poll(f.monitor(), [{ ...sample(30)[0], durationMins: null }]);
+  await f.poll(f.monitor(), sample(4));
+  expect(f.entries()).toHaveLength(1);
+});
+
+test("older reset recovery cannot rearm an unchanged low episode", async () => {
+  const f = fixture();
+  await f.poll(f.monitor(), sample(4, reset + 86400));
+  await f.poll(f.monitor(), sample(30, reset));
+  await f.poll(f.monitor(), sample(4, reset + 86400));
+  expect(f.entries()).toHaveLength(1);
+  await f.poll(f.monitor(), sample(30, reset + 86400));
+  await f.poll(f.monitor(), sample(4, reset + 86400));
+  expect(f.entries()).toHaveLength(2);
+});
+
 test("unknown quota preserves low episode; each main window crosses independently", async () => {
   const f = fixture();
   const m = f.monitor();

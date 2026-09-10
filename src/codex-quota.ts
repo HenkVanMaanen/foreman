@@ -136,6 +136,7 @@ interface QuotaState {
   checkedAt?: number;
   status?: "ok" | "unknown";
   observed?: QuotaWindow[];
+  windowNames?: Partial<Record<QuotaWindow["slot"], string>>;
   episodes: Record<string, Episode>;
   pending?: { id: string; key: string; text: string };
 }
@@ -196,16 +197,37 @@ export class CodexQuotaMonitor {
       // Auth/network/protocol failures are unknown quota, never zero or a reason to wake a model.
     }
     if (this.stopped) return;
+    state.windowNames ??= Object.fromEntries(
+      (state.observed ?? []).map((window) => [
+        window.slot,
+        String(window.durationMins ?? window.slot),
+      ]),
+    );
+    const windowNames = state.windowNames;
     state.checkedAt = this.now();
     state.status = windows.length ? "ok" : "unknown";
     state.observed = windows;
     const low: QuotaWindow[] = [];
     const id = `quota-${randomUUID()}`;
     for (const window of windows) {
+      if (window.durationMins === null) continue;
+      const name = String(window.durationMins);
+      // A known duration moving slots must not leave the old slot pointing to it.
+      for (const slot of ["primary", "secondary"] as const) {
+        if (slot !== window.slot && windowNames[slot] === name) delete windowNames[slot];
+      }
+      windowNames[window.slot] = name;
+    }
+    for (const window of windows) {
       // Duration, not primary/secondary position, identifies a known allowance window.
-      const name = String(window.durationMins ?? window.slot);
-      const episode = state.episodes[name] ?? { resetsAt: null, alertId: null };
+      const name = String(window.durationMins ?? windowNames[window.slot] ?? window.slot);
+      // Retain the identity through metadata gaps; promote a previously unnamed episode.
+      const episode = state.episodes[name] ??
+        state.episodes[window.slot] ?? { resetsAt: null, alertId: null };
+      if (name !== window.slot) delete state.episodes[window.slot];
+      state.episodes[name] = episode;
       if (window.resetsAt !== null) {
+        if (episode.resetsAt !== null && window.resetsAt < episode.resetsAt) continue;
         if (episode.resetsAt !== null && window.resetsAt > episode.resetsAt) episode.alertId = null;
         episode.resetsAt = Math.max(episode.resetsAt ?? 0, window.resetsAt);
       }
@@ -214,7 +236,6 @@ export class CodexQuotaMonitor {
         episode.alertId = id;
         low.push(window);
       }
-      state.episodes[name] = episode;
     }
     if (low.length)
       state.pending = {
