@@ -14,10 +14,8 @@
 #                     an attempt that changes nothing ends it, a pass that emits no verdict line
 #                     counts as UNRESOLVED (never silently resolved), an echoed-back output template
 #                     is not a verdict, and running out of attempts is reported as UNRESOLVED.
-#   codex sandbox   - a bubblewrap/startup failure is detected from the round's output (codex exits
-#                     0 in that state, so the exit code alone never told anyone), while the SAME
-#                     error text merely QUOTED by a healthy review is not; and a detection that was
-#                     never confirmed by the phase must not stop later codex rounds.
+#   codex output    - the focused offline CLI suite checks final-message isolation, sandbox/command
+#                     failures, malformed output and fresh capture files across multiple rounds.
 #
 # shellcheck disable=SC2034,SC2154  # units are eval'd from review-loop.sh, so shellcheck cannot see
 #                                  # the extracted functions assign/read these globals.
@@ -35,7 +33,6 @@ fail() { echo "FAIL: $1"; exit 1; }
 # function body ends that way in this file).
 extract() { awk -v pat="$1" '$0 ~ pat {f=1} f{print} f&&/^}$/{exit}' "$SCRIPT"; }
 eval "$(extract '^VERDICT="CLEAN"')"
-eval "$(extract '^CODEX_SANDBOX_RE=')"
 eval "$(extract '^_esc_new[(][)]')"
 eval "$(extract '^_risky_finding_re=')"
 eval "$(extract '^build_escalation_prompt[(][)]')"
@@ -44,7 +41,7 @@ eval "$(extract '^configure_review_engines[(][)]')"
 eval "$(extract '^build_codex_simplify_prompt[(][)]')"
 eval "$(extract '^build_security_prompt[(][)]')"
 eval "$(sed -n '/^LF=/p;/^_esc_mark_seen()/p;/^_esc_count()/p' "$SCRIPT")"
-for fn in compute_verdict run_codex _esc_new collect_risky_findings build_escalation_prompt \
+for fn in compute_verdict _esc_new collect_risky_findings build_escalation_prompt \
           run_escalation_phase _esc_mark_seen _esc_count configure_review_engines \
           build_codex_simplify_prompt build_security_prompt; do
   type "$fn" >/dev/null 2>&1 || fail "could not extract $fn from $SCRIPT"
@@ -280,58 +277,8 @@ done
 echo "  OK  the escalation prompt defines FIXED / DISMISSED / DECISION / UNRESOLVED"
 unset -f run_fix_phase escalation_recheck
 
-# === 8. codex sandbox-failure detection =======================================================
-echo "### 8: a codex sandbox failure is detected, quoted error text is not ###"
-_indent_tee() { sed 's/^/    | /' >/dev/null; }   # swallow the transcript; we assert on the flag
-dir="$WS"; codex_model="stub"; RUN_CLAUDE_CAPTURE=""
-mkdir -p "$WS/bin"; PATH="$WS/bin:$PATH"
-mk_codex() { printf '#!/usr/bin/env bash\n%s\n' "$1" > "$WS/bin/codex"; chmod +x "$WS/bin/codex"; }
-
-# The real failure shape, captured from this box: codex exits 0, bubblewrap's error is on the stream.
-mk_codex 'echo "warning: Codex'"'"'s Linux sandbox uses bubblewrap and needs access to create user namespaces."
-echo "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
-exit 0'
-CODEX_SANDBOX_HIT=0; CODEX_SANDBOX_CONFIRMED=0; CODEX_SCAN=""
-rc=0; run_codex "review" || rc=$?
-[ "$rc" = 0 ] || fail "the stub codex should exit 0 (that is the point: the exit code hides it)"
-[ "$CODEX_SANDBOX_HIT" = 1 ] || fail "a real sandbox failure was not detected"
-echo "  OK  sandbox failure detected (codex exit 0)"
-
-# A healthy review that quotes those very errors — this loop reviews the file documenting them.
-mk_codex 'cat <<EOT
-Reviewing the diff; the comment documents:
-#   -s workspace-write -> "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
-+#  bwrap: setting up uid map: Permission denied
-CODEXFINDING: NONE
-EOT'
-CODEX_SANDBOX_HIT=0; CODEX_SANDBOX_CONFIRMED=0
-run_codex "review" || fail "healthy stub should exit 0"
-[ "$CODEX_SANDBOX_HIT" = 0 ] || fail "quoted sandbox error text must NOT count as a failure"
-echo "  OK  quoted error text is not a failure"
-
-# An unconfirmed hit must not stop later rounds (that would turn a false positive into a phase ERROR).
-CODEX_SANDBOX_HIT=1; CODEX_SANDBOX_CONFIRMED=0
-mk_codex 'echo "CODEXFINDING: NONE"; exit 0'
-run_codex "review" || fail "an UNconfirmed hit must not block a codex round"
-echo "  OK  an unconfirmed hit does not block later rounds"
-
-# Once the phase confirms it, further rounds are refused instead of burning calls. The stub leaves a
-# marker file if it is ever executed, so "was codex invoked?" is asserted directly.
-CODEX_SANDBOX_CONFIRMED=1
-rm -f "$WS/codex-ran"
-mk_codex 'touch '"$WS"'/codex-ran; exit 0'
-rc=0; run_codex "review" || rc=$?
-[ "$rc" != 0 ] || fail "a confirmed sandbox failure must return non-zero"
-[ ! -e "$WS/codex-ran" ] || fail "codex was invoked despite a CONFIRMED sandbox failure"
-echo "  OK  a confirmed failure stops further codex calls"
-
-# The invocation itself must use danger-full-access (workspace-write cannot start bwrap here).
-grep -q 'codex exec --skip-git-repo-check -s danger-full-access' "$SCRIPT" \
-  || fail "run_codex must invoke codex with -s danger-full-access (see the bubblewrap note)"
-echo "  OK  codex is invoked with -s danger-full-access"
-grep -q 'model_reasoning_effort="$effort"' "$SCRIPT" \
-  || fail "every run_codex invocation must pin its configured reasoning effort"
-echo "  OK  codex is invoked with the configured reasoning effort"
+# === 8. codex output boundary and failures ====================================================
+bash "$HERE/test/review-loop-codex-output.sh"
 
 # === 9. review-engine selection ================================================================
 echo "### 9: review phases and the independent cross-check always use opposite engines ###"
