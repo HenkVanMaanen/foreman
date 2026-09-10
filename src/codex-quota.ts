@@ -203,6 +203,7 @@ export class CodexQuotaMonitor {
       ]),
     );
     const windowNames = state.windowNames;
+    const priorNames = Object.values(windowNames);
     state.checkedAt = this.now();
     state.status = windows.length ? "ok" : "unknown";
     state.observed = windows;
@@ -218,6 +219,15 @@ export class CodexQuotaMonitor {
       windowNames[window.slot] = name;
     }
     for (const window of windows) {
+      if (window.durationMins === null && windowNames[window.slot] === undefined) {
+        // A slot swap can displace the other identity while its duration is unavailable.
+        const unassignedNames = priorNames.filter(
+          (name) => !Object.values(windowNames).includes(name),
+        );
+        if (unassignedNames.length === 1 && unassignedNames[0]) {
+          windowNames[window.slot] = unassignedNames[0];
+        }
+      }
       // Duration, not primary/secondary position, identifies a known allowance window.
       const name = String(window.durationMins ?? windowNames[window.slot] ?? window.slot);
       // Retain the identity through metadata gaps; promote a previously unnamed episode.

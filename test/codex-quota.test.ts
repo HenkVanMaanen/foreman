@@ -194,6 +194,42 @@ test("duration identities remain independent after slot swaps and missing metada
   expect(entries.filter((entry) => entry.item.text.includes("5h:"))).toHaveLength(1);
 });
 
+test("slot swaps with one missing duration preserve both alerted episodes", async () => {
+  for (const missingDuration of [300, 10080]) {
+    const f = fixture();
+    const weekly = { ...sample(4)[0], slot: "secondary" as const };
+    const short = { ...sample(4)[0], durationMins: 300 };
+    const swapped: QuotaWindow[] = [
+      { ...weekly, slot: "primary" as const },
+      { ...short, slot: "secondary" as const },
+    ].map((window) => ({
+      ...window,
+      durationMins: window.durationMins === missingDuration ? null : window.durationMins,
+    }));
+    await f.poll(f.monitor(), [short, weekly]);
+    await f.poll(f.monitor(), swapped);
+    expect(f.entries()).toHaveLength(1);
+    await f.poll(
+      f.monitor(),
+      swapped.map((window) => ({ ...window, durationMins: null })),
+    );
+    expect(f.entries()).toHaveLength(1);
+
+    await f.poll(
+      f.monitor(),
+      swapped.map((window) => ({
+        ...window,
+        remaining: window.durationMins === null ? 30 : window.remaining,
+      })),
+    );
+    await f.poll(f.monitor(), [short, weekly]);
+    const entries = f.entries();
+    expect(entries).toHaveLength(2);
+    const unchangedLabel = missingDuration === 300 ? "weekly:" : "5h:";
+    expect(entries.filter((entry) => entry.item.text.includes(unchangedLabel))).toHaveLength(1);
+  }
+});
+
 test("existing quota state supplies identities when duration metadata disappears", async () => {
   const f = fixture();
   const path = join(f.state, "codex-quota/monitor.json");
