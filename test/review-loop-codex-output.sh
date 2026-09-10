@@ -62,6 +62,9 @@ healthy() {
   CODEX_SANDBOX_CONFIRMED=0
   export STUB_RC=0 STUB_FINAL=present STUB_EDIT=0
   : > "$WS/stderr"; : > "$WS/capture"
+  write_events "$1"
+}
+write_events() {
   printf '%s\n' "$1" > "$WS/answer"
   jq -cn --rawfile quoted "$WS/quoted" --rawfile answer "$WS/answer" '
     {type:"thread.started", thread_id:"offline"},
@@ -73,6 +76,16 @@ healthy() {
   ' > "$WS/events"
 }
 run() { rc=0; run_codex "quoted prompt: $(cat "$WS/quoted")" "${1:-SECFINDING}" > "$WS/log" 2>&1 || rc=$?; }
+failed_repository_read() {
+  # PR33 simplify: a compound read printed a sandbox fixture, then rg failed on a missing file.
+  # These fields carry repository output, not a structured failure to start Codex's sandbox.
+  jq -c --arg status "${1:-failed}" 'if .item.type? == "command_execution" then
+    .item.status=$status | .item.exit_code=2 |
+    .item.command="cat quoted-fixture.sh && rg -n workerDone src/inbox.ts test/inbox.test.ts" |
+    .item.aggregated_output += "\nrg: test/inbox.test.ts: No such file or directory (os error 2)"
+    else . end' "$WS/events" > "$WS/probe-events"
+  mv "$WS/probe-events" "$WS/events"
+}
 expect_failure() {
   run "${1:-SECFINDING}"
   [ "$rc" -ne 0 ] || fail "accepted $case_name"
@@ -128,46 +141,77 @@ for status in completed failed; do
 done
 echo "  OK  ordinary nonzero tool outcomes preserve the actual final verdict"
 
+# Reproduce the false global latch with both command statuses and the actual exit code (2).
+# A successful turn and report must survive even when a failed read quotes line-start diagnostics.
+for status in failed completed; do
+  for answer in 'SECFINDING: NONE' 'SECFINDING: RISKY | HIGH | real.ts:7 | actual defect -- NOT APPLIED: needs work'; do
+    healthy "$answer"; failed_repository_read "$status"
+    run
+    [ "$rc" -eq 0 ] && [ "$(cat "$WS/capture")" = "$answer" ] || fail "failed fixture read hid final report"
+    [ "$CODEX_SANDBOX_CONFIRMED" -eq 0 ] || fail "failed fixture read poisoned later phases"
+  done
+done
+echo "  OK  exit-2 repository reads with quoted sandbox fixtures preserve the final report"
+
 healthy 'SECFINDING: NONE'; export STUB_RC=17
+failed_repository_read
 case_name='nonzero CLI with valid final'; expect_failure
 [ "$rc" -eq 17 ] || fail "CLI exit code was hidden"
-for failure in command_incomplete command_no_exit sandbox turn error malformed truncated missing_message mismatched_message; do
+[ "$CODEX_SANDBOX_CONFIRMED" -eq 0 ] || fail "CLI exit plus quoted output became sandbox proof"
+for failure in command_incomplete command_no_exit sandbox_turn sandbox_error turn error item_error file_change \
+               malformed truncated empty_events missing_message mismatched_message; do
   healthy 'SECFINDING: NONE'
+  failed_repository_read
   case "$failure" in
     command_incomplete|command_no_exit)
       jq -c --arg failure "$failure" 'if .item.type? == "command_execution" then
         if $failure == "command_incomplete" then .item.status="in_progress"
         else .item.exit_code=null end else . end' "$WS/events" > "$WS/bad-events";;
-    sandbox)
-      output="$(cat "$WS/quoted")"
-      jq -c --arg output "$output" 'if .item.type? == "command_execution" then
-        .item.status="failed" | .item.exit_code=1 | .item.aggregated_output=$output else . end' \
-        "$WS/events" > "$WS/bad-events";;
+    sandbox_turn|sandbox_error)
+      jq -c --arg failure "$failure" 'if .type == "turn.completed" then
+        if $failure == "sandbox_turn" then
+          {type:"turn.failed", error:{message:"bwrap: setting up uid map: Permission denied"}}
+        else {type:"error", message:"bwrap: setting up uid map: Permission denied"}, . end
+        else . end' "$WS/events" > "$WS/bad-events";;
     turn) printf '{"type":"turn.failed","error":{"message":"failed"}}\n' > "$WS/bad-events";;
     error) printf '{"type":"error","message":"failed"}\n{"type":"turn.completed"}\n' > "$WS/bad-events";;
+    item_error|file_change)
+      jq -c --arg failure "$failure" 'if .type == "turn.completed" then
+        {type:"item.completed", item:(if $failure == "item_error" then
+          {type:"error", message:"failed"} else {type:"file_change", status:"failed"} end)}, .
+        else . end' "$WS/events" > "$WS/bad-events";;
     malformed) printf 'not JSON\n' > "$WS/bad-events";;
     truncated) sed '$d' "$WS/events" > "$WS/bad-events";;
+    empty_events) : > "$WS/bad-events";;
     missing_message) jq -c 'select(.item.type? != "agent_message")' "$WS/events" > "$WS/bad-events";;
     mismatched_message) jq -c 'if .item.type? == "agent_message" then .item.text="different" else . end' \
       "$WS/events" > "$WS/bad-events";;
   esac
   mv "$WS/bad-events" "$WS/events"
   case_name="$failure events despite a valid final"; expect_failure
-  if [ "$failure" = sandbox ]; then
+  if [[ "$failure" == sandbox_* ]]; then
     [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ] || fail "sandbox failure not confirmed"
     calls="$(wc -l < "$WS/paths")"
     run
     [ "$(wc -l < "$WS/paths")" -eq "$calls" ] || fail "confirmed sandbox failure invoked another CLI"
+  else
+    [ "$CODEX_SANDBOX_CONFIRMED" -eq 0 ] || fail "$failure plus quoted output became sandbox proof"
   fi
 done
 healthy 'SECFINDING: NONE'
 printf 'bwrap: setting up uid map: Permission denied\n' > "$WS/stderr"
 case_name='real CLI sandbox diagnostic'; expect_failure
 [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ] || fail "CLI sandbox failure not confirmed"
+healthy 'SECFINDING: NONE'; export STUB_RC=19 STUB_FINAL=missing
+: > "$WS/events"
+printf 'bwrap: setting up uid map: Permission denied\n' > "$WS/stderr"
+case_name='sandbox startup failed before any events or final'; expect_failure
+[ "$rc" -eq 19 ] && [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ] || fail "startup failure was hidden"
 echo "  OK  CLI, command, sandbox and incomplete/failed event streams fail closed"
 
 for final in missing empty whitespace prose template malformed wrong_token contradictory bad_status; do
   healthy 'SECFINDING: NONE'
+  failed_repository_read
   case "$final" in
     missing|empty) export STUB_FINAL="$final";;
     whitespace) printf ' \n\t\n' > "$WS/answer";;
@@ -205,6 +249,28 @@ git -C "$dir" config commit.gpgSign false
 git -C "$dir" config user.name 'Offline Test'
 git -C "$dir" config user.email 'offline@example.invalid'
 git -C "$dir" -c core.hooksPath=/dev/null commit -qm initial --allow-empty
+# Exercise the affected phase sequence without resetting the global latch between invocations.
+healthy 'Simplified a helper and passed the focused checks.'; failed_repository_read
+export STUB_EDIT=1
+before_commit="$(git -C "$dir" rev-parse HEAD)"
+calls="$(wc -l < "$WS/paths")"
+run_fix_phase simplify prompt test display run_codex 1 '' > "$WS/log" 2>&1
+[ "$PHASE_STATUS" = NOT-CONVERGED ] && [ "$PHASE_CHANGED" -eq 1 ] || fail "fixture read made simplify ERROR"
+[ "$(git -C "$dir" rev-parse HEAD)" != "$before_commit" ] || fail "simplify edits were not committed"
+[ -z "$(git -C "$dir" status --porcelain)" ] || fail "simplify left uncommitted edits"
+export STUB_EDIT=0
+write_events 'SECFINDING: NONE'
+run_fix_phase security prompt test display run_codex 2 SECFINDING > "$WS/log" 2>&1
+[ "$PHASE_STATUS" = CLEAN ] || fail "simplify poisoned the security phase"
+write_events 'REVIEWFINDING: NONE'
+review_engine=codex; phase_runner=run_codex; cr_display=offline; codex_review_prompt=offline
+run_review_phase final test > "$WS/log" 2>&1
+[ "$REVIEW_STATUS" = CLEAN ] || fail "simplify poisoned the final review"
+[ "$(wc -l < "$WS/paths")" -eq "$((calls + 3))" ] || fail "simplify/security/final did not all invoke the CLI"
+[ "$CODEX_SANDBOX_CONFIRMED" -eq 0 ] || fail "fixture read latched a sandbox failure"
+echo "  OK  simplify commits its edit and subsequent security/final phases actually run"
+
+RUN_CLAUDE_CAPTURE="$WS/capture"
 healthy 'SECFINDING: NONE'
 run_fix_phase security prompt test display run_codex 2 SECFINDING > "$WS/log" 2>&1
 [ "$PHASE_STATUS" = CLEAN ] && [ "$PHASE_ROUNDS" -eq 1 ] || fail "no-edit quote round failed convergence"
