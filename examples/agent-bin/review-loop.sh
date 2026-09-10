@@ -39,8 +39,8 @@
 #                          If the opposite CLI is unavailable, the phase WARNs and SKIPs — a missing
 #                          cross-check is informational, never a finding about the code. If Codex is
 #                          selected but its sandbox cannot start (see run_codex), the phase reports
-#                          DID-NOT-RUN loudly and its output is discarded rather than parsed into
-#                          findings: a missing second opinion is not a review result.
+#                          ERROR loudly and its output is discarded rather than parsed into
+#                          findings: a failed invocation is not a review result.
 #   3. security fix loop — conditional (see --security), and it AUTO-FIXES. Each round runs a
 #                          security review of the diff vs --base and APPLIES the fixes it is
 #                          confident about (auth / input-validation / secrets / network scope),
@@ -85,7 +85,7 @@
 # the loops do 0 productive rounds and exit 0 fast (idempotent).
 #
 # Usage:
-#   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
+#   review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--pr URL] [--max-rounds N]
 #               [--simplify-rounds N] [--security auto|on|off] [--escalation-attempts N]
 #               [--codex|--no-codex] [--codex-model MODEL]
 #   review-loop --stop-hook [ ...same opts... ]   # loop-safe Claude Code Stop-hook entrypoint
@@ -178,6 +178,7 @@ orig_args=("$@")
 # --- defaults ---------------------------------------------------------------------------------
 dir="$PWD"
 base=""
+review_pr=""      # exact approved PR URL; suppresses branch-based PR discovery
 target="auto"     # default: best-effort derive the MR/PR target branch, else the historical base
 max_rounds=6
 # /simplify gets its OWN, much lower cap. It is a TASTE pass with no fixpoint to find (there is
@@ -229,7 +230,7 @@ usage() {
 review-loop — run review + simplify + codex + security over this branch's changes.
 
 Usage:
-  review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--max-rounds N]
+  review-loop [--dir DIR] [--base REF] [--target REF|auto|none] [--pr URL] [--max-rounds N]
               [--simplify-rounds N] [--security auto|on|off] [--escalation-attempts N]
               [--codex|--no-codex] [--codex-model MODEL] [--force]
   review-loop --stop-hook [ ...same opts... ]
@@ -248,7 +249,13 @@ override for when you knowingly want to exceed FOREMAN_MAX_WORKERS. Without it, 
 as 2 slots against FOREMAN_MAX_WORKERS (shared with spawn-worker) and blocks until 2 slots are free,
 or until FOREMAN_REVIEW_LOOP_WAIT_TIMEOUT seconds elapse (default 3600 → exit 4).
 
-Scope: --base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
+Scope: --pr URL resolves exactly that open GitHub PR or GitLab MR through its forge CLI (or the public github.com API). It
+requires matching returned URL, full base/head commit IDs, and a local HEAD containing the PR
+head. Missing base commits are fetched from that exact repository. Every phase uses the resolved
+diff; branch-based discovery and Claude /review selection are suppressed. Lookup/validation
+failures stop the gate; --pr cannot be combined with --base or a non-auto --target.
+
+--base REF uses REF verbatim as the diff base (wins over --target); REF must resolve to a
 commit or it is a usage error. --target REF diffs from the merge-base with the branch this work
 merges INTO, so the review scope equals the MR/PR even for a branch stacked on another unmerged
 branch; an explicit REF that does not resolve locally (try `git fetch`) or shares no history with
@@ -319,6 +326,7 @@ while [ "$#" -gt 0 ]; do
     --dir)        [ "$#" -ge 2 ] || die_usage "--dir needs DIR"; dir="$2"; shift 2;;
     --base)       [ "$#" -ge 2 ] || die_usage "--base needs REF"; base="$2"; shift 2;;
     --target)     [ "$#" -ge 2 ] || die_usage "--target needs REF|auto|none"; target="$2"; shift 2;;
+    --pr)         [ "$#" -ge 2 ] || die_usage "--pr needs an exact PR URL"; review_pr="$2"; shift 2;;
     --max-rounds) [ "$#" -ge 2 ] || die_usage "--max-rounds needs N"; max_rounds="$2"; shift 2;;
     --simplify-rounds) [ "$#" -ge 2 ] || die_usage "--simplify-rounds needs N"; simplify_rounds="$2"; shift 2;;
     --security)   [ "$#" -ge 2 ] || die_usage "--security needs auto|on|off"; security="$2"; shift 2;;
@@ -402,9 +410,8 @@ escalation_attempts="$((10#$escalation_attempts))"   # same leading-zero normali
 #     * simplify (or the final reconciliation) stopping at its round cap. /simplify is a TASTE pass:
 #       it can essentially always find one more thing to change, so "still changing at round N" is
 #       a fact about the cap, not evidence of a defect in the code.
-#     * codex DID-NOT-RUN (see run_codex): the second opinion is MISSING. That degrades the run and
-#       is called out loudly on the verdict line, but it is not a finding about the code, and
-#       treating it as one is what turned a broken sandbox into a fake RISKY review result.
+#     * legacy codex DID-NOT-RUN statuses remain informational for verdict callers. The runner now
+#       reports actual CLI/sandbox failures as ERROR, never as findings about the reviewed code.
 #
 #   ESCALATION — what a RISKY finding MEANS. A RISKY finding no longer ends the run by itself: the
 #   escalation phase hands it to a fresh, better-resourced agent that must fix it or justify why it
@@ -838,6 +845,64 @@ detect_mr_context() {
   return 0
 }
 
+# Resolve the actual approved PR, never an arbitrary first PR sharing its source branch.
+# Metadata lookup is mandatory and bounded. The forge CLI owns authentication; no token is
+# copied into this script, its argv, or the review prompt. Only full commit IDs reach git.
+resolve_review_pr() {
+  [ -z "$base" ] && [ "$target" = "auto" ] \
+    || die_usage "--pr cannot be combined with --base or an explicit --target"
+  command -v jq >/dev/null 2>&1 || die "--pr requires jq"
+  local host project number raw repo_url pr_base pr_head
+  if [[ "$review_pr" =~ ^https://([A-Za-z0-9.-]+(:[0-9]+)?)/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)$ ]]; then
+    host="${BASH_REMATCH[1]}"; project="${BASH_REMATCH[3]}"; number="${BASH_REMATCH[4]}"
+    if ! raw="$(_tmo 20 gh api --hostname "$host" "repos/$project/pulls/$number" </dev/null 2>/dev/null)"; then
+      # Public github.com repositories need no new login/token. Private/enterprise metadata
+      # still requires the existing forge CLI authentication; never inspect credential files.
+      [ "$host" = "github.com" ] || die "could not read the exact approved GitHub PR"
+      raw="$(_tmo 20 curl --fail --silent --show-error --max-time 18 \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$project/pulls/$number" </dev/null 2>/dev/null)" \
+        || die "could not read the exact approved GitHub PR"
+    fi
+    jq -e --arg url "$review_pr" --argjson number "$number" \
+      '.html_url == $url and .number == $number and .state == "open" and .merged == false' \
+      <<<"$raw" >/dev/null 2>&1 || die "GitHub PR metadata does not match the requested open PR"
+    pr_base="$(jq -er '.base.sha | strings' <<<"$raw")" || die "GitHub PR base is missing"
+    pr_head="$(jq -er '.head.sha | strings' <<<"$raw")" || die "GitHub PR head is missing"
+  elif [[ "$review_pr" =~ ^https://([A-Za-z0-9.-]+(:[0-9]+)?)/([A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+)/-/merge_requests/([1-9][0-9]*)$ ]]; then
+    host="${BASH_REMATCH[1]}"; project="${BASH_REMATCH[3]}"; number="${BASH_REMATCH[5]}"
+    command -v glab >/dev/null 2>&1 || die "--pr requires glab for GitLab MR metadata"
+    local project_id="${project//\//%2F}"
+    raw="$(_tmo 20 glab api --hostname "$host" "projects/$project_id/merge_requests/$number" </dev/null 2>/dev/null)" \
+      || die "could not read the exact approved GitLab MR"
+    jq -e --arg url "$review_pr" --argjson number "$number" \
+      '.web_url == $url and .iid == $number and .state == "opened" and .sha == .diff_refs.head_sha' \
+      <<<"$raw" >/dev/null 2>&1 || die "GitLab MR metadata does not match the requested open MR"
+    pr_base="$(jq -er '.diff_refs.base_sha | strings' <<<"$raw")" || die "GitLab MR base is missing"
+    pr_head="$(jq -er '.diff_refs.head_sha | strings' <<<"$raw")" || die "GitLab MR head is missing"
+  else
+    die_usage "--pr needs an exact HTTPS GitHub /pull/N or GitLab /-/merge_requests/N URL"
+  fi
+  [[ "$pr_base" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ && "$pr_head" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ ]] \
+    || die "approved PR metadata contains invalid commit IDs"
+  git -C "$dir" merge-base --is-ancestor "$pr_head" HEAD >/dev/null 2>&1 \
+    || die "local HEAD does not contain the current approved PR head"
+  repo_url="https://$host/$project.git"
+  if ! git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null; then
+    _tmo 30 git -C "$dir" fetch --no-tags -- "$repo_url" "$pr_base" </dev/null >/dev/null 2>&1 \
+      || die "could not fetch the approved PR base commit"
+    git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null \
+      || die "approved PR base commit is unavailable"
+  fi
+  # Explicit base makes every phase use this diff. An empty PR number deliberately chooses
+  # the scoped report prompt for Claude too, rather than /review's independent PR lookup.
+  base="$pr_base"; target="none"
+  MR_CTX_DONE=1; MR_TARGET_BRANCH=""; MR_PR_NUMBER=""
+  echo "$prog: scoping every review phase to approved PR $review_pr"
+}
+
+if [ -n "$review_pr" ]; then resolve_review_pr; fi
+
 # A resolved ref in its short display form (origin/main, main) — the full refs/ path exists only to
 # keep resolution unambiguous, and reads as noise in a log line.
 _short_ref() { local r="${1#refs/remotes/}"; printf '%s' "${r#refs/heads/}"; }
@@ -1051,9 +1116,9 @@ _tree_digest() {
   } | _hash | awk '{print $1}'
 }
 
-# Shared output tail for the reviewer runners: indent a runner's combined stdout/stderr for the
+# Claude output tail: indent its combined stdout/stderr for the
 # transcript, and — when RUN_CLAUDE_CAPTURE is set to a file path — also append the RAW (pre-indent)
-# output there so a caller can post-parse it (the security/codex phases use this to surface findings).
+# output there so a caller can post-parse it. Codex uses a separate final-message boundary below.
 _indent_tee() {
   if [ -n "${RUN_CLAUDE_CAPTURE:-}" ]; then
     tee -a "$RUN_CLAUDE_CAPTURE" | sed 's/^/    | /'
@@ -1074,27 +1139,59 @@ run_claude() {
   return "${PIPESTATUS[0]}"
 }
 
-# Lines that mean codex NEVER GOT TO REVIEW — its sandbox failed to start — as opposed to codex
-# reviewing and reporting something. Deliberately NARROW, because this loop reviews THIS FILE: the
-# first alternative is anchored to line start (bubblewrap writes its errors there, while a reviewer
-# quoting the comment below emits them behind a '#', a '+' or an indent), and the second is a full
-# sentence codex itself prints only when it is about to use bubblewrap. Both were verified against
-# real captures of a failing and a working run.
-CODEX_SANDBOX_RE="^bwrap:|Codex.s Linux sandbox uses bubblewrap"
-# Two flags, deliberately: an OBSERVATION and a DECISION.
-#   HIT       — run_codex saw one of those lines. On its own this is only a hint: a healthy codex
-#               reviewing THIS file could quote them.
-#   CONFIRMED — run_fix_phase combined the hit with "and the round changed no files" (the report
-#               pass uses its mandatory missing REVIEWFINDING marker), i.e. Codex demonstrably
-#               did NOT work. Only then does run_codex stop spending calls. Keeping the decision out
-#               of run_codex is what stops one suspicious line from poisoning later Codex rounds.
-CODEX_SANDBOX_HIT=0
+# Scan only CLI diagnostics and FAILED command events, never prompts or successful command output.
+CODEX_SANDBOX_RE="^bwrap:|^warning: Codex.s Linux sandbox uses bubblewrap"
 CODEX_SANDBOX_CONFIRMED=0
-CODEX_SCAN=""          # run_codex's private scan copy; listed in the EXIT trap so it cannot leak
+CODEX_RUN_DIR=""       # private per-invocation files, also cleaned by the EXIT trap
+
+# Validate and extract the terminal finding block from the actual final assistant message.
+# The prompts require these lines LAST. Prose/quoted examples earlier in the report are diagnostic
+# context, not findings. A missing, malformed or contradictory block fails closed. Simplify has no
+# finding contract, but must still provide a nonempty final answer.
+codex_final_report() { # $1=last-message file, $2=contract (token[:report|apply], or empty for simplify)
+  local final="$1" contract="$2"
+  [ -f "$final" ] && [ -s "$final" ] && grep -Iq . "$final" \
+    && grep -q '[^[:space:]]' "$final" || return 1
+  if [ -z "$contract" ]; then cat "$final"; return; fi
+  awk -v contract="$contract" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    BEGIN {
+      split(contract, c, ":"); token=c[1]; mode=c[2]
+      required=(token == "SECFINDING" || token == "CODEXFINDING") ? 4 : 3
+    }
+    {
+      line=trim($0)
+      if (line == "") next
+      if (index(line, token ":") != 1) { count=0; next }
+      lines[++count]=line
+    }
+    END {
+      if (!count) exit 1
+      for (i=1; i<=count; i++) {
+        line=lines[i]; sub("^" token ":[[:space:]]*", "", line)
+        n=split(line, fields, "|")
+        for (j=1; j<=n; j++) fields[j]=trim(fields[j])
+        status=toupper(fields[1])
+        if (status == "NONE") {
+          if (n != 1 || count != 1 || token == "ESCFINDING" || mode == "apply") exit 1
+          continue
+        }
+        if (n < required || index(line, "<file:line-or-area>")) exit 1
+        for (j=1; j<=required; j++) if (fields[j] == "") exit 1
+        if (token == "ESCFINDING" && status !~ /^(FIXED|DISMISSED|DECISION|UNRESOLVED)$/) exit 1
+        if (mode == "apply" && status !~ /^(APPLIED|RISKY|DISMISSED)$/) exit 1
+        if ((token == "SECFINDING" || token == "CODEXFINDING") && status !~ /^(APPLIED|RISKY)$/) exit 1
+        if (mode == "report" && fields[1] ~ /[<>]/) exit 1
+      }
+      for (i=1; i<=count; i++) print lines[i]
+    }
+  ' "$final"
+}
 
 # Codex counterpart of run_claude: run one `codex exec` pass in DIR with the given full prompt,
-# stream its output indented, and return codex's exit code. Same RUN_CLAUDE_CAPTURE contract so
-# callers can post-parse findings. `</dev/null` is MANDATORY — without it codex blocks forever on
+# stream diagnostics indented, and return nonzero for CLI, startup or final-report failures. Only
+# the validated final report is appended to RUN_CLAUDE_CAPTURE for callers to parse.
+# `</dev/null` is MANDATORY — without it codex blocks forever on
 # "Reading additional input from stdin...". -m pins the model. run_fix_phase (not codex) does the
 # git commit, so editing prompts tell codex not to.
 #
@@ -1120,37 +1217,71 @@ CODEX_SCAN=""          # run_codex's private scan copy; listed in the EXIT trap 
 #   and put workspace-write back the moment bubblewrap starts.
 # shellcheck disable=SC2329  # invoked indirectly via run_fix_phase's $runner ("run_codex")
 run_codex() {
-  local prompt="$1" rc=0 scan="" effort="${codex_effort:-xhigh}"
-  # Once the phase has CONFIRMED the sandbox cannot start there is no reason to pay for another codex
-  # call: every round would fail identically. Refuse fast, non-zero, with no output. (A mere HIT is
-  # not enough — see the two-flag note above.)
+  local prompt="$1" contract="${2:-}" rc=0 effort="${codex_effort:-xhigh}" run_dir
+  local -a statuses
   if [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ]; then
     echo "    | codex: not invoked — the sandbox failure is confirmed for this run (see above)"
     return 1
   fi
-  # Private scan copy of the round's output. The sandbox errors are interleaved into the same stream
-  # we indent for the transcript, and the pipeline runs in a SUBSHELL — a flag set inside it would be
-  # lost — so tee the raw bytes out and grep them here, in the function body, where the assignment
-  # sticks. If mktemp fails we simply cannot detect the failure; the review still runs (`cat`).
-  scan="$(mktemp "${TMPDIR:-/tmp}/review-loop-codexscan.XXXXXX" 2>/dev/null)" || scan=""
-  CODEX_SCAN="$scan"
+  command -v jq >/dev/null 2>&1 || { echo "    codex: jq is required to validate CLI events"; return 1; }
+  run_dir="$(mktemp -d "${TMPDIR:-/tmp}/review-loop-codexrun.XXXXXX")" \
+    || { echo "    codex: could not create private output files"; return 1; }
+  CODEX_RUN_DIR="$run_dir"
+  # Installed `codex exec --help` (0.153.4): --json emits events on stdout; -o writes the last
+  # agent message. Keep stderr separate from JSON and BOTH out of RUN_CLAUDE_CAPTURE. Unique paths
+  # for every invocation prevent a missing final message from reusing the previous round’s answer.
   ( cd "$dir" && codex exec --skip-git-repo-check -s danger-full-access -m "$codex_model" \
-      -c model_reasoning_effort="$effort" "$prompt" </dev/null ) 2>&1 \
-    | { if [ -n "$scan" ]; then tee -a "$scan"; else cat; fi; } \
-    | _indent_tee
-  rc="${PIPESTATUS[0]}"
-  if [ -n "$scan" ]; then
-    if grep -aqE "$CODEX_SANDBOX_RE" "$scan" 2>/dev/null; then
-      CODEX_SANDBOX_HIT=1
-      # Loud, and phrased as what it is: a missing second opinion, not a review result. codex exits
-      # 0 in this state (the model completes, it is only its shell that never started), so the exit
-      # code alone would never have told anyone.
-      echo "    ** codex: SANDBOX/STARTUP FAILURE detected — codex could not run repository commands,"
-      echo "    ** so it reviewed NOTHING this round. See the bubblewrap note above run_codex()."
-    fi
-    rm -f "$scan" 2>/dev/null || true
+      -c model_reasoning_effort="$effort" --json --output-last-message "$run_dir/final" \
+      "$prompt" </dev/null ) 2>"$run_dir/stderr" \
+    | tee "$run_dir/events" | sed 's/^/    | /'
+  statuses=("${PIPESTATUS[@]}")
+  rc="${statuses[0]}"
+  if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ]; then
+    [ "$rc" -ne 0 ] || rc=1
   fi
-  CODEX_SCAN=""
+  # Preserve the complete local diagnostic transcript; findings only enter the capture below.
+  sed 's/^/    | /' "$run_dir/stderr" || { [ "$rc" -ne 0 ] || rc=1; }
+  if grep -aqE "$CODEX_SANDBOX_RE" "$run_dir/stderr" || \
+     jq -se --arg re "$CODEX_SANDBOX_RE" '
+       any(.[]; .type == "item.completed" and .item.type == "command_execution" and
+         (.item.status == "failed" or (.item.exit_code != null and .item.exit_code != 0)) and
+         ((.item.aggregated_output // "") | split("\n") | any(.[]; test($re))))
+     ' "$run_dir/events" >/dev/null 2>&1; then
+    CODEX_SANDBOX_CONFIRMED=1
+    echo "    codex: SANDBOX/STARTUP FAILURE — repository commands could not run"
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  # The JSON event contract is also used by src/codex-session.ts. Successful completion and a
+  # final answer are BOTH required. A completed shell command may intentionally return nonzero
+  # (rg with no matches, a red regression test before its fix). Those outcomes are evidence for
+  # the reviewer, not a failed agent turn. Require terminal tool records but leave repository
+  # findings to the final report; required tests still have their independent CI gate.
+  if ! jq -se --rawfile final "$run_dir/final" '
+    length > 0 and all(.[]; type == "object" and (.type | type == "string")) and
+    .[-1].type == "turn.completed" and
+    ([.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] |
+      last | type == "string" and (sub("[\\r\\n]+$"; "") == ($final | sub("[\\r\\n]+$"; "")))) and
+    all(.[]; .type != "error" and .type != "turn.failed" and
+      (if .type == "item.completed" then
+         .item.type != "error" and
+         (if .item.type == "command_execution" then
+            (.item.status == "completed" or .item.status == "failed") and
+            (.item.exit_code | type == "number" and floor == .)
+          else .item.status != "failed" end)
+       else true end))
+  ' "$run_dir/events" >/dev/null 2>&1; then
+    echo "    codex: failed turn or incomplete/malformed CLI events"
+    [ "$rc" -ne 0 ] || rc=1
+  fi
+  if ! codex_final_report "$run_dir/final" "$contract" > "$run_dir/report"; then
+    echo "    codex: missing, empty or malformed final assistant report"
+    [ "$rc" -ne 0 ] || rc=1
+  elif [ "$rc" -eq 0 ] && [ -n "${RUN_CLAUDE_CAPTURE:-}" ]; then
+    # Append only validated final reports, preserving findings from each successful round.
+    cat "$run_dir/report" >> "$RUN_CLAUDE_CAPTURE" && printf '\n' >> "$RUN_CLAUDE_CAPTURE" || rc=1
+  fi
+  rm -rf "$run_dir"
+  CODEX_RUN_DIR=""
   return "$rc"
 }
 
@@ -1164,35 +1295,19 @@ run_codex() {
 # is passed EXPLICITLY rather than via a mutable global so a phase can never leak its runner into the
 # next. $cap overrides the round cap (default --max-rounds) for a phase that is deliberately bounded
 # tighter — the review apply pass passes 1, since there is nothing to converge towards there.
+# $7 is the Codex final-report contract; Claude ignores this extra runner argument.
 # Sets globals: PHASE_STATUS (CLEAN|NOT-CONVERGED|ERROR), PHASE_ROUNDS, PHASE_CHANGED (0|1).
 run_fix_phase() {
   local label="$1" slash="$2" commit_prefix="$3" display="${4:-$2}" runner="${5:-run_claude}" cap="${6:-$max_rounds}"
   PHASE_STATUS="CLEAN"; PHASE_ROUNDS=0; PHASE_CHANGED=0
-  local round before after rc
+  local round before after rc contract="${7:-}"
   for ((round = 1; round <= cap; round++)); do
     PHASE_ROUNDS="$round"
     before="$(_tree_digest)"
     echo ">>> $label: round $round/$cap — $runner \"$display\""
     rc=0
-    "$runner" "$slash" || rc=$?
+    "$runner" "$slash" "$contract" || rc=$?
     after="$(_tree_digest)"
-
-    # The second half of Codex's two-signal did-not-run check lives here so EVERY codex-driven
-    # editing phase reuses it. Signal 1 is run_codex's narrow sandbox/startup HIT. Signal 2 is the
-    # structural fact this round changed no files. A hit plus a real edit can only be quoted text;
-    # clear it. A hit plus no edit confirms Codex executed nothing (it can still exit 0), so stop
-    # later Codex calls and make this primary phase ERROR. The independent cross-check maps the same
-    # confirmation to informational DID-NOT-RUN in run_crosscheck_phase below.
-    if [ "$runner" = "run_codex" ] && [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
-      if [ "$before" != "$after" ]; then
-        echo "    codex: sandbox-error text seen, but the round edited files — codex DID run; treating it as quoted text" >&2
-        CODEX_SANDBOX_HIT=0
-      else
-        CODEX_SANDBOX_CONFIRMED=1
-        rc=1
-        echo "    codex: DID NOT RUN (sandbox failure + no file changes)" >&2
-      fi
-    fi
 
     if [ "$before" = "$after" ]; then
       # No measurable progress this round.
@@ -1335,7 +1450,7 @@ run_review_phase() {
     : > "$CR_CAP"
     RUN_CLAUDE_CAPTURE="$CR_CAP"
     if [ "$review_engine" = "codex" ]; then
-      run_codex "$codex_review_prompt" || rc=$?
+      run_codex "$codex_review_prompt" REVIEWFINDING:report || rc=$?
     else
       run_claude "$cr_cmd" || rc=$?
     fi
@@ -1349,23 +1464,10 @@ run_review_phase() {
     # so does a model that ignored the output contract. Treating that as "no findings" would report
     # CLEAN having read nothing — the exact silent pass this phase exists to prevent.
     if grep -aqiE 'REVIEWFINDING:' "$CR_CAP" 2>/dev/null; then
-      # A valid mandatory marker is positive evidence that this read-only Codex report really ran.
-      # If it also quoted the documented sandbox text, discard that lone HIT before a later
-      # no-edit phase can accidentally combine it into a false did-not-run confirmation.
-      if [ "$review_engine" = "codex" ] && [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
-        echo "    codex: sandbox-error text seen, but the report emitted REVIEWFINDING — codex DID run; treating it as quoted text" >&2
-        CODEX_SANDBOX_HIT=0
-      fi
       break
     fi
     report_try=$((report_try + 1))
     if [ "$report_try" -ge 2 ]; then
-      # For Codex review, the missing output-contract marker is the second signal that the
-      # sandbox/startup HIT meant real did-not-run rather than quoted text. This report pass is
-      # intentionally read-only, so a tree digest cannot provide the editing phases' second signal.
-      if [ "$review_engine" = "codex" ] && [ "$CODEX_SANDBOX_HIT" -eq 1 ]; then
-        CODEX_SANDBOX_CONFIRMED=1
-      fi
       echo "    $label: report pass emitted no REVIEWFINDING line — nothing was reviewed (soft error)"
       REVIEW_STATUS="ERROR"; rm -f "$CR_CAP" 2>/dev/null || true; CR_CAP=""; return 0
     fi
@@ -1390,7 +1492,7 @@ run_review_phase() {
   REVIEW_PASSES=2
   RUN_CLAUDE_CAPTURE="$CR_CAP"
   run_fix_phase "$label (apply)" "$(build_review_apply_prompt "$report")" "$commit_prefix" \
-                "apply the confident fixes from the review report" "$phase_runner" 1
+                "apply the confident fixes from the review report" "$phase_runner" 1 REVIEWFINDING:apply
   RUN_CLAUDE_CAPTURE=""
   REVIEW_CHANGED="$PHASE_CHANGED"
 
@@ -1530,7 +1632,7 @@ run_security_phase() {
   : > "$SEC_CAP"
   RUN_CLAUDE_CAPTURE="$SEC_CAP"
   run_fix_phase "security-review" "$(build_security_prompt)" "chore(security): auto-fix" \
-                "/security-review + apply confident in-scope fixes" "$phase_runner"
+                "/security-review + apply confident in-scope fixes" "$phase_runner" "$max_rounds" SECFINDING
   RUN_CLAUDE_CAPTURE=""
   SEC_ROUNDS="$PHASE_ROUNDS"; SEC_CHANGED="$PHASE_CHANGED"
 
@@ -1653,7 +1755,7 @@ run_crosscheck_phase() {
   local check_label="$crosscheck_engine-review" check_commit="chore(review): $crosscheck_engine auto-fix"
   local check_display="$crosscheck_engine review + apply confident fixes"
   run_fix_phase "$check_label" "$CODEX_PROMPT" "$check_commit" \
-                "$check_display" "$crosscheck_runner"
+                "$check_display" "$crosscheck_runner" "$max_rounds" CODEXFINDING
   RUN_CLAUDE_CAPTURE=""
   CODEX_ROUNDS="$PHASE_ROUNDS"; CODEX_CHANGED="$PHASE_CHANGED"
 
@@ -1663,10 +1765,9 @@ run_crosscheck_phase() {
   # review result is what hid the breakage for three consecutive runs. So: drop the capture (nothing
   # in it is a review), and mark codex INACTIVE so the joint reconciliation below degrades to the
   # primary-only path rather than alternating with a reviewer that cannot start.
-  # run_fix_phase owns the one two-signal confirmation. A missing CROSS-CHECK is informational — it
-  # must never become WHY — while a primary Codex phase that cannot run is a real gate ERROR.
+  # An unavailable optional CLI may be skipped at preflight; a failed invocation is a gate ERROR.
   if [ "$crosscheck_engine" = "codex" ] && [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ]; then
-    CODEX_STATUS="DID-NOT-RUN"
+    CODEX_STATUS="ERROR"
     CODEX_REASON="sandbox failed to start — codex could not run repository commands; NO second opinion this run"
     CODEX_ACTIVE=0
     CODEX_FINDINGS=""
@@ -1823,7 +1924,7 @@ escalation_recheck() {
     RUN_CLAUDE_CAPTURE="$CODEX_CAP"
     run_fix_phase "$crosscheck_engine-review (post-escalation)" "$CODEX_PROMPT" \
                   "chore(review): post-escalation $crosscheck_engine" \
-                  "$crosscheck_engine recheck of the escalation fix" "$crosscheck_runner"
+                  "$crosscheck_engine recheck of the escalation fix" "$crosscheck_runner" "$max_rounds" CODEXFINDING
     RUN_CLAUDE_CAPTURE=""
     [ "$PHASE_STATUS" = "ERROR" ] && CODEX_STATUS="ERROR"
     [ "$PHASE_CHANGED" -eq 1 ] && CODEX_CHANGED=1
@@ -1882,7 +1983,7 @@ run_escalation_phase() {
     # for its digest/commit machinery, exactly as the review apply pass does.
     run_fix_phase "escalation" "$(build_escalation_prompt "$new")" "chore(review): escalation fix" \
                   "fix the RISKY findings, or justify concretely why they cannot be fixed" \
-                  "${phase_runner:-run_claude}" 1
+                  "${phase_runner:-run_claude}" 1 ESCFINDING
     RUN_CLAUDE_CAPTURE=""
     changed="$PHASE_CHANGED"
     [ "$PHASE_STATUS" = "ERROR" ] && err=1
@@ -1965,7 +2066,7 @@ ESC_STATUS="SKIPPED"; ESC_REASON=""; ESC_ATTEMPTS=0; ESC_CHANGED=0; ESC_FINDINGS
 # top) and $review_loop_marker (our admission-budget marker, see the admission gate): this trap
 # REPLACES both the early snapshot-cleanup trap and the gate's marker-cleanup trap, so it must carry
 # BOTH — otherwise a marker/snapshot would leak past this point.
-trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "$ESC_CAP" "${CODEX_SCAN:-}" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" "${review_loop_marker:-}" 2>/dev/null || true' EXIT
+trap 'rm -f "$SEC_CAP" "$CODEX_CAP" "$CR_CAP" "$ESC_CAP" "${REVIEW_LOOP_SNAPSHOT_FILE:-}" "${review_loop_marker:-}" 2>/dev/null || true; [ -z "${CODEX_RUN_DIR:-}" ] || rm -rf "$CODEX_RUN_DIR"' EXIT
 
 # Accumulates the review findings across the initial phase AND any reconcile / post-security
 # pass, so a finding raised late still reaches the summary.
@@ -2028,7 +2129,7 @@ if [ "$SEC_CHANGED" -eq 1 ] || [ "$CODEX_CHANGED" -eq 1 ] || [ "$SI_CHANGED" -eq
       RUN_CLAUDE_CAPTURE="$CODEX_CAP"
       run_fix_phase "$crosscheck_engine-review (reconcile)" "$CODEX_PROMPT" \
                     "chore(review): reconcile $crosscheck_engine" \
-                    "$crosscheck_engine recheck" "$crosscheck_runner"
+                    "$crosscheck_engine recheck" "$crosscheck_runner" "$max_rounds" CODEXFINDING
       RUN_CLAUDE_CAPTURE=""
       FCC_RAN=1; [ "$PHASE_CHANGED" -eq 1 ] && FCC_CHANGED=1
       x_changed="$PHASE_CHANGED"; _recon_note "$PHASE_STATUS"

@@ -57,7 +57,10 @@ never while you and the human are still shaping the change. The lifecycle:
 So: **fast human↔foreman iteration first; review is the final gate right before merge.** It is
 *not* a per-worker definition-of-done — workers open a draft and stop (see `spawn-worker`). Don't
 kick off review-loops on a change the human hasn't approved yet; that's the slow path this policy
-exists to kill.
+exists to kill. A bound Mattermost agent with a resident-verified task grant is the exception:
+after actual content approval, that agent runs the required final gate and merges only the
+approved PR through the scoped `thread-control approval-*` workflow. Detached workers remain
+draft-only.
 
 ## Durable memory (notes are a git repo)
 
