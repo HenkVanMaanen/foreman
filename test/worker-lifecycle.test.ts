@@ -53,8 +53,8 @@ function fixture() {
   fixtures.push(f);
   return f;
 }
-async function until(check: () => boolean) {
-  for (let i = 0; i < 200; i++) {
+async function until(check: () => boolean, attempts = 200) {
+  for (let i = 0; i < attempts; i++) {
     if (check()) return;
     await Bun.sleep(10);
   }
@@ -107,6 +107,112 @@ test("TERM forwards to the stub and finalizes an interrupted result", async () =
   expect(read(f, "term-worker.log")).toContain("WORKER_EXIT=143");
   expect(JSON.parse(read(f, "term.result.json")).summary).toContain("interrupted by TERM");
   expect(() => process.kill(Number(read(f, "child")), 0)).toThrow();
+});
+
+test.each([
+  "default",
+  "signal-ignoring",
+])("foreground SIGINT stops the %s engine within the deadline", async (engine) => {
+  const f = fixture();
+  f.shim(
+    "claude",
+    `${engine === "signal-ignoring" ? "trap '' INT TERM; " : ""}echo $$ > "$FOREMAN_STATE_DIR/child"; exec sleep 30`,
+  );
+  const runner = Bun.spawn(
+    ["/usr/bin/bash", join(scripts, "spawn-worker.sh"), "int", join(f.dir, "brief")],
+    {
+      cwd: f.dir,
+      env: { ...f.env, FOREMAN_WORKER_LAUNCH: "foreground" },
+      stdout: "ignore",
+      stderr: "ignore",
+    },
+  );
+  let child = 0;
+  try {
+    await until(() => existsSync(join(f.state, "child")) && existsSync(join(f.state, "int.child")));
+    child = Number(read(f, "child"));
+    process.kill(runner.pid, "SIGINT");
+    await until(() => existsSync(join(f.state, "int.done")), 300);
+    expect(await runner.exited).toBe(130);
+    expect(read(f, "int-worker.log")).toContain("WORKER_EXIT=130");
+    expect(JSON.parse(read(f, "int.result.json")).summary).toContain("interrupted by INT");
+    expect(() => process.kill(child, 0)).toThrow();
+  } finally {
+    // Bound cleanup even against the regression, whose interrupt handler never returns.
+    for (const target of [child, runner.pid]) {
+      if (target > 0) {
+        try {
+          process.kill(target, "SIGKILL");
+        } catch {}
+      }
+    }
+    await runner.exited;
+  }
+});
+
+test.each([
+  "foreground",
+  "nohup",
+  "setsid",
+])("TERM waits for resistant descendants before DONE in %s mode", async (mode) => {
+  const f = fixture();
+  f.shim(
+    "claude",
+    `trap 'exit 0' TERM
+bash -c '
+  trap "" TERM
+  sleep 30 &
+  echo "$!" > "$FOREMAN_STATE_DIR/grandchild"
+  echo "$BASHPID" > "$FOREMAN_STATE_DIR/descendant"
+  wait
+' &
+echo "$$" > "$FOREMAN_STATE_DIR/engine"
+wait`,
+  );
+  const launcher = Bun.spawn(
+    ["/usr/bin/bash", join(scripts, "spawn-worker.sh"), "tree", join(f.dir, "brief")],
+    {
+      cwd: f.dir,
+      env: { ...f.env, FOREMAN_WORKER_LAUNCH: mode, FOREMAN_MAX_WORKERS: "1" },
+      stdout: "ignore",
+      stderr: "ignore",
+    },
+  );
+  const running = (target: number) => {
+    const r = Bun.spawnSync(["/usr/bin/ps", "-p", String(target), "-o", "stat="]);
+    const stat = r.stdout.toString().trim();
+    return stat !== "" && !/^[ZX]/.test(stat);
+  };
+  const owned: number[] = [];
+  try {
+    await until(() =>
+      ["engine", "descendant", "grandchild", "tree.child"].every((file) =>
+        existsSync(join(f.state, file)),
+      ),
+    );
+    owned.push(
+      pid(f, "tree"),
+      ...["engine", "descendant", "grandchild"].map((file) => Number(read(f, file))),
+    );
+    expect(f.run("worker-stop", ["tree"]).code).toBe(0);
+    await until(() => !running(owned[1] as number));
+    expect(existsSync(join(f.state, "tree.done"))).toBe(false);
+    expect(f.launch("still-capped", { FOREMAN_MAX_WORKERS: "1" }).code).toBe(3);
+    await until(() => existsSync(join(f.state, "tree.done")), 300);
+    for (const target of owned.slice(1)) expect(running(target)).toBe(false);
+    expect(read(f, "tree-worker.log")).toContain("WORKER_EXIT=143");
+    expect(JSON.parse(read(f, "tree.result.json")).summary).toContain("interrupted by TERM");
+    f.shim("claude", "exit 0");
+    expect(f.launch("next", { FOREMAN_MAX_WORKERS: "1" }).code).toBe(0);
+    await until(() => existsSync(join(f.state, "next.done")));
+  } finally {
+    for (const target of [...owned, launcher.pid]) {
+      try {
+        process.kill(target, "SIGKILL");
+      } catch {}
+    }
+    await launcher.exited;
+  }
 });
 
 test("SIGKILL loses the wrapper, frees capacity, and wakes without a done marker", async () => {

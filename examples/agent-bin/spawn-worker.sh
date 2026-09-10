@@ -282,9 +282,42 @@ EOF
   cat <<'EOF'
 child=""
 interrupted=""
+child_group_running() {
+  local processes pgid stat
+  kill -0 -- "-$child" 2>/dev/null || return 1
+  processes="$(ps -eo pgid=,stat=)" || return 0
+  while read -r pgid stat; do
+    # Orphaned zombies may await the host's reaper, but can no longer do work.
+    if [ "$pgid" = "$child" ]; then
+      case "$stat" in Z*|X*) ;; *) return 0;; esac
+    fi
+  done <<< "$processes"
+  return 1
+}
+stop_child_group() {
+  [ -n "$child" ] || return 0
+  local signal attempt
+  for signal in "${interrupted:-TERM}" KILL; do
+    kill -s "$signal" -- "-$child" 2>/dev/null || true
+    for ((attempt=0; attempt<20; attempt++)); do
+      if ! child_group_running; then
+        wait "$child" 2>/dev/null || true
+        return 0
+      fi
+      sleep 0.05
+    done
+  done
+  # Do not publish completion or free capacity if even KILL cannot stop the group.
+  printf '%s unknown\n' "$child" > "$state/$name.child.tmp.$$" && \
+    mv "$state/$name.child.tmp.$$" "$state/$name.child"
+  echo "spawn-worker: child process group did not stop; completion unverified" >> "$log"
+  return 1
+}
 finish() {
   local code="$1" summary
   trap - EXIT
+  trap '' TERM INT HUP
+  stop_child_group || return 1
   summary="exited $code, no result.json"
   if [ -n "$interrupted" ]; then
     summary="interrupted by $interrupted; verify partial work"
@@ -304,10 +337,6 @@ finish() {
 interrupt() {
   interrupted="$1"
   trap '' TERM INT HUP
-  if [ -n "$child" ]; then
-    kill -s "$1" "$child" 2>/dev/null || true
-    wait "$child" 2>/dev/null || true
-  fi
   exit "$2"
 }
 trap 'finish $?' EXIT
@@ -329,8 +358,12 @@ printf '%s %s %s\n' "$(date +%s)" "$$" "$identity" > "$state/$name.launch.tmp.$$
   mv "$state/$name.launch.tmp.$$" "$state/$name.launch" || exit 1
 EOF
   cat <<EOF
-$run_cmd &
+# Job control gives the engine an owned process group and preserves foreground SIGINT.
+# Restore the historical background stdin; codex's explicit brief redirect overrides it.
+set -m
+</dev/null $run_cmd &
 child=\$!
+set +m
 if child_identity="\$(worker_identity "\$child")"; then :
 elif [ "\$?" -eq 2 ]; then child_identity=unknown
 else child_identity=exited
