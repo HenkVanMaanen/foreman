@@ -1,25 +1,6 @@
 #!/usr/bin/env bash
-# Unit + end-to-end test for spawn-worker.sh's ENGINE SELECTION and its CODEX DID-NOT-RUN detection —
-# no real agent, no network, no token spend. The two pure units (`worker_run_cmd`, `codex_did_not_run`
-# plus the regex it reads) are extracted VERBATIM from the shipped script, so the test cannot drift
-# from the code it claims to cover; the end-to-end legs drive the real spawn-worker against PATH-shim
-# `claude`/`codex` binaries in a throwaway FOREMAN_STATE_DIR.
-#
-# What it pins down:
-#   engine dispatch  - FOREMAN_WORKER_ENGINE picks the command line, and `claude` is the DEFAULT, so
-#                      an unset variable reproduces today's behaviour exactly. The codex line passes
-#                      the brief on STDIN (`- < brief`), never as an argv string — briefs are long
-#                      and full of quotes and newlines — and always carries `-s danger-full-access`,
-#                      without which bubblewrap cannot start in this container. An unknown engine is
-#                      rejected before anything is spawned.
-#   did-not-run      - a bubblewrap startup failure is detected even though `codex exec` exits 0 and
-#                      the model still reports the work as done, and is surfaced as a FAILURE
-#                      (WORKER_EXIT=86, result.json status "blocked") rather than a silent success;
-#                      while the SAME error text merely QUOTED by a worker that really ran (and so
-#                      wrote its own result.json) must NOT trigger it.
-#   shared contract  - both engines produce the same log path, the same WORKER_EXIT marker, the same
-#                      `<name>.done` marker, the same `<name>.result.json` (worker-written or the
-#                      synthesised needs-verify stub) and the same workers.jsonl exit line.
+# Engine dispatch and completion contract against harmless CLI shims in temporary state.
+# Sandbox prose is only a hint: omitted result.json cannot prove that no commands ran.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,11 +27,9 @@ ok "worker-status.sh parses"
 extract_fn()   { awk -v pat="$1" '$0 ~ pat {f=1} f{print} f&&/^}$/{exit}' "$SCRIPT"; }
 extract_line() { grep -m1 -E "$1" "$SCRIPT"; }
 eval "$(extract_line '^CODEX_SANDBOX_RE=')"
-eval "$(extract_line '^CODEX_DID_NOT_RUN_EXIT=')"
 eval "$(extract_fn '^worker_run_cmd[(][)]')"
-eval "$(extract_fn '^codex_did_not_run[(][)]')"
+eval "$(extract_fn '^codex_sandbox_hint[(][)]')"
 [ -n "${CODEX_SANDBOX_RE:-}" ] || fail "could not extract CODEX_SANDBOX_RE"
-[ "${CODEX_DID_NOT_RUN_EXIT:-}" = 86 ] || fail "CODEX_DID_NOT_RUN_EXIT changed; update this test"
 
 # --- 1. engine dispatch -------------------------------------------------------------------------
 unset FOREMAN_CODEX_MODEL
@@ -81,7 +60,7 @@ rc=0; worker_run_cmd gemini /BRIEF /LOG /LAST >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 2 ] || fail "unknown engine should return 2, got $rc"
 ok "unknown engine is rejected"
 
-# --- 2. did-not-run detection -------------------------------------------------------------------
+# --- 2. sandbox diagnostics -------------------------------------------------------------------
 # A REAL captured bubblewrap failure: codex warns, every command dies, the model answers anyway, and
 # codex exits 0. Reproduced on this box with `codex exec -s workspace-write` on 2026-08-24.
 broken="$WS/broken.log"
@@ -101,22 +80,22 @@ exec /usr/bin/bash -lc 'git diff' in /repo
 EOF
 res="$WS/w.result.json"; rm -f "$res"
 
-codex_did_not_run "$broken" "$res" || fail "a real bwrap failure was NOT detected"
-ok "bubblewrap startup failure detected despite codex exiting 0"
+codex_sandbox_hint "$broken" "$res" || fail "a sandbox hint was NOT detected"
+ok "sandbox prose is detected as a hint despite codex exiting 0"
 
 printf '{"status":"done"}\n' > "$res"
-! codex_did_not_run "$broken" "$res" \
+! codex_sandbox_hint "$broken" "$res" \
   || fail "detection fired even though the worker wrote its own result.json"
 rm -f "$res"
 ok "a worker that wrote result.json is never called did-not-run (it demonstrably ran)"
 
-! codex_did_not_run "$quoted" "$res" \
+! codex_sandbox_hint "$quoted" "$res" \
   || fail "quoted sandbox text false-triggered the detection (regex is not line-anchored enough)"
 ok "the same error text quoted mid-line does not false-trigger"
 
 : > "$WS/clean.log"
-! codex_did_not_run "$WS/clean.log" "$res" || fail "a clean log triggered the detection"
-! codex_did_not_run "$WS/nope.log" "$res"  || fail "a missing log triggered the detection"
+! codex_sandbox_hint "$WS/clean.log" "$res" || fail "a clean log triggered the detection"
+! codex_sandbox_hint "$WS/nope.log" "$res"  || fail "a missing log triggered the detection"
 ok "a clean or missing log never triggers the detection"
 
 # --- 3. end-to-end, both engines ------------------------------------------------------------------
@@ -134,7 +113,10 @@ EOF
 chmod +x "$WS/bin/claude"
 export PATH="$WS/bin:$PATH"
 
-run_worker() { ( cd "$HERE" && bash "$SCRIPT" --force "$@" >/dev/null ); }
+run_worker() {
+  ( cd "$WS" && env -i PATH="$WS/bin:/usr/bin:/bin" FOREMAN_STATE_DIR="$FOREMAN_STATE_DIR" \
+      FOREMAN_WORKER_ENGINE="${FOREMAN_WORKER_ENGINE:-claude}" bash "$SCRIPT" --force "$@" >/dev/null )
+}
 await() { # the wrapper is detached; wait for its done-marker
   local n="$1" i=0
   while [ ! -e "$FOREMAN_STATE_DIR/$n.done" ]; do
@@ -164,7 +146,7 @@ grep -q '^CLAUDE_BRIEF_HEAD=do the thing$' "$FOREMAN_STATE_DIR/e2eclaude-worker.
 assert_contract e2eclaude 0 needs-verify
 ok "engine=claude: brief as one argv arg, WORKER_EXIT/done/result.json/registry all as before"
 
-# codex shim #1 — the sandbox never starts: consume the brief, replay the failure, exit 0.
+# codex shim #1 — replay sandbox prose and exit 0 without a result. This remains unverified.
 cat > "$WS/bin/codex" <<EOF
 #!/usr/bin/env bash
 cat > "$WS/codex-stdin.txt"
@@ -178,10 +160,10 @@ head -n1 "$WS/codex-stdin.txt" | grep -q '^do the thing$' \
   || fail "codex engine did not deliver the brief on stdin"
 grep -q 'Definition of done' "$WS/codex-stdin.txt" \
   || fail "codex engine did not deliver the definition-of-done footer"
-assert_contract e2ebroken "$CODEX_DID_NOT_RUN_EXIT" blocked
-grep -q 'CODEX DID NOT RUN' "$FOREMAN_STATE_DIR/e2ebroken-worker.log" \
-  || fail "the did-not-run failure was not explained in the log"
-ok "engine=codex: a did-not-run is reported as exit $CODEX_DID_NOT_RUN_EXIT + status blocked, not a silent done"
+assert_contract e2ebroken 0 needs-verify
+grep -q 'execution unverified' "$FOREMAN_STATE_DIR/e2ebroken.result.json" \
+  || fail "sandbox evidence must remain unverified"
+ok "engine=codex: sandbox prose without a result requires verification and preserves the real exit"
 
 # codex shim #2 — really ran (writes its own result.json) but its OUTPUT quotes the sandbox errors.
 cat > "$WS/bin/codex" <<EOF
@@ -210,4 +192,4 @@ if [ -e "$FOREMAN_STATE_DIR/e2ebad.done" ]; then
 fi
 ok "an unknown FOREMAN_WORKER_ENGINE is refused before spawning"
 
-echo "PASS: spawn-worker engine selection + codex did-not-run detection"
+echo "PASS: spawn-worker engine selection + conservative sandbox diagnostics"
