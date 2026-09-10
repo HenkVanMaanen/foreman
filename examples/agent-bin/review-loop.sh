@@ -1155,7 +1155,10 @@ codex_final_report() { # $1=last-message file, $2=contract (token[:report|apply]
   if [ -z "$contract" ]; then cat "$final"; return; fi
   awk -v contract="$contract" '
     function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
-    BEGIN { split(contract, c, ":"); token=c[1]; mode=c[2] }
+    BEGIN {
+      split(contract, c, ":"); token=c[1]; mode=c[2]
+      required=(token == "SECFINDING" || token == "CODEXFINDING") ? 4 : 3
+    }
     {
       line=trim($0)
       if (line == "") next
@@ -1173,7 +1176,6 @@ codex_final_report() { # $1=last-message file, $2=contract (token[:report|apply]
           if (n != 1 || count != 1 || token == "ESCFINDING" || mode == "apply") exit 1
           continue
         }
-        required=(token == "SECFINDING" || token == "CODEXFINDING") ? 4 : 3
         if (n < required || index(line, "<file:line-or-area>")) exit 1
         for (j=1; j<=required; j++) if (fields[j] == "") exit 1
         if (token == "ESCFINDING" && status !~ /^(FIXED|DISMISSED|DECISION|UNRESOLVED)$/) exit 1

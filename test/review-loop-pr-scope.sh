@@ -35,20 +35,15 @@ printf 'RESULT:%s|%s|%s|%s|%s\\n' "$base" "$target" "$MR_CTX_DONE" "$MR_TARGET_B
     forge='''#!/usr/bin/env python3
 import json,os,sys
 from pathlib import Path
-with open(os.environ['TEST_CALLS'],'a') as f:f.write(json.dumps([Path(sys.argv[0]).name,*sys.argv[1:]])+'\\n')
-if os.environ.get('TEST_API_ERROR'):sys.exit(1)
+name=Path(sys.argv[0]).name
+with open(os.environ['TEST_CALLS'],'a') as f:f.write(json.dumps([name,*sys.argv[1:]])+'\\n')
+if name=='curl':
+    if not os.environ.get('TEST_PUBLIC'):sys.exit(1)
+elif os.environ.get('TEST_API_ERROR'):sys.exit(1)
 print(Path(os.environ['TEST_API']).read_text())
 '''
-    for name in ['gh','glab']:
+    for name in ['gh','glab','curl']:
         p=bindir/name;p.write_text(forge);p.chmod(0o700)
-    p=bindir/'curl'
-    p.write_text('''#!/usr/bin/env python3
-import json,os,sys
-from pathlib import Path
-with open(os.environ['TEST_CALLS'],'a') as f:f.write(json.dumps(['curl',*sys.argv[1:]])+'\\n')
-if not os.environ.get('TEST_PUBLIC'):sys.exit(1)
-print(Path(os.environ['TEST_API']).read_text())
-''');p.chmod(0o700)
     p=bindir/'git'
     p.write_text('''#!/usr/bin/env python3
 import json,os,sys
