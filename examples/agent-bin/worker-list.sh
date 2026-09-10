@@ -3,16 +3,17 @@
 #
 # Render a one-line-per-worker table of every worker ever launched via `spawn-worker`, read from the
 # append-only registry `$STATE/workers.jsonl` (where $STATE is ${FOREMAN_STATE_DIR:-state}). For each
-# distinct worker name it shows the recorded pid, start time, live state (RUNNING until the wrapper
-# touches `<name>.done`, else the recorded exit code), and the `status` field from
+# distinct worker name it shows the recorded pid, start time, verified lifecycle state, and the
+# `status` field from
 # `<name>.result.json` when the worker (or the spawn-worker fallback) has written one.
 #
-# The registry has TWO line kinds per worker: a launch line `{name,pid,log,brief,started_at}` and an
-# exit line `{name,ended_at,exit}`. This tool merges them by name. jq is used when present; a
+# The registry records launch intent, a launch `{name,pid,log,brief,started_at}`, and an exit
+# `{name,ended_at,exit}`. This tool merges them by name. jq is used when present; a
 # grep/sed fallback keeps it working without jq.
 #
 # Usage: worker-list           # no args
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worker-state.sh"
 
 state="${FOREMAN_STATE_DIR:-state}"
 registry="$state/workers.jsonl"
@@ -27,23 +28,16 @@ command -v jq >/dev/null 2>&1 && have_jq=1
 
 # Distinct worker names, in first-seen order preserved by awk (sort would lose launch order).
 if [ "$have_jq" -eq 1 ]; then
-  names="$(jq -r '.name // empty' "$registry" 2>/dev/null | awk '!seen[$0]++')"
+  names="$(jq -Rr 'fromjson? | .name // empty' "$registry" 2>/dev/null | awk '!seen[$0]++')"
 else
   names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$registry" 2>/dev/null \
-           | sed -E 's/.*"([^"]*)"$/\1/' | awk '!seen[$0]++')"
+           | sed -E 's/.*"([^"]*)"$/\1/' | awk '!seen[$0]++' || true)"
 fi
 
 # Pull the LAST value of a JSON field from the registry lines belonging to one worker. jq path selects
 # by exact name; the fallback greps the lines carrying `"name":"<name>"` (closing quote = exact match)
 # then sed-extracts the field (handles both "key":"str" and "key":num).
-field_for() { # $1=name  $2=field
-  if [ "$have_jq" -eq 1 ]; then
-    jq -r --arg n "$1" --arg f "$2" 'select(.name==$n) | .[$f] // empty' "$registry" 2>/dev/null | tail -n1
-  else
-    grep -F "\"name\":\"$1\"" "$registry" 2>/dev/null \
-      | sed -nE "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"?([^\",}]*)\"?.*/\1/p" | tail -n1
-  fi
-}
+field_for() { worker_field "$state" "$1" "$2"; }
 
 result_status() { # $1=name
   local rf="$state/$1.result.json"
@@ -59,14 +53,13 @@ result_status() { # $1=name
 
 printf '%-20s %-8s %-20s %-12s %s\n' "NAME" "PID" "STARTED" "STATE" "STATUS"
 while IFS= read -r name; do
-  [ -n "$name" ] || continue
+  [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
   pid="$(field_for "$name" pid)";        [ -n "$pid" ] || pid="?"
   started="$(field_for "$name" started_at)"; [ -n "$started" ] || started="?"
-  if [ -e "$state/$name.done" ]; then
+  st="$(worker_state "$state" "$name")"
+  if [ "$st" = DONE ]; then
     exitc="$(field_for "$name" exit)"
     if [ -n "$exitc" ]; then st="exit $exitc"; else st="done"; fi
-  else
-    st="RUNNING"
   fi
   printf '%-20s %-8s %-20s %-12s %s\n' "$name" "$pid" "$started" "$st" "$(result_status "$name")"
 done <<EOF

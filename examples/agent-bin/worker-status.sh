@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # worker-status — REFERENCE implementation for foreman to adopt into bin/ and refine.
 #
-# Read-only status for a worker launched with `spawn-worker <name>`: reports done-vs-running
-# (a "WORKER_EXIT=" marker in the log means the worker finished, and shows its exit code) and
+# Read-only status for a worker launched with `spawn-worker <name>`: verifies runner liveness and
 # tails the last ~15 lines of its log so you can see where it is without re-reading everything.
 #
 # Usage: worker-status <name>
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worker-state.sh"
 
 name="${1:?usage: worker-status <name>}"
 # Same charset guard as spawn-worker so the name can't escape the log path.
@@ -21,7 +21,7 @@ result="$state/$name.result.json"
 # Structured result first: the worker writes `<name>.result.json` as its last act, and the
 # spawn-worker wrapper synthesises a minimal one if the worker forgot — so once the worker is DONE
 # this file exists and is the authoritative status. Show its parsed fields (jq), or the raw file if
-# jq is unavailable, BEFORE falling through to the WORKER_EXIT/RUNNING log signal and the tail.
+# jq is unavailable. The separate lifecycle check below determines whether execution finished.
 if [ -f "$result" ]; then
   echo "worker '$name': result.json"
   if command -v jq >/dev/null 2>&1; then
@@ -32,17 +32,21 @@ if [ -f "$result" ]; then
   fi
 fi
 
-[ -f "$log" ] || { echo "worker-status: no log for '$name' at $log" >&2; exit 1; }
+lifecycle="$(worker_state "$state" "$name")"
+case "$lifecycle" in
+  DONE)
+    code="$(worker_field "$state" "$name" exit)"
+    echo "worker '$name': DONE (${code:-unknown} exit code)";;
+  RUNNING) echo "worker '$name': RUNNING (runner identity verified)";;
+  STARTING) echo "worker '$name': STARTING (awaiting runner acknowledgement)";;
+  ORPHANED) echo "worker '$name': ORPHANED (runner missing, recorded engine child still live; needs attention)";;
+  LOST) echo "worker '$name': LOST (recorded runner absent or replaced; completion unconfirmed)";;
+  *) echo "worker '$name': UNKNOWN (no verified live runner or completion; inspect launch evidence)";;
+esac
 
-# WORKER_EXIT= is appended by spawn-worker only after `claude -p` returns, so its presence is the
-# done signal; grab the last one and report its code. This stays as the fallback when result.json is
-# absent (worker still running, or launched by an older spawn-worker).
-exit_line="$(grep -E '^WORKER_EXIT=' "$log" | tail -n1 || true)"
-if [ -n "$exit_line" ]; then
-  echo "worker '$name': DONE (${exit_line#WORKER_EXIT=} exit code)"
+if [ -f "$log" ]; then
+  echo "--- last 15 lines of $log ---"
+  tail -n 15 "$log"
 else
-  echo "worker '$name': RUNNING (no WORKER_EXIT marker yet)"
+  echo "worker-status: no log for '$name' at $log" >&2
 fi
-
-echo "--- last 15 lines of $log ---"
-tail -n 15 "$log"

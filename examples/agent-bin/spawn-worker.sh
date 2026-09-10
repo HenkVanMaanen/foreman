@@ -25,6 +25,7 @@
 # `--force`, so `worker-status` and the supervisor's done-marker poll do not know or care which
 # engine ran. Prints the wrapper pid and the log path; poll it with `worker-status <name>`.
 set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worker-state.sh"
 
 # Definition-of-done footer appended to EVERY worker brief. Policy: a worker produces a REVIEWABLE
 # DRAFT fast and stops for the human — it does NOT run the heavy multi-round review loop. That
@@ -77,7 +78,8 @@ fi
 [ -f "$brief" ] || { echo "spawn-worker: brief file '$brief' not found" >&2; exit 2; }
 
 state="${FOREMAN_STATE_DIR:-state}"
-mkdir -p "$state" 2>/dev/null || true
+mkdir -p "$state"
+state="$(cd "$state" && pwd)"
 log="$state/$name-worker.log"
 registry="$state/workers.jsonl"
 done_file="$state/$name.done"
@@ -86,9 +88,7 @@ result_file="$state/$name.result.json"
 # back out of the transcript log. Written for the codex engine only (claude -p already prints its
 # final message as the tail of the log).
 last_msg_file="$state/$name-worker.last-message.txt"
-# The generated launch wrapper (see below). Kept on disk rather than passed as a `bash -c` string:
-# the wrapper now carries the codex did-not-run check, and a multi-line script is the readable,
-# testable way to express that.
+# The generated runner stays on disk as launch evidence.
 runner_file="$state/$name-worker.run.sh"
 
 # --- worker engine ------------------------------------------------------------------------------
@@ -122,7 +122,7 @@ esac
 #     codex exec --skip-git-repo-check -s workspace-write "run 'git log --oneline -1'"
 #   and put workspace-write back the moment bubblewrap starts.
 # `--color never`: the log is read by humans (`worker-status` tails it) and grepped by the
-# did-not-run check below; ANSI escapes help neither. codex emits them even when stdout is a file.
+# sandbox hint below; ANSI escapes help neither. codex emits them even when stdout is a file.
 worker_run_cmd() {
   local eng="$1" qb="$2" ql="$3" qlast="$4"
   local model="${FOREMAN_CODEX_MODEL:-gpt-6-astra}" marg=""
@@ -141,34 +141,33 @@ worker_run_cmd() {
   esac
 }
 
-# Lines that mean codex NEVER GOT TO WORK — its sandbox failed to start — as opposed to codex
-# working and reporting something. Kept verbatim in sync with review-loop.sh's copy, and narrow for
-# the same reason: the first alternative is anchored to line start (bubblewrap writes its errors
-# there, while a worker quoting them emits them behind a '#', a '+', a quote or an indent), and the
-# second is a full sentence codex itself prints only when it is about to use bubblewrap.
+# Sandbox prose can be emitted by a successful command reading these very docs. A missing
+# result is a contract omission, not evidence that no command ran. Keep this as a diagnostic
+# hint only; never replace the engine exit code or claim that the worker executed nothing.
 CODEX_SANDBOX_RE="^bwrap:|Codex.s Linux sandbox uses bubblewrap"
-
-# Did this codex worker fail to run AT ALL? Two independent signals, both required — an OBSERVATION
-# and a CONFIRMATION — exactly as review-loop.sh learned to do it:
-#   HIT      the log matches CODEX_SANDBOX_RE. On its own this is only a hint: a worker whose JOB is
-#            to read or edit the sandbox notes in this very repo will quote those strings.
-#   CONFIRM  the worker did not write its own <name>.result.json. Writing it needs a tool call, so a
-#            worker whose sandbox never started CANNOT have produced one. This is our OWN contract,
-#            not a codex UI string, which is why it is the confirmation rather than the prettier
-#            "no `succeeded in` line in the transcript" (that marker is unversioned CLI chrome, and
-#            if its wording changed we would start reporting healthy workers as broken).
-# Both true ⇒ codex ran, did nothing, and — the nasty part, reproduced on this box — exited 0 with
-# the model cheerfully claiming success. That must surface as a FAILURE, never as a silent `done`.
-codex_did_not_run() {
+codex_sandbox_hint() {
   local lg="$1" res="$2"
-  [ -f "$lg" ] || return 1
-  grep -aqE "$CODEX_SANDBOX_RE" "$lg" 2>/dev/null || return 1
-  [ -f "$res" ] && return 1
-  return 0
+  [ ! -f "$res" ] && [ -f "$lg" ] && grep -aqE "$CODEX_SANDBOX_RE" "$lg" 2>/dev/null
 }
-# Exit code stamped on a confirmed did-not-run. Distinct from anything the engines return
-# themselves (codex exits 0 in this state), so `WORKER_EXIT=86` is unambiguous in the log.
-CODEX_DID_NOT_RUN_EXIT=86
+
+# Names are durable run identifiers. Reusing one could let an old .done/result (or late exit)
+# complete the new run. Refuse without deleting or overwriting any previous evidence.
+for artifact in "$log" "$done_file" "$result_file" "$runner_file" "$last_msg_file" "$state/$name.launch" "$state/$name.child"; do
+  [ ! -e "$artifact" ] || { echo "spawn-worker: '$name' already has run artifacts; use a new name" >&2; exit 2; }
+done
+[ -z "$(worker_field "$state" "$name" name)" ] || {
+  echo "spawn-worker: '$name' is already registered; use a new name" >&2; exit 2;
+}
+
+# Separate sessions survive caller process-group cleanup, but not cgroup cleanup. Foreground
+# mode lets a service manager own the entire lifetime. Explicit nohup preserves the old mode.
+launch="${FOREMAN_WORKER_LAUNCH:-auto}"
+case "$launch" in
+  auto) if command -v setsid >/dev/null 2>&1; then launch=setsid; else launch=nohup; fi;;
+  setsid) command -v setsid >/dev/null 2>&1 || { echo "spawn-worker: setsid unavailable" >&2; exit 2; };;
+  nohup|foreground) ;;
+  *) echo "spawn-worker: unknown FOREMAN_WORKER_LAUNCH '$launch' (auto|setsid|nohup|foreground)" >&2; exit 2;;
+esac
 
 # Count LIVE review-loop pid markers under $1, deleting any whose pid is dead (stale). A review-loop
 # registers an empty file named for its pid under review-loops/ while it runs; "live" = the pid still
@@ -197,8 +196,8 @@ _review_loop_load() {
 # agents), so it counts as 2 slots against the SAME FOREMAN_MAX_WORKERS budget. Cap the combined LOAD
 # at FOREMAN_MAX_WORKERS (default 2), where:
 #   LOAD = (active workers) + 2*(active review-loops).
-#   active workers      = a name that appears as a launch entry in workers.jsonl whose `<name>.done`
-#                         marker does NOT yet exist (the wrapper touches it when `claude -p` returns).
+#   active workers      = running, starting, orphaned, or unverified launches. A lost wrapper
+#                         frees a slot only when its recorded engine child is also gone.
 #   active review-loops = LIVE pid markers under $state/review-loops (dead-pid markers are cleaned).
 # `--force` bypasses the whole check.
 max_workers="${FOREMAN_MAX_WORKERS:-2}"
@@ -209,14 +208,14 @@ if [ "$force" -ne 1 ]; then
     # Distinct worker names ever launched. Prefer jq; fall back to a grep/sed extraction of the first
     # "name":"…" on each line (launch and exit entries both carry it — de-duped by sort -u).
     if command -v jq >/dev/null 2>&1; then
-      names="$(jq -r '.name // empty' "$registry" 2>/dev/null | sort -u)"
+      names="$(jq -Rr 'fromjson? | .name // empty' "$registry" | sort -u)"
     else
       names="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' "$registry" 2>/dev/null \
-               | sed -E 's/.*"([^"]*)"$/\1/' | sort -u)"
+               | sed -E 's/.*"([^"]*)"$/\1/' | sort -u || true)"
     fi
     while IFS= read -r n; do
       [ -n "$n" ] || continue
-      [ -e "$state/$n.done" ] || active_workers=$((active_workers + 1))
+      if worker_slot_active "$state" "$n"; then active_workers=$((active_workers + 1)); fi
     done <<EOF
 $names
 EOF
@@ -233,8 +232,15 @@ EOF
   fi
 fi
 
+# Atomically reserve this run name before composing any artifacts. Concurrent same-name
+# callers cannot overwrite each other's runner or consume each other's completion.
+if ! (set -o noclobber; printf '%s pending\n' "$(date +%s)" > "$state/$name.launch") 2>/dev/null; then
+  echo "spawn-worker: '$name' was already reserved; use a new name" >&2
+  exit 2
+fi
+
 # Compose the brief the worker actually receives: the caller's brief followed by the standard
-# definition-of-done footer (which wires in the auto-review loop). Written to a file so multi-line
+# definition-of-done footer. Written to a file so multi-line
 # text / apostrophes stay safe — the launch still passes it via $(cat …), exactly as before, so
 # the existing safe-quoting is preserved.
 full_brief="$state/$name-brief.composed.txt"
@@ -247,7 +253,6 @@ brief_body="$(cat -- "$brief")"
 # Pre-quote the paths the detached wrapper interpolates; %q makes each a single shell-safe token.
 qbrief="$(printf '%q' "$full_brief")"
 qlog="$(printf '%q' "$log")"
-qdone="$(printf '%q' "$done_file")"
 qresult="$(printf '%q' "$result_file")"
 qreg="$(printf '%q' "$registry")"
 qlast="$(printf '%q' "$last_msg_file")"
@@ -255,71 +260,113 @@ qlast="$(printf '%q' "$last_msg_file")"
 run_cmd="$(worker_run_cmd "$engine" "$qbrief" "$qlog" "$qlast")" \
   || { echo "spawn-worker: no launch command for engine '$engine'" >&2; exit 2; }
 
-# The detached wrapper, generated per worker. Structure, and the ORDER, are the done-marker contract
-# and are IDENTICAL for both engines: after the engine returns it (1) appends the WORKER_EXIT marker
-# to the log, (2) touches `<name>.done` (the single-stat done signal the supervisor polls),
-# (3) appends an exit line to the registry, and (4) synthesises a minimal result.json if the worker
-# forgot to write one, so `<name>.result.json` always exists once `.done` does. `$name` is
-# charset-guarded (A-Za-z0-9_-), so inlining it into the JSON below is safe.
-#
-# Between the engine and (1) sits the codex did-not-run check — before the WORKER_EXIT line, because
-# it OVERRIDES the exit code codex reported (0) with one that says what actually happened.
-# Written with an UNQUOTED heredoc: `$q*` and `$run_cmd` are expanded HERE (they are already
-# %q-quoted single tokens), while `\$code` and friends stay literal for the wrapper to evaluate at
-# run time. Deliberately no `set -e`: the whole point is to survive the engine's non-zero exit and
-# record it. codex_did_not_run is emitted from THIS file with `declare -f`, so the wrapper's copy
-# can never drift from the one the test exercises.
+json_string() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"; printf '"%s"' "$s"; }
+
+# The runner owns registration and finalization. Its acknowledgement records the ACTUAL runner
+# PID (setsid may fork), and its EXIT trap publishes result + registry BEFORE the wake marker.
+# Paths/cwd are pinned so a prepared runner does not silently operate in a recovery caller's cwd.
 {
   cat <<EOF
 #!/usr/bin/env bash
-# Generated by spawn-worker for worker '$name' (engine=$engine). Safe to delete once it is done.
 engine=$(printf '%q' "$engine")
+name=$(printf '%q' "$name")
+state=$(printf '%q' "$state")
+log=$qlog
+result=$qresult
+registry=$qreg
+brief=$(printf '%q' "$brief")
+launch=$(printf '%q' "$launch")
 CODEX_SANDBOX_RE=$(printf '%q' "$CODEX_SANDBOX_RE")
 EOF
-  declare -f codex_did_not_run
-  cat <<EOF
-$run_cmd
-code=\$?
-blocked=0
-if [ "\$engine" = codex ] && codex_did_not_run $qlog $qresult; then
-  blocked=1; code=$CODEX_DID_NOT_RUN_EXIT
-  {
-    echo
-    echo "spawn-worker: ** CODEX DID NOT RUN — its sandbox failed to start, so this worker executed"
-    echo "spawn-worker: ** NOTHING. codex exits 0 in that state and the model can still report the"
-    echo "spawn-worker: ** work as done, so the exit code alone would have lied. Reported as exit"
-    echo "spawn-worker: ** $CODEX_DID_NOT_RUN_EXIT. See the bubblewrap note above worker_run_cmd() in spawn-worker."
-  } >> $qlog
-fi
-echo "WORKER_EXIT=\$code" >> $qlog
-touch $qdone
-printf '{"name":"$name","engine":"$engine","ended_at":"%s","exit":%s}\n' \\
-       "\$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)" "\$code" >> $qreg
-if [ ! -f $qresult ]; then
-  if [ "\$blocked" = 1 ]; then
-    printf '{"status":"blocked","branch":"","mr_url":"","summary":"codex did not run: its sandbox failed to start, so the worker executed nothing","follow_ups":[]}\n' > $qresult
-  else
-    printf '{"status":"needs-verify","summary":"exited %s, no result.json"}\n' "\$code" > $qresult
+  declare -f worker_identity codex_sandbox_hint json_string
+  cat <<'EOF'
+child=""
+interrupted=""
+finish() {
+  local code="$1" summary
+  trap - EXIT
+  summary="exited $code, no result.json"
+  if [ -n "$interrupted" ]; then
+    summary="interrupted by $interrupted; verify partial work"
+  elif [ "$engine" = codex ] && codex_sandbox_hint "$log" "$result"; then
+    summary="exited $code, no result.json; sandbox text observed, execution unverified"
+    echo "spawn-worker: sandbox text observed; quoted output and a real failure cannot be distinguished without further evidence" >> "$log"
   fi
+  if [ ! -f "$result" ]; then
+    printf '{"status":"needs-verify","branch":"","mr_url":"","summary":"%s","follow_ups":[]}\n' "$summary" \
+      > "$result.tmp.$$" && mv "$result.tmp.$$" "$result" || return 1
+  fi
+  printf 'WORKER_EXIT=%s\n' "$code" >> "$log" || return 1
+  printf '{"name":"%s","engine":"%s","ended_at":"%s","exit":%s}\n' \
+    "$name" "$engine" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" >> "$registry" || return 1
+  touch "$state/$name.done"
+}
+interrupt() {
+  interrupted="$1"
+  trap '' TERM INT HUP
+  if [ -n "$child" ]; then
+    kill -s "$1" "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  fi
+  exit "$2"
+}
+trap 'finish $?' EXIT
+trap 'interrupt TERM 143' TERM
+trap 'interrupt INT 130' INT
+trap 'interrupt HUP 129' HUP
+export FOREMAN_STATE_DIR="$state"
+EOF
+  cat <<EOF
+cd $(printf '%q' "$PWD") || exit 1
+EOF
+  cat <<'EOF'
+identity="$(worker_identity "$$")" || exit 1
+started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Retain the historical launch fields together, with safely encoded paths.
+printf '{"name":"%s","pid":%s,"log":%s,"brief":%s,"engine":"%s","launcher":"%s","started_at":"%s"}\n' \
+  "$name" "$$" "$(json_string "$log")" "$(json_string "$brief")" "$engine" "$launch" "$started_at" >> "$registry" || exit 1
+printf '%s %s %s\n' "$(date +%s)" "$$" "$identity" > "$state/$name.launch.tmp.$$" && \
+  mv "$state/$name.launch.tmp.$$" "$state/$name.launch" || exit 1
+EOF
+  cat <<EOF
+$run_cmd &
+child=\$!
+if child_identity="\$(worker_identity "\$child")"; then :
+elif [ "\$?" -eq 2 ]; then child_identity=unknown
+else child_identity=exited
 fi
+printf '%s %s\n' "\$child" "\$child_identity" > "\$state/\$name.child.tmp.\$\$" && \
+  mv "\$state/\$name.child.tmp.\$\$" "\$state/\$name.child"
+wait "\$child"
+exit \$?
 EOF
 } > "$runner_file"
 
-# Detach so the worker outlives this turn.
-env -u MATTERMOST_BOT_TOKEN -u TELEGRAM_BOT_TOKEN -u FOREMAN_ROUTER_TOKEN -u FOREMAN_ROUTER_SOCKET nohup bash "$runner_file" >/dev/null 2>&1 &
-pid=$!
+# Durable intent exists even if the child never reaches its first instruction. A stale pending
+# launch is UNKNOWN (needs attention), never proof that it is running or safe to relaunch.
+# Preserve launch path fields in the registry, also in environments without jq.
 
-# Registry launch line (append-only). started_at is ISO-8601 UTC, or epoch seconds if `date -u` with
-# that format is unavailable. Prefer jq to encode the paths safely; fall back to printf.
-started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)"
-if command -v jq >/dev/null 2>&1; then
-  jq -cn --arg name "$name" --argjson pid "$pid" --arg log "$log" --arg brief "$brief" \
-        --arg started_at "$started_at" \
-    '{name:$name,pid:$pid,log:$log,brief:$brief,started_at:$started_at}' >> "$registry" 2>/dev/null || true
+printf '{"name":"%s","log":%s,"brief":%s,"requested_at":"%s"}\n' \
+  "$name" "$(json_string "$log")" "$(json_string "$brief")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$registry"
+
+clean_env=(env -u MATTERMOST_BOT_TOKEN -u TELEGRAM_BOT_TOKEN -u FOREMAN_ROUTER_TOKEN -u FOREMAN_ROUTER_SOCKET)
+if [ "$launch" = foreground ]; then
+  exec "${clean_env[@]}" bash "$runner_file" >> "$log" 2>&1
+elif [ "$launch" = setsid ]; then
+  "${clean_env[@]}" nohup setsid bash "$runner_file" </dev/null >> "$log" 2>&1 &
 else
-  printf '{"name":"%s","pid":%s,"log":"%s","brief":"%s","started_at":"%s"}\n' \
-    "$name" "$pid" "$log" "$brief" "$started_at" >> "$registry" 2>/dev/null || true
+  "${clean_env[@]}" nohup bash "$runner_file" </dev/null >> "$log" 2>&1 &
 fi
 
-echo "spawned worker '$name' (pid $pid)"
-echo "log: $log"
+# Bounded acknowledgement: don't report a successful spawn solely because $! was allocated.
+for ((attempt=0; attempt<50; attempt++)); do
+  read -r requested pid identity < "$state/$name.launch" || true
+  if [[ "${pid:-}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "spawned worker '$name' (pid $pid; $launch)"
+    echo "log: $log"
+    exit 0
+  fi
+  sleep 0.1
+done
+echo "spawn-worker: '$name' did not acknowledge startup; inspect $log and worker-status (it may start later)" >&2
+exit 1
