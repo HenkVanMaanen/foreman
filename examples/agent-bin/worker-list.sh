@@ -34,11 +34,6 @@ else
            | sed -E 's/.*"([^"]*)"$/\1/' | awk '!seen[$0]++' || true)"
 fi
 
-# Pull the LAST value of a JSON field from the registry lines belonging to one worker. jq path selects
-# by exact name; the fallback greps the lines carrying `"name":"<name>"` (closing quote = exact match)
-# then sed-extracts the field (handles both "key":"str" and "key":num).
-field_for() { worker_field "$state" "$1" "$2"; }
-
 result_status() { # $1=name
   local rf="$state/$1.result.json"
   [ -f "$rf" ] || { printf '%s' "-"; return; }
@@ -54,11 +49,11 @@ result_status() { # $1=name
 printf '%-20s %-8s %-20s %-12s %s\n' "NAME" "PID" "STARTED" "STATE" "STATUS"
 while IFS= read -r name; do
   [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
-  pid="$(field_for "$name" pid)";        [ -n "$pid" ] || pid="?"
-  started="$(field_for "$name" started_at)"; [ -n "$started" ] || started="?"
+  pid="$(worker_field "$state" "$name" pid)";        [ -n "$pid" ] || pid="?"
+  started="$(worker_field "$state" "$name" started_at)"; [ -n "$started" ] || started="?"
   st="$(worker_state "$state" "$name")"
   if [ "$st" = DONE ]; then
-    exitc="$(field_for "$name" exit)"
+    exitc="$(worker_field "$state" "$name" exit)"
     if [ -n "$exitc" ]; then st="exit $exitc"; else st="done"; fi
   fi
   printf '%-20s %-8s %-20s %-12s %s\n' "$name" "$pid" "$started" "$st" "$(result_status "$name")"
