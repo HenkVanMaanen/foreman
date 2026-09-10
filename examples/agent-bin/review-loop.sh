@@ -891,9 +891,9 @@ resolve_review_pr() {
   if ! git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null; then
     _tmo 30 git -C "$dir" fetch --no-tags -- "$repo_url" "$pr_base" </dev/null >/dev/null 2>&1 \
       || die "could not fetch the approved PR base commit"
+    git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null \
+      || die "approved PR base commit is unavailable"
   fi
-  git -C "$dir" cat-file -e "$pr_base^{commit}" 2>/dev/null \
-    || die "approved PR base commit is unavailable"
   # Explicit base makes every phase use this diff. An empty PR number deliberately chooses
   # the scoped report prompt for Claude too, rather than /review's independent PR lookup.
   base="$pr_base"; target="none"
