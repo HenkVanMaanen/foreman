@@ -64,6 +64,11 @@ const read = (f: ReturnType<typeof fixture>, file: string) =>
   readFileSync(join(f.state, file), "utf8");
 const pid = (f: ReturnType<typeof fixture>, name: string) =>
   Number(read(f, `${name}.launch`).split(" ")[1]);
+const running = (target: number) => {
+  const r = Bun.spawnSync(["/usr/bin/ps", "-p", String(target), "-o", "stat="]);
+  const stat = r.stdout.toString().trim();
+  return stat !== "" && !/^[ZX]/.test(stat);
+};
 afterEach(async () => {
   for (const f of fixtures.splice(0)) {
     // Stop only verified wrapper identities in our own disposable state; never search host PIDs.
@@ -178,11 +183,6 @@ wait`,
       stderr: "ignore",
     },
   );
-  const running = (target: number) => {
-    const r = Bun.spawnSync(["/usr/bin/ps", "-p", String(target), "-o", "stat="]);
-    const stat = r.stdout.toString().trim();
-    return stat !== "" && !/^[ZX]/.test(stat);
-  };
   const owned: number[] = [];
   try {
     await until(() =>
@@ -255,11 +255,6 @@ echo "$!" > "$FOREMAN_STATE_DIR/descendant"
 echo "$$" > "$FOREMAN_STATE_DIR/engine"
 wait`,
   );
-  const running = (target: number) => {
-    const r = Bun.spawnSync(["/usr/bin/ps", "-p", String(target), "-o", "stat="]);
-    const stat = r.stdout.toString().trim();
-    return stat !== "" && !/^[ZX]/.test(stat);
-  };
   const owned: number[] = [];
   try {
     expect(f.launch("orphan-tree", { FOREMAN_MAX_WORKERS: "1" }).code).toBe(0);
