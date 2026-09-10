@@ -121,14 +121,16 @@ test("inclusive 5% threshold, one combined alert, no repeats at zero or after re
   expect(f.entries()).toHaveLength(0);
   const windows = [...sample(), { ...sample(4)[0], slot: "secondary" as const, durationMins: 300 }];
   await f.poll(m, windows);
-  expect(f.entries()).toHaveLength(1);
-  expect(f.entries()[0]?.item.text).toContain("weekly: 5% left");
-  expect(f.entries()[0]?.item.text).toContain("5h: 4% left");
-  expect(f.entries()[0]?.item.text).toContain("UTC");
+  const entries = f.entries();
+  expect(entries).toHaveLength(1);
+  expect(entries[0]?.item.text).toContain("weekly: 5% left");
+  expect(entries[0]?.item.text).toContain("5h: 4% left");
+  expect(entries[0]?.item.text).toContain("UTC");
   await f.poll(m, sample(0));
   await f.poll(f.monitor(), sample(0));
-  expect(f.entries()).toHaveLength(1);
-  expect(f.entries()[0]?.item.sendOnce).toBe(true);
+  const restartedEntries = f.entries();
+  expect(restartedEntries).toHaveLength(1);
+  expect(restartedEntries[0]?.item.sendOnce).toBe(true);
 });
 
 test("recovery and forward reset rearm; backwards or missing reset metadata do not", async () => {
@@ -143,8 +145,9 @@ test("recovery and forward reset rearm; backwards or missing reset metadata do n
   await f.poll(m, sample(3, reset));
   await f.poll(m, sample(3, null));
   await f.poll(m, sample(3, reset + 86400));
-  expect(f.entries()).toHaveLength(3);
-  expect(new Set(f.entries().map((entry) => entry.file)).size).toBe(3);
+  const entries = f.entries();
+  expect(entries).toHaveLength(3);
+  expect(new Set(entries.map((entry) => entry.file)).size).toBe(3);
 });
 
 test("duration metadata changes preserve suppression and recovery across restarts", async () => {
@@ -186,8 +189,9 @@ test("duration identities remain independent after slot swaps and missing metada
   ]);
   expect(f.entries()).toHaveLength(1);
   await f.poll(f.monitor(), [short, weekly]);
-  expect(f.entries()).toHaveLength(2);
-  expect(f.entries().filter((entry) => entry.item.text.includes("5h:"))).toHaveLength(1);
+  const entries = f.entries();
+  expect(entries).toHaveLength(2);
+  expect(entries.filter((entry) => entry.item.text.includes("5h:"))).toHaveLength(1);
 });
 
 test("existing quota state supplies identities when duration metadata disappears", async () => {

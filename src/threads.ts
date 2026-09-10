@@ -561,12 +561,14 @@ export class ThreadRouter {
 
   async tick(): Promise<void> {
     if (this.stopped || this.cfg.channelMode === "telegram") return;
-    const quotaThread = this.registry.threads.find(
-      (thread) => `mm:${thread.channel}:${thread.root}` === this.cfg.codexQuotaThread,
-    );
-    void this.quota
-      ?.tick(quotaThread?.key)
-      .catch(() => console.error("[quota] check deferred; state retained"));
+    if (this.quota) {
+      const quotaThread = this.registry.threads.find(
+        (thread) => `mm:${thread.channel}:${thread.root}` === this.cfg.codexQuotaThread,
+      );
+      void this.quota
+        .tick(quotaThread?.key)
+        .catch(() => console.error("[quota] check deferred; state retained"));
+    }
     this.collect();
     // Surviving CLIs count against the cap after a supervisor crash, before any new launches.
     const orphans = new Set(

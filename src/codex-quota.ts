@@ -83,8 +83,7 @@ export async function readCodexQuota(
           return;
         }
         buffer += chunk;
-        while (buffer.includes("\n")) {
-          const end = buffer.indexOf("\n");
+        for (let end = buffer.indexOf("\n"); end !== -1; end = buffer.indexOf("\n")) {
           const line = buffer.slice(0, end);
           buffer = buffer.slice(end + 1);
           let message: Record<string, unknown> | undefined;
