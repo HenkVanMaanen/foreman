@@ -8,7 +8,7 @@ WS="$(mktemp -d)"
 trap 'rm -rf "$WS"' EXIT
 fail() { echo "FAIL: $1"; [ ! -f "$WS/log" ] || cat "$WS/log"; exit 1; }
 extract() { awk -v pat="^$1[(][)]" '$0 ~ pat {f=1} f{print} f&&/^}$/{exit}' "$SCRIPT"; }
-for fn in codex_final_report run_codex parse_findings run_fix_phase run_review_phase \
+for fn in codex_final_report review_context_prompt run_codex parse_findings run_fix_phase run_review_phase \
           build_review_apply_prompt build_codex_prompt run_crosscheck_phase _hash _tree_digest; do
   eval "$(extract "$fn")"
   type "$fn" >/dev/null || fail "could not extract $fn"
@@ -298,6 +298,21 @@ crosscheck_engine=codex; crosscheck_runner=run_codex; scope_diff_ref=HEAD
 run_crosscheck_phase > "$WS/log" 2>&1
 [ "$CODEX_STATUS" = ERROR ] || fail "optional cross-check hid an actual sandbox failure"
 echo "  OK  real phase callers preserve CLEAN/RISKY/ERROR with isolated captures"
+
+healthy 'SECFINDING: NONE'
+export FOREMAN_HOME="$HERE"
+REVIEW_CONTEXT_DIR="$WS/evidence"; mkdir -p "$REVIEW_CONTEXT_DIR"
+base="$(git -C "$dir" rev-parse HEAD)"
+calls="$(wc -l < "$WS/paths")"
+run SECFINDING
+[ "$rc" -eq 0 ] || fail "review evidence integration failed"
+run SECFINDING
+[ "$rc" -eq 0 ] || fail "reused evidence integration failed"
+[ "$(wc -l < "$WS/paths")" -eq "$((calls + 2))" ] || fail "evidence cache skipped a required reviewer"
+[ "$(find "$REVIEW_CONTEXT_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ] || fail "unchanged evidence was not reused"
+jq -se 'length == 2 and all(.[]; .phase == "SECFINDING" and .input_tokens == 1 and .output_tokens == 1 and .exit == 0)' \
+  "$REVIEW_CONTEXT_DIR/usage.jsonl" >/dev/null || fail "numeric review usage missing"
+echo "  OK  source evidence is reused while every required review still runs"
 
 grep -q 'codex exec --skip-git-repo-check -s danger-full-access' "$SCRIPT" || fail "sandbox mode changed"
 grep -q 'model_reasoning_effort="$effort"' "$SCRIPT" || fail "reasoning effort changed"

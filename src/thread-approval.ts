@@ -1,7 +1,19 @@
 // The supervisor alone grants authority. Worker helpers check its exact scope and run the gate.
-import { createHash } from "node:crypto";
-import { linkSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+
+import { createHash, randomUUID } from "node:crypto";
+import {
+  closeSync,
+  linkSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
+import type { Subprocess } from "bun";
+import { boundedText } from "./agent-context.ts";
 import type { HumanPost } from "./mattermost.ts";
 import { readJson, safeId, writeJson } from "./thread-store.ts";
 
@@ -131,6 +143,23 @@ export function cleanApprovalReview(
   );
 }
 
+function reviewGroupRunning(group: number): boolean {
+  // Orphans can remain as zombies until init reaps them; they cannot edit or hold pipes open.
+  for (const pid of readdirSync("/proc")) {
+    if (!/^\d+$/.test(pid)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch (error) {
+      if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+      throw error;
+    }
+    const [state, , pgrp] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(pgrp) === group && state !== "Z" && state !== "X") return true;
+  }
+  return false;
+}
+
 export async function reviewApproval(
   state: string,
   key: string,
@@ -148,35 +177,78 @@ export async function reviewApproval(
     clean: false,
   };
   writeJson(path, review); // An interrupted or failed rerun invalidates any earlier CLEAN result.
-  const child = Bun.spawn(
-    [
-      "flock",
-      "-n",
-      "-E",
-      "75",
-      "-F",
-      join(state, "threads", `${safeId(key)}.review.lock`),
-      "review-loop",
-      "--dir",
-      approval.cwd,
-      "--pr",
-      approval.request.target,
-    ],
-    {
-      cwd: approval.cwd,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "inherit",
-    },
-  );
+  const log = `${path}.${randomUUID()}.log`;
+  const logFd = openSync(log, "wx", 0o600);
+  let child: Subprocess<"ignore", "pipe", "inherit">;
+  try {
+    child = Bun.spawn(
+      [
+        "flock",
+        "-n",
+        "-E",
+        "75",
+        "-F",
+        join(state, "threads", `${safeId(key)}.review.lock`),
+        "review-loop",
+        "--dir",
+        approval.cwd,
+        "--pr",
+        approval.request.target,
+      ],
+      {
+        cwd: approval.cwd,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "inherit",
+        detached: true, // Keep the shell and reviewers in a group owned by this gate.
+      },
+    );
+  } catch (error) {
+    closeSync(logFd);
+    throw error;
+  }
+  let first = Buffer.alloc(0);
+  let totalBytes = 0;
   let tail = "";
   const decoder = new TextDecoder();
-  for await (const chunk of child.stdout) {
-    process.stdout.write(chunk);
-    tail = (tail + decoder.decode(chunk, { stream: true })).slice(-8192);
+  try {
+    for await (const chunk of child.stdout) {
+      writeFileSync(logFd, chunk);
+      totalBytes += chunk.length;
+      if (first.length < 10_000)
+        first = Buffer.concat([first, chunk.subarray(0, 10_000 - first.length)]);
+      tail = (tail + decoder.decode(chunk, { stream: true })).slice(-8192);
+    }
+  } catch (error) {
+    const signalGroup = (signal: NodeJS.Signals) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (killError) {
+        if ((killError as NodeJS.ErrnoException).code !== "ESRCH") throw killError;
+      }
+    };
+    signalGroup("SIGTERM");
+    const deadline = performance.now() + 500;
+    // The shell exiting does not mean its reviewers stopped. Await every live group member.
+    while (reviewGroupRunning(child.pid)) {
+      if (performance.now() >= deadline) signalGroup("SIGKILL");
+      await Bun.sleep(10);
+    }
+    await child.exited;
+    throw error;
+  } finally {
+    closeSync(logFd);
   }
   tail += decoder.decode();
   const code = await child.exited;
+  process.stdout.write(
+    boundedText(
+      totalBytes <= 10_000 ? first.toString() : first.toString() + tail,
+      10_000,
+      `Full review output: ${log}`,
+      totalBytes,
+    ),
+  );
   // Exit 0 alone is insufficient (for example a skipped run or an echoed CLEAN in earlier output).
   if (code !== 0 || !/^review-loop: CLEAN — .+$/.test(tail.trim().split("\n").at(-1) ?? ""))
     throw new Error("final review did not finish CLEAN; merge remains unavailable");
