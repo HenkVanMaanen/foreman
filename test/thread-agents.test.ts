@@ -1012,7 +1012,7 @@ test("unresolved handoffs survive failed resident delivery/restarts and expose l
   f.post("revoke", "root", "channel1", "Hold off, do not merge yet.");
   next.collect();
   expect(f.resident).toHaveLength(2);
-  expect(JSON.stringify(next.command(next.token, ["approval-list"]))).toContain(
+  expect(JSON.stringify(next.command(next.token, ["approval-read", id]))).toContain(
     "Hold off, do not merge yet.",
   );
   await next.tick();

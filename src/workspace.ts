@@ -33,6 +33,9 @@ const BIN_SCRIPTS = [
   "second-opinion",
   "thread-control",
   "thread-reply",
+  "notes-context",
+  "bounded-run",
+  "review-context",
 ] as const;
 
 /**

@@ -31,12 +31,10 @@ async function until(check: () => boolean) {
 }
 
 function grantCommand(router: ThreadRouter, id: string, ref: string): string[] {
-  const approvals = router.command(router.token, ["approval-list"]) as {
+  const approval = router.command(router.token, ["approval-read", id]) as {
     id: string;
     receipts: string[];
-  }[];
-  const approval = approvals.find((item) => item.id === id);
-  if (!approval) throw new Error("missing approval");
+  };
   return ["approval-grant", id, ref, JSON.stringify(approval.receipts)];
 }
 
@@ -136,6 +134,7 @@ if (mode === "fix") {
   const child = Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "review fix"], {stdout:"ignore",stderr:"ignore"});
   if (child.exitCode) process.exit(5);
 }
+if (mode === "verbose") console.log("detail ".repeat(20000));
 console.log("review-loop: CLEAN — mock gate completed.");
 if (mode === "skipped") console.log("review-loop: skipped");
 if (mode === "error") process.exit(5);
@@ -171,6 +170,180 @@ if (mode === "error") process.exit(5);
   };
   return { dir, cwd, git, head, cfg, ref, id, key, target, r, router, calls, resident, post, cli };
 }
+
+test("approval summaries omit receipt bodies and resolved history; explicit reads retain all receipts", async () => {
+  const f = await fixture();
+  const before = f.r.command(f.r.token, ["approval-list"]) as { receiptVersion: string }[];
+  f.post("later", `Hold off. ${"private receipt body ".repeat(3000)}`);
+  const summaries = f.r.command(f.r.token, ["approval-list"]) as { receiptVersion: string }[];
+  const serialized = JSON.stringify(summaries);
+  expect(serialized.length).toBeLessThan(2000);
+  expect(serialized).not.toContain("private receipt body");
+  expect(summaries[0]?.receiptVersion).not.toBe(before[0]?.receiptVersion);
+  const full = f.r.command(f.r.token, ["approval-read", f.id]) as {
+    receipts: string[];
+    messages: { text: string }[];
+  };
+  expect(full.receipts).toContain("later");
+  expect(full.messages.some((m) => m.text.startsWith("Hold off."))).toBe(true);
+  f.r.command(f.r.token, ["approval-resolve", f.id, "declined", "Human asked to hold off."]);
+  expect(f.r.command(f.r.token, ["approval-list"])).toEqual([]);
+  expect(f.r.command(f.r.token, ["approval-read", f.id])).toMatchObject({
+    resolution: { outcome: "declined" },
+  });
+  expect(() => f.r.command("worker", ["approval-read", f.id])).toThrow("resident authorization");
+});
+
+test("large gate output is saved completely while the returned view remains bounded and CLEAN is checked", async () => {
+  const f = await fixture();
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
+  const result = await f.cli(["approval-review", f.id], "verbose");
+  expect(result.code).toBe(0);
+  expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(10_100);
+  expect(result.output).toContain("Full review output:");
+  expect(result.output).toContain("review-loop: CLEAN");
+  const log = /Full review output: ([^;\]]+)/.exec(result.output)?.[1];
+  expect(log).toBeDefined();
+  expect(readFileSync(log ?? "", "utf8").length).toBeGreaterThan(140_000);
+  expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).code).toBe(0);
+});
+
+test.each([
+  { ignoreTerm: false, shell: false },
+  { ignoreTerm: true, shell: false },
+  { ignoreTerm: false, shell: true },
+  { ignoreTerm: true, shell: true },
+])("capture failure stops the review group and keeps the gate closed (%j)", async ({
+  ignoreTerm,
+  shell,
+}) => {
+  const f = await fixture();
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
+  const reviewerPid = join(f.dir, "reviewer.pid");
+  const reviewer = `import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => { ${ignoreTerm ? "" : "process.exit(0);"} });
+setInterval(() => {}, 1000);
+writeFileSync(${JSON.stringify(reviewerPid)}, String(process.pid));
+process.stdout.write("capture this");
+`;
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  writeFileSync(
+    join(f.dir, "review-loop"),
+    shell
+      ? `#!/bin/sh\n${quote(process.execPath)} --no-env-file -e ${quote(reviewer)} &\nwait\n`
+      : `#!${process.execPath}\n${reviewer}`,
+  );
+  const script = `
+    import { mock } from "bun:test";
+    import * as fs from "node:fs";
+    const spawn = Bun.spawn;
+    const write = fs.writeFileSync;
+    const close = fs.closeSync;
+    const kill = process.kill.bind(process);
+    const captureError = new Error("ENOSPC: no space left on device");
+    let command;
+    let reaped = false;
+    let reapedAtClose = false;
+    let closed = false;
+    let timedOut = false;
+    let originalError = false;
+    let reviewerRunningAtClose = true;
+    let reviewerRunningAtFailure = true;
+    const signals = [];
+    const reviewerRunning = () => {
+      const pid = fs.readFileSync(${JSON.stringify(reviewerPid)}, "utf8");
+      const stat = Bun.spawnSync(["/usr/bin/ps", "-p", pid, "-o", "stat="]).stdout.toString().trim();
+      return stat !== "" && !/^[ZX]/.test(stat);
+    };
+    const stop = () => {
+      if (command) {
+        try { kill(-command.pid, "SIGKILL"); } catch {}
+        command.kill("SIGKILL");
+      }
+      if (fs.existsSync(${JSON.stringify(reviewerPid)})) {
+        try { kill(Number(fs.readFileSync(${JSON.stringify(reviewerPid)}, "utf8")), "SIGKILL"); } catch {}
+      }
+    };
+    process.kill = (pid, signal) => {
+      if (pid === -command?.pid) signals.push(signal);
+      return kill(pid, signal);
+    };
+    Bun.spawn = (...args) => {
+      command = spawn(...args);
+      command.exited.then(() => { reaped = true; });
+      return command;
+    };
+    mock.module("node:fs", () => ({
+      ...fs,
+      writeFileSync(file, ...args) {
+        if (typeof file === "number") throw captureError;
+        return write(file, ...args);
+      },
+      closeSync(fd) {
+        reapedAtClose = reaped;
+        reviewerRunningAtClose = reviewerRunning();
+        close(fd);
+        closed = true;
+      },
+    }));
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, 2000);
+    try {
+      const { reviewApproval } = await import(${JSON.stringify(resolve(import.meta.dir, "../src/thread-approval.ts"))});
+      await reviewApproval(...${JSON.stringify([f.cfg.stateDir, f.key, f.id, f.cwd])});
+    } catch (error) {
+      originalError = error === captureError;
+      reviewerRunningAtFailure = reviewerRunning();
+    } finally {
+      clearTimeout(watchdog);
+      stop();
+      if (command) {
+        await command.exited;
+      }
+    }
+    console.log(JSON.stringify({ signals, reapedAtClose, reviewerRunningAtClose, reviewerRunningAtFailure, closed, timedOut, originalError }));
+  `;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+    cwd: f.cwd,
+    env: {
+      HOME: f.dir,
+      PATH: `${f.dir}:/usr/bin:/bin`,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect(code).toBe(0);
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout)).toEqual({
+    signals: ignoreTerm ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"],
+    reapedAtClose: true,
+    reviewerRunningAtClose: false,
+    reviewerRunningAtFailure: false,
+    closed: true,
+    timedOut: false,
+    originalError: true,
+  });
+  expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).error).toContain(
+    "a CLEAN final review",
+  );
+  const approval = f.r.snapshot().approvals?.[0];
+  const grant = approval?.grants?.at(-1);
+  if (!approval || !grant) throw new Error("missing grant");
+  expect(readJson(approvalArtifact(f.cfg.stateDir, approval, grant, "review"), null)).toMatchObject(
+    {
+      clean: false,
+    },
+  );
+});
 
 test("verified approval resumes the same agent to review then merge only its PR, consuming task authority", async () => {
   const f = await fixture();
@@ -248,7 +421,7 @@ test("verified approval resumes the same agent to review then merge only its PR,
 test.each([
   false,
   true,
-])("a revocation between approval-list and approval-grant rejects the stale receipt snapshot (existing grant=%s)", async (existingGrant) => {
+])("a revocation between approval-read and approval-grant rejects the stale receipt snapshot (existing grant=%s)", async (existingGrant) => {
   const f = await fixture();
   const grant = grantCommand(f.r, f.id, f.ref);
   if (existingGrant) f.r.command(f.r.token, grant);
@@ -260,15 +433,13 @@ test.each([
   expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).error).toContain(
     "current resident-verified task grant required",
   );
-  expect(f.r.command(f.r.token, ["approval-list"])).toMatchObject([
-    {
-      receipts: ["revoked", "root"],
-      grantCurrent: false,
-      messages: expect.arrayContaining([
-        expect.objectContaining({ id: "revoked", text: "Do not merge; I revoke approval." }),
-      ]),
-    },
-  ]);
+  expect(f.r.command(f.r.token, ["approval-read", f.id])).toMatchObject({
+    receipts: ["revoked", "root"],
+    grantCurrent: false,
+    messages: expect.arrayContaining([
+      expect.objectContaining({ id: "revoked", text: "Do not merge; I revoke approval." }),
+    ]),
+  });
   f.r.command(f.r.token, ["approval-resolve", f.id, "declined", "Human revoked approval."]);
 });
 

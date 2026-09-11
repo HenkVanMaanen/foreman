@@ -36,6 +36,9 @@ source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worker-state.sh"
 read -r -d '' DOD_FOOTER <<'EOF' || true
 
 ## Definition of done (mandatory — appended by spawn-worker)
+
+Keep tool results bounded: use `bounded-run -- <command> [args...]` for large text output and read
+additional artifact ranges only as needed. Reuse unchanged diffs, file reads and validation results.
 Produce a reviewable change FAST, then stop for the human. Before you mark yourself done / exit:
 1. Complete your change and COMMIT it on your branch.
 2. Sanity-check only: make sure it builds and the repo's QUICK checks pass (unit tests, `bash -n`,
