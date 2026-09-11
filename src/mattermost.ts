@@ -75,18 +75,30 @@ export class Mattermost {
     private request: typeof fetch = fetch,
   ) {}
 
-  async api(path: string, body?: unknown): Promise<unknown> {
+  async api(
+    path: string,
+    body?: unknown,
+    method = body === undefined ? "GET" : "POST",
+  ): Promise<unknown> {
     const base = this.env["MATTERMOST_BASE_URL"];
     const token = this.env["MATTERMOST_BOT_TOKEN"];
     if (!base || !token) throw new Error("Mattermost credentials are not configured");
     const response = await this.request(`${base.replace(/\/$/, "")}/api/v4${path}`, {
-      method: body === undefined ? "GET" : "POST",
+      method,
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(15_000),
     });
     if (!response.ok) throw new Error(`Mattermost HTTP ${response.status}`);
     return response.json();
+  }
+
+  async setCustomStatus(text: string, expiresAt: string): Promise<void> {
+    await this.api(
+      "/users/me/status/custom",
+      { emoji: "battery", text, duration: "date_and_time", expires_at: expiresAt },
+      "PUT",
+    );
   }
 
   async destinations(): Promise<{ channels: string[]; humans: string[] }> {

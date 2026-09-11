@@ -62,6 +62,7 @@ async function fixture() {
     ...loadConfig(),
     threadAgents: true,
     channelMode: "mattermost" as const,
+    codexQuotaStatus: false,
     stateDir: join(dir, "state"),
     notesDir: join(dir, "notes"),
     codexBin: "/no-real-codex",

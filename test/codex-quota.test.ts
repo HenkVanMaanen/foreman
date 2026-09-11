@@ -366,12 +366,13 @@ function routerFixture(target = "mm:channel:root", mode: "mattermost" | "telegra
     channelMode: mode,
     codexQuotaThread: target,
     codexQuotaPollMs: 60000,
+    codexQuotaStatus: false,
     codexBin: "/must-never-run",
   };
   return { state, cfg };
 }
 
-test("router uses bound outbox without a model turn; disabled, missing target and Telegram pause", async () => {
+test("router uses bound outbox with Mattermost credentials; disabled status, missing target and Telegram pause", async () => {
   for (const [target, mode, expected] of [
     ["mm:channel:root", "mattermost", 1],
     ["", "mattermost", 0],
@@ -380,10 +381,11 @@ test("router uses bound outbox without a model turn; disabled, missing target an
   ] as const) {
     const f = routerFixture(target, mode);
     let reads = 0;
+    let statusUpdates = 0;
     const sent: string[] = [];
     const router = new ThreadRouter(
       f.cfg,
-      {},
+      { MATTERMOST_BASE_URL: "https://mock.invalid", MATTERMOST_BOT_TOKEN: "fake" },
       () => {
         throw new Error("no resident wake");
       },
@@ -399,12 +401,16 @@ test("router uses bound outbox without a model turn; disabled, missing target an
         reads++;
         return sample();
       },
+      async () => {
+        statusUpdates++;
+      },
     );
     try {
       await router.tick();
       await router.drain();
       expect(reads).toBe(expected);
       expect(sent).toHaveLength(expected);
+      expect(statusUpdates).toBe(0);
     } finally {
       await router.stop();
     }

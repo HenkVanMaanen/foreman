@@ -36,6 +36,7 @@ function fixture() {
     ...loadConfig(),
     threadAgents: true,
     channelMode: "mattermost",
+    codexQuotaStatus: false,
     maxThreadAgents: 2,
     stateDir: join(dir, "state"),
     notesDir: join(dir, "notes"),
