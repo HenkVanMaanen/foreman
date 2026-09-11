@@ -101,4 +101,8 @@ test("review evidence reuses unchanged content and invalidates on tracked, untra
     expect(statSync(join(cache, directory, "manifest.json")).mode & 0o777).toBe(0o600);
     expect(readFileSync(join(cache, directory, "changes.diff"), "utf8")).toContain("+changed");
   }
+  const artifact = /Diff: (.+)/.exec(d)?.[1];
+  expect(artifact).toBeDefined();
+  writeFileSync(artifact ?? "", "altered evidence");
+  expect(() => reviewContext(repo, base, cache)).toThrow("artifact changed");
 });

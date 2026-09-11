@@ -89,6 +89,9 @@ export function reviewContext(cwd: string, base: string, directory: string): str
       writeFileSync(join(bundle, name), text, { flag: "wx", mode: 0o600 });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const path = join(bundle, name);
+      if (!lstatSync(path).isFile() || readFileSync(path, "utf8") !== text)
+        throw new Error("review evidence artifact changed; refusing to reuse it");
     }
   }
   return (
