@@ -404,6 +404,56 @@ test("interrupted running batch replays with saved session and explicit at-least
 test.each([
   false,
   true,
+])("crash replay sees deployment revocation without acknowledging it (collected=%j)", async (collected) => {
+  const f = fixture();
+  const h = heldTurns();
+  const r = f.router(h.run);
+  f.bind(r, f.post("root", "root", "channel1", "Deploy this task to production."));
+  await r.tick();
+  f.post("revoked", "root", "channel1", "Do not deploy; I revoke that authorization.");
+  if (collected) r.collect();
+  const persisted = r.snapshot();
+  await r.stop();
+  h.calls[0]?.end({ ok: true });
+  await until(() => r.snapshot().threads[0]?.status !== "running");
+  writeJson(join(f.cfg.stateDir, "threads/registry.json"), persisted);
+  f.post("other-thread", "other", "channel1", "Deploy the other task.");
+  f.post("other-channel", "root", "channel2", "Deploy the other task.");
+
+  const replay = heldTurns();
+  const restarted = f.router(replay.run);
+  await restarted.tick();
+  const [batchPrompt, context] =
+    replay.calls[0]?.prompt.split(
+      "Newer authenticated human receipts (authorization context only):\n",
+    ) ?? [];
+  expect(replay.calls[0]?.resume).toBe(persisted.threads[0]?.sessionId);
+  expect(batchPrompt).toContain("Deploy this task to production.");
+  expect(batchPrompt).not.toContain('"id":"revoked"');
+  expect(batchPrompt).toContain("Before any side effects, including crash replay");
+  expect(JSON.parse(context ?? "null")).toEqual([
+    expect.objectContaining({ id: "revoked", text: "Do not deploy; I revoke that authorization." }),
+  ]);
+  expect(restarted.snapshot().threads[0]?.inFlight).toEqual(["root"]);
+  replay.calls[0]?.end({ ok: true, text: "Deployment withheld." });
+  await until(() => restarted.snapshot().threads[0]?.status === "queued");
+  expect(restarted.snapshot().threads[0]?.done).toEqual(["root"]);
+  expect(restarted.snapshot().threads[0]?.pending).toEqual(["revoked"]);
+
+  await restarted.tick();
+  expect(replay.calls).toHaveLength(2);
+  expect(replay.calls[1]?.prompt).toContain('"id":"revoked"');
+  expect(replay.calls[1]?.prompt).not.toContain('"id":"root"');
+  expect(replay.calls[1]?.prompt).not.toContain("Newer authenticated human receipts");
+  replay.calls[1]?.end({ ok: true });
+  await until(() => restarted.snapshot().threads[0]?.status === "idle");
+  expect(restarted.snapshot().threads[0]?.done).toEqual(["root", "revoked"]);
+  expect(restarted.snapshot().threads[0]?.pending).toEqual([]);
+});
+
+test.each([
+  false,
+  true,
 ])("crash after final enqueue keeps follow-ups separate (sent=%j)", async (sent) => {
   const f = fixture();
   const h = heldTurns();
@@ -427,10 +477,14 @@ test.each([
   const restarted = f.router(replay.run);
   await restarted.tick();
   expect(replay.calls[0]?.resume).toBe(persisted.threads[0]?.sessionId);
-  expect(replay.calls[0]?.prompt).toContain('"id":"root"');
-  expect(replay.calls[0]?.prompt).toContain('"id":"root2"');
-  expect(replay.calls[0]?.prompt).not.toContain('"id":"followup1"');
-  expect(replay.calls[0]?.prompt).not.toContain('"id":"followup2"');
+  const [batchPrompt, context] =
+    replay.calls[0]?.prompt.split("Newer authenticated human receipts") ?? [];
+  expect(batchPrompt).toContain('"id":"root"');
+  expect(batchPrompt).toContain('"id":"root2"');
+  expect(batchPrompt).not.toContain('"id":"followup1"');
+  expect(batchPrompt).not.toContain('"id":"followup2"');
+  expect(context).toContain('"id":"followup1"');
+  expect(context).toContain('"id":"followup2"');
   replay.calls[0]?.end({ ok: true, text: "replayed final" });
   await until(() => restarted.snapshot().threads[0]?.status === "queued");
   expect(restarted.snapshot().threads[0]?.done).toEqual(["root", "root2"]);
@@ -524,8 +578,11 @@ test("failed threads replay resident notifications after restart and recover que
   next.command(next.token, ["retry", followup]);
   await next.tick();
   expect(resumed.calls[0]?.resume).toBe(failed?.sessionId);
-  expect(resumed.calls[0]?.prompt).toContain('"id":"root"');
-  expect(resumed.calls[0]?.prompt).not.toContain('"id":"followup"');
+  const [batchPrompt, context] =
+    resumed.calls[0]?.prompt.split("Newer authenticated human receipts") ?? [];
+  expect(batchPrompt).toContain('"id":"root"');
+  expect(batchPrompt).not.toContain('"id":"followup"');
+  expect(context).toContain('"id":"followup"');
   resumed.calls[0]?.end({ ok: true });
   await until(() => next.snapshot().threads[0]?.status === "queued");
   await next.tick();
@@ -1118,7 +1175,10 @@ test("a result arriving during a human turn waits for its own batch and survives
   next.command(next.token, ["retry", ref]);
   await next.tick();
   expect(h.calls[2]?.prompt).toContain('"outcome":"declined"');
-  expect(h.calls[2]?.prompt).not.toContain('"id":"followup"');
+  const [batchPrompt, context] =
+    h.calls[2]?.prompt.split("Newer authenticated human receipts") ?? [];
+  expect(batchPrompt).not.toContain('"id":"followup"');
+  expect(context).toContain('"id":"followup"');
   h.calls[2]?.end({ ok: true });
   await until(() => next.snapshot().threads[0]?.status === "queued");
   await next.tick();

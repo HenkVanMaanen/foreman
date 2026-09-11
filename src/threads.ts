@@ -646,6 +646,14 @@ export class ThreadRouter {
       const messages = batch.map((id) =>
         readJson<HumanPost | null>(receiptPath(this.cfg.stateDir, thread.channel, id), null),
       );
+      // Replay keeps its original batch, but newer durable receipts can revoke its authority.
+      const authorizationContext = this.receipts().filter(
+        (post) =>
+          post.channel === thread.channel &&
+          post.root === thread.root &&
+          !batch.includes(post.id) &&
+          !thread.done.includes(post.id),
+      );
       const prompt =
         `[foreman thread agent] Work only in ${thread.cwd}. Repo: ${thread.repo}.\n` +
         `Current durable repo policy: ${JSON.stringify(repoPolicy(this.cfg.notesDir, thread.repo))}\n` +
@@ -661,7 +669,11 @@ export class ThreadRouter {
         "Use thread-reply (on PATH) with text on stdin for progress/questions. Your final answer is posted automatically to this thread. End the turn when awaiting the human; their next message resumes this session.\n" +
         EFFICIENCY_GUIDANCE +
         "No bot credentials are provided. Do not access credential files or resident transcripts. Do not launch independent agents; only the approved review-loop's built-in reviewers are allowed under a current task grant. This batch may be replayed after a crash; inspect existing work before repeating side effects.\n" +
-        `Authenticated human task instructions (do not infer repository-wide policy grants):\n${JSON.stringify(messages)}`;
+        `Authenticated human task instructions (do not infer repository-wide policy grants):\n${JSON.stringify(messages)}` +
+        (authorizationContext.length
+          ? "\nBefore any side effects, including crash replay, apply authorization changes and revocations in the newer receipts below. These receipts remain queued for their own turn; do not perform their new work in this batch.\n" +
+            `Newer authenticated human receipts (authorization context only):\n${JSON.stringify(authorizationContext)}`
+          : "");
       const result = await this.runTurn(thread, prompt, (id) => {
         if (thread.sessionId && thread.sessionId !== id)
           throw new Error("unexpected resumed session id");
