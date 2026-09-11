@@ -1133,8 +1133,17 @@ _indent_tee() {
 # stdin, and closing it stops a piped invocation (e.g. `data | review-loop`) from feeding leftover
 # stdin into the first review round as extra prompt input.
 # shellcheck disable=SC2329  # invoked indirectly via run_fix_phase's $runner (default run_claude)
+review_context_prompt() {
+  bun run "$FOREMAN_HOME/src/agent-context-cli.ts" review-context "$dir" "$base" "$REVIEW_CONTEXT_DIR"
+}
+
 run_claude() {
   local slash="$1"
+  if [ -n "${REVIEW_CONTEXT_DIR:-}" ]; then
+    local evidence
+    evidence="$(review_context_prompt)" || return 1
+    slash="$slash ${evidence//$'\n'/ }"
+  fi
   ( cd "$dir" && claude -p --dangerously-skip-permissions "$slash" </dev/null ) 2>&1 | _indent_tee
   return "${PIPESTATUS[0]}"
 }
@@ -1217,8 +1226,14 @@ codex_final_report() { # $1=last-message file, $2=contract (token[:report|apply]
 #   and put workspace-write back the moment bubblewrap starts.
 # shellcheck disable=SC2329  # invoked indirectly via run_fix_phase's $runner ("run_codex")
 run_codex() {
-  local prompt="$1" contract="${2:-}" rc=0 effort="${codex_effort:-xhigh}" run_dir
+  local prompt="$1" contract="${2:-}" rc=0 effort="${codex_effort:-xhigh}" run_dir head_before=""
   local -a statuses
+  if [ -n "${REVIEW_CONTEXT_DIR:-}" ]; then
+    local evidence
+    evidence="$(review_context_prompt)" || return 1
+    prompt="$prompt"$'\n\n'"$evidence"
+    head_before="$(git -C "$dir" rev-parse HEAD)" || return 1
+  fi
   if [ "$CODEX_SANDBOX_CONFIRMED" -eq 1 ]; then
     echo "    | codex: not invoked — the sandbox failure is confirmed for this run (see above)"
     return 1
@@ -1282,6 +1297,16 @@ run_codex() {
   elif [ "$rc" -eq 0 ] && [ -n "${RUN_CLAUDE_CAPTURE:-}" ]; then
     # Append only validated final reports, preserving findings from each successful round.
     cat "$run_dir/report" >> "$RUN_CLAUDE_CAPTURE" && printf '\n' >> "$RUN_CLAUDE_CAPTURE" || rc=1
+  fi
+  if [ -n "${REVIEW_CONTEXT_DIR:-}" ]; then
+    # Numeric usage only; cached input/reasoning remain subsets. No transcripts in telemetry.
+    (umask 077; jq -sc --arg phase "${contract:-simplify}" --arg head "$head_before" \
+      --arg model "$codex_model" --argjson exit "$rc" '
+      [.[] | select(.type == "turn.completed") | .usage] | last // {} |
+      {phase:$phase, head:$head, model:$model, exit:$exit,
+       input_tokens:.input_tokens, cached_input_tokens:.cached_input_tokens,
+       output_tokens:.output_tokens, reasoning_output_tokens:.reasoning_output_tokens}
+    ' "$run_dir/events" >> "$REVIEW_CONTEXT_DIR/usage.jsonl") || rc=1
   fi
   rm -rf "$run_dir"
   CODEX_RUN_DIR=""
@@ -2045,6 +2070,14 @@ run_escalation_phase() {
 }
 
 # --- drive the phases -------------------------------------------------------------------------
+REVIEW_CONTEXT_DIR=""
+if [ -n "${FOREMAN_HOME:-}" ] && [ -f "$FOREMAN_HOME/src/agent-context-cli.ts" ]; then
+  # One private evidence cache for this gate; every phase refreshes its base/head/worktree key.
+  # No phase/verdict is skipped and no evidence from an earlier head grants authority.
+  REVIEW_CONTEXT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/review-evidence.XXXXXX")" \
+    || die "could not create review evidence directory"
+  echo "review evidence: $REVIEW_CONTEXT_DIR"
+fi
 echo "== $prog =="
 codex_disp="$codex"; [ "$codex" = "on" ] && codex_disp="on ($codex_model)"
 echo "dir=$dir  base=$base_short  max-rounds=$max_rounds  security=$security  codex=$codex_disp  escalation-attempts=$escalation_attempts"

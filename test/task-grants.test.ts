@@ -31,12 +31,10 @@ async function until(check: () => boolean) {
 }
 
 function grantCommand(router: ThreadRouter, id: string, ref: string): string[] {
-  const approvals = router.command(router.token, ["approval-list"]) as {
+  const approval = router.command(router.token, ["approval-read", id]) as {
     id: string;
     receipts: string[];
-  }[];
-  const approval = approvals.find((item) => item.id === id);
-  if (!approval) throw new Error("missing approval");
+  };
   return ["approval-grant", id, ref, JSON.stringify(approval.receipts)];
 }
 
@@ -136,6 +134,7 @@ if (mode === "fix") {
   const child = Bun.spawnSync(["git", "commit", "--allow-empty", "-m", "review fix"], {stdout:"ignore",stderr:"ignore"});
   if (child.exitCode) process.exit(5);
 }
+if (mode === "verbose") console.log("detail ".repeat(20000));
 console.log("review-loop: CLEAN — mock gate completed.");
 if (mode === "skipped") console.log("review-loop: skipped");
 if (mode === "error") process.exit(5);
@@ -171,6 +170,42 @@ if (mode === "error") process.exit(5);
   };
   return { dir, cwd, git, head, cfg, ref, id, key, target, r, router, calls, resident, post, cli };
 }
+
+test("approval summaries omit receipt bodies and resolved history; explicit reads retain all receipts", async () => {
+  const f = await fixture();
+  const before = f.r.command(f.r.token, ["approval-list"]) as { receiptVersion: string }[];
+  f.post("later", `Hold off. ${"private receipt body ".repeat(3000)}`);
+  const summaries = f.r.command(f.r.token, ["approval-list"]) as { receiptVersion: string }[];
+  expect(JSON.stringify(summaries).length).toBeLessThan(2000);
+  expect(JSON.stringify(summaries)).not.toContain("private receipt body");
+  expect(summaries[0]?.receiptVersion).not.toBe(before[0]?.receiptVersion);
+  const full = f.r.command(f.r.token, ["approval-read", f.id]) as {
+    receipts: string[];
+    messages: { text: string }[];
+  };
+  expect(full.receipts).toContain("later");
+  expect(full.messages.some((m) => m.text.startsWith("Hold off."))).toBe(true);
+  f.r.command(f.r.token, ["approval-resolve", f.id, "declined", "Human asked to hold off."]);
+  expect(f.r.command(f.r.token, ["approval-list"])).toEqual([]);
+  expect(f.r.command(f.r.token, ["approval-read", f.id])).toMatchObject({
+    resolution: { outcome: "declined" },
+  });
+  expect(() => f.r.command("worker", ["approval-read", f.id])).toThrow("resident authorization");
+});
+
+test("large gate output is saved completely while the returned view remains bounded and CLEAN is checked", async () => {
+  const f = await fixture();
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
+  const result = await f.cli(["approval-review", f.id], "verbose");
+  expect(result.code).toBe(0);
+  expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(10_100);
+  expect(result.output).toContain("Full review output:");
+  expect(result.output).toContain("review-loop: CLEAN");
+  const log = /Full review output: ([^;\]]+)/.exec(result.output)?.[1];
+  expect(log).toBeDefined();
+  expect(readFileSync(log ?? "", "utf8").length).toBeGreaterThan(140_000);
+  expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).code).toBe(0);
+});
 
 test("verified approval resumes the same agent to review then merge only its PR, consuming task authority", async () => {
   const f = await fixture();
@@ -248,7 +283,7 @@ test("verified approval resumes the same agent to review then merge only its PR,
 test.each([
   false,
   true,
-])("a revocation between approval-list and approval-grant rejects the stale receipt snapshot (existing grant=%s)", async (existingGrant) => {
+])("a revocation between approval-read and approval-grant rejects the stale receipt snapshot (existing grant=%s)", async (existingGrant) => {
   const f = await fixture();
   const grant = grantCommand(f.r, f.id, f.ref);
   if (existingGrant) f.r.command(f.r.token, grant);
@@ -260,7 +295,7 @@ test.each([
   expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).error).toContain(
     "current resident-verified task grant required",
   );
-  expect(f.r.command(f.r.token, ["approval-list"])).toMatchObject([
+  expect([f.r.command(f.r.token, ["approval-read", f.id])]).toMatchObject([
     {
       receipts: ["revoked", "root"],
       grantCurrent: false,

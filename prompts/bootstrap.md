@@ -6,7 +6,7 @@ disk, not in this conversation.** Treat every launch as "resume from notes."
 
 ## First actions, every launch
 
-1. Read `notes/INDEX.md`. It is your always-loaded table of contents.
+1. Run `bin/notes-context` once. It returns a view of `notes/INDEX.md` capped at 15KB; the full durable index remains on disk. Read the relevant task journal before acting, and retrieve a needed omitted section explicitly. Do not reload the index on each status check.
 2. If a journal entry says you were mid-task, read it and resume exactly there.
 3. If `notes/INDEX.md` is effectively empty (fresh start), you have not been onboarded yet —
    go to **Onboarding** below.
@@ -101,8 +101,7 @@ re-reads your whole context each time (a large chunk of idle spend). Instead:
   re-invokes you **only when the human sends a message**, delivering the message text in your
   next prompt, prefixed `[inbox] New message(s)…` (one `MSG <post_id> <root_or_-> <text>` line
   per message; a leading `-` in the 2nd field means a new root). Reply in the correct thread.
-- This replaces the old idle HOLD/park pattern. Keep the thread-per-topic discipline: settle
-  and re-poll before acting, and `+1`/ack when appropriate. `bin/wait-reply <id>` is still the
+- Keep the thread-per-topic discipline and act on the delivered receipt. `bin/wait-reply <id>` is still the
   tool for an explicit blocking wait on a single in-task thread.
 
 ### Staying responsive while working (don't vanish into a long turn)
@@ -115,11 +114,16 @@ The human must never feel ignored while you work. Two rules:
   is a receipt, not your answer.
 - **Don't foreground-block for minutes in a single turn.** New human messages are only handed to you
   at a **turn boundary**, so a turn that runs for many minutes (e.g. a long in-turn `wait` loop for
-  detached workers) makes you deaf for that whole stretch. Instead, when waiting on workers: poll
-  once, and if nothing is ready, `sleep` briefly and **end your turn** — the supervisor immediately
-  re-invokes you to keep polling, and delivers any queued human message in between. Keep each such
-  turn short (tens of seconds, not minutes) so you stay reachable. Reserve `bin/park` (which sleeps
-  until the human speaks) for when you're waiting *only* on the human, not on workers.
+  detached workers) makes you deaf for that whole stretch. When waiting on workers, run
+  `bin/wait-on <worker-name> [worker-name ...]` and **end your turn**. The supervisor wakes you
+  when a named worker needs attention or a human writes. Do not sleep/end-turn to poll again.
+  Use `bin/park` when waiting on human input or an approval handoff notification.
+
+Use `bin/bounded-run -- <command> [args...]` for potentially large text results. It returns at most
+10KB and keeps the complete output in a local artifact. Read additional ranges only when needed.
+Reuse unchanged file reads, diffs and validation results. For approvals, `approval-list` lists
+compact unresolved summaries; `approval-read <id>` returns the complete receipts required for
+verification. Read those receipts before granting, including later changes or revocations.
 
 ### Write like a human, not a status bot
 
