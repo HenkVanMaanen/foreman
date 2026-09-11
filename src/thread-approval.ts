@@ -201,8 +201,13 @@ export async function reviewApproval(
       tail = (tail + decoder.decode(chunk, { stream: true })).slice(-8192);
     }
   } catch (error) {
-    child.kill();
-    await child.exited;
+    child.kill("SIGTERM");
+    const killTimer = setTimeout(() => child.kill("SIGKILL"), 500);
+    try {
+      await child.exited;
+    } finally {
+      clearTimeout(killTimer);
+    }
     throw error;
   } finally {
     closeSync(logFd);

@@ -207,6 +207,109 @@ test("large gate output is saved completely while the returned view remains boun
   expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).code).toBe(0);
 });
 
+test.each([
+  false,
+  true,
+])("capture failure reaps the review child and keeps the gate closed (ignores SIGTERM=%s)", async (ignoreTerm) => {
+  const f = await fixture();
+  f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
+  writeFileSync(
+    join(f.dir, "review-loop"),
+    `#!${process.execPath}
+process.on("SIGTERM", () => { ${ignoreTerm ? "" : "process.exit(0);"} });
+setInterval(() => {}, 1000);
+process.stdout.write("capture this");
+`,
+  );
+  const script = `
+    import { mock } from "bun:test";
+    import * as fs from "node:fs";
+    const spawn = Bun.spawn;
+    const write = fs.writeFileSync;
+    const close = fs.closeSync;
+    const captureError = new Error("ENOSPC: no space left on device");
+    let command;
+    let reaped = false;
+    let reapedAtClose = false;
+    let closed = false;
+    let timedOut = false;
+    let originalError = false;
+    const signals = [];
+    Bun.spawn = (...args) => {
+      command = spawn(...args);
+      const kill = command.kill.bind(command);
+      command.kill = (signal = "SIGTERM") => { signals.push(signal); kill(signal); };
+      command.exited.then(() => { reaped = true; });
+      return command;
+    };
+    mock.module("node:fs", () => ({
+      ...fs,
+      writeFileSync(file, ...args) {
+        if (typeof file === "number") throw captureError;
+        return write(file, ...args);
+      },
+      closeSync(fd) {
+        reapedAtClose = reaped;
+        close(fd);
+        closed = true;
+      },
+    }));
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      command?.kill("SIGKILL");
+    }, 2000);
+    try {
+      const { reviewApproval } = await import(${JSON.stringify(resolve(import.meta.dir, "../src/thread-approval.ts"))});
+      await reviewApproval(...${JSON.stringify([f.cfg.stateDir, f.key, f.id, f.cwd])});
+    } catch (error) {
+      originalError = error === captureError;
+    } finally {
+      clearTimeout(watchdog);
+      if (command && !reaped) {
+        command.kill("SIGKILL");
+        await command.exited;
+      }
+    }
+    console.log(JSON.stringify({ signals, reapedAtClose, closed, timedOut, originalError }));
+  `;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+    cwd: f.cwd,
+    env: {
+      HOME: f.dir,
+      PATH: `${f.dir}:/usr/bin:/bin`,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect(code).toBe(0);
+  expect(stderr).toBe("");
+  expect(JSON.parse(stdout)).toEqual({
+    signals: ignoreTerm ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"],
+    reapedAtClose: true,
+    closed: true,
+    timedOut: false,
+    originalError: true,
+  });
+  expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).error).toContain(
+    "a CLEAN final review",
+  );
+  const approval = f.r.snapshot().approvals?.[0];
+  const grant = approval?.grants?.at(-1);
+  if (!approval || !grant) throw new Error("missing grant");
+  expect(readJson(approvalArtifact(f.cfg.stateDir, approval, grant, "review"), null)).toMatchObject(
+    {
+      clean: false,
+    },
+  );
+});
+
 test("verified approval resumes the same agent to review then merge only its PR, consuming task authority", async () => {
   const f = await fixture();
   const grant = grantCommand(f.r, f.id, f.ref);
