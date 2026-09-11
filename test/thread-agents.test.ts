@@ -1852,14 +1852,14 @@ emit({ type: ${JSON.stringify(scenario === "failed turn" ? "turn.failed" : "turn
   const expected = [
     "Bound to a dedicated agent; queued for the next available slot.",
     "Investigating the duplicate replies.",
-    ...(scenario === "empty answer"
-      ? []
-      : [
-          scenario === "failed turn"
-            ? "Turn failed; messages retained. Resident must inspect and use thread-control retry."
-            : "Duplicate replies fixed.",
-        ]),
   ];
+  if (scenario !== "empty answer") {
+    expected.push(
+      scenario === "failed turn"
+        ? "Turn failed; messages retained. Resident must inspect and use thread-control retry."
+        : "Duplicate replies fixed.",
+    );
+  }
   expect(f.sent.map(({ text }) => text)).toEqual(expected);
   await r.stop();
   if (scenario !== "failed turn") {
