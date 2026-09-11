@@ -1806,6 +1806,82 @@ test("real CodexSession adapter with mock CLI emits stable independent IDs, resu
   );
 });
 
+test.each([
+  "answer",
+  "repeated answer",
+  "empty answer",
+  "failed turn",
+])("Codex thread replies publish progress once and only the final assistant message (%s)", async (scenario) => {
+  const f = fixture();
+  const cli = join(f.dir, "mock-codex");
+  writeFileSync(
+    cli,
+    `#!${process.execPath}
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const resumed = args[1] === "resume";
+const id = resumed ? args.at(-2) : "session-" + process.env.FOREMAN_THREAD_KEY;
+const progress = resumed ? "Checking the follow-up." : "Investigating the duplicate replies.";
+const final = ${JSON.stringify(scenario)} === "empty answer" ? "" : resumed ? "Follow-up fixed." : "Duplicate replies fixed.";
+appendFileSync(${JSON.stringify(join(f.dir, "calls"))}, id + "\\n");
+await Bun.stdin.text();
+const emit = (event) => console.log(JSON.stringify(event));
+const message = (text) => emit({ type: "item.completed", item: { type: "agent_message", text } });
+emit({ type: "thread.started", thread_id: id });
+emit({ type: "turn.started" });
+message(progress);
+const reply = Bun.spawnSync([process.execPath, "--no-env-file", ${JSON.stringify(resolve(import.meta.dir, "../src/thread-cli.ts"))}, "outbox"], {
+  stdin: Buffer.from(progress), stdout: "pipe", stderr: "pipe",
+});
+if (reply.exitCode !== 0) throw new Error("mock progress reply failed");
+emit({ type: "item.completed", item: { type: "command_execution", aggregated_output: "tool output must not become a reply" } });
+message("Verification is complete.");
+message(final);
+if (${JSON.stringify(scenario)} === "repeated answer") message(final);
+emit({ type: "item.updated", item: { type: "agent_message", text: "unfinished update must not become a reply" } });
+emit({ type: ${JSON.stringify(scenario === "failed turn" ? "turn.failed" : "turn.completed")} });
+`,
+  );
+  chmodSync(cli, 0o700);
+  f.cfg.codexBin = cli;
+  const r = f.router();
+  f.bind(r, f.post("root"));
+  await r.tick();
+  await until(() => r.snapshot().threads[0]?.status !== "running");
+  await r.drain();
+  const expected = [
+    "Bound to a dedicated agent; queued for the next available slot.",
+    "Investigating the duplicate replies.",
+  ];
+  if (scenario !== "empty answer") {
+    expected.push(
+      scenario === "failed turn"
+        ? "Turn failed; messages retained. Resident must inspect and use thread-control retry."
+        : "Duplicate replies fixed.",
+    );
+  }
+  expect(f.sent.map(({ text }) => text)).toEqual(expected);
+  await r.stop();
+  if (scenario !== "failed turn") {
+    f.post("followup", "root");
+    const next = f.router();
+    await next.tick();
+    await until(() => next.snapshot().threads[0]?.status !== "running");
+    await next.drain();
+    expected.push("Checking the follow-up.");
+    if (scenario !== "empty answer") expected.push("Follow-up fixed.");
+    expect(f.sent.map(({ text }) => text)).toEqual(expected);
+    // Duplicate ingress after restart must not create another turn or final reply.
+    next.collect();
+    await next.tick();
+    const calls = readFileSync(join(f.dir, "calls"), "utf8").trim().split("\n");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toBe(calls[0]);
+    expect(f.sent.map(({ text }) => text)).toEqual(expected);
+  }
+  expect(f.sent.every(({ channel, root }) => channel === "channel1" && root === "root")).toBe(true);
+});
+
 test("credential-free thread-reply CLI spools only text and control endpoint rejects absent capability", async () => {
   const f = fixture();
   const r = f.router();

@@ -714,7 +714,7 @@ export class ThreadRouter {
       ),
     );
     let ok = false;
-    const text: string[] = [];
+    let text = "";
     try {
       await session.send(prompt);
       for await (const event of session.events()) {
@@ -722,13 +722,19 @@ export class ThreadRouter {
           onSession(event.session_id);
         if (event.type === "result") ok = !event.is_error;
         const raw = event.raw as { type?: string; item?: { type?: string; text?: string } };
-        if (raw?.type === "item.completed" && raw.item?.type === "agent_message" && raw.item.text)
-          text.push(raw.item.text);
+        // Codex emits progress and the final answer as agent_message items. Match its
+        // last-message contract; concatenating them replays progress sent via thread-reply.
+        if (
+          raw?.type === "item.completed" &&
+          raw.item?.type === "agent_message" &&
+          typeof raw.item.text === "string"
+        )
+          text = raw.item.text;
       }
       return {
         ok: ok && session.exitCode === 0,
         busy: session.exitCode === 75,
-        text: text.join("\n\n"),
+        text,
       };
     } finally {
       await session.stop();
