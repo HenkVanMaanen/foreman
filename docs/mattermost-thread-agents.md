@@ -33,7 +33,7 @@ Thread agents use `thread-reply` on PATH, with text on stdin, for progress/quest
 
 Supervisor and worker replies share a per-thread outbox lock and durable `.order` list. Delivery follows publication order regardless of filenames or clocks; retrying a delivery ID retains its original reply and position, including its sent marker. Existing JSON files retain their names and payloads and are adopted in their recorded timestamp/mtime order. A crash between publishing a reply and recording its position is recovered before later replies can be queued or drained.
 
-Repo policy defaults allow branch, branch push and draft PR. Merge, main pushes/edits, undraft, deploy, harness-sync and keeper edits default false. Each thread reads current policy before every turn. `thread-control policy-get owner/repo` is a public read. Only the resident endpoint accepts updates, for example:
+Repo policy defaults allow branch, branch push and draft PR. Merge, main pushes/edits, undraft, deploy, harness-sync and keeper edits default false. These are standing permissions: an explicit authenticated human task instruction can authorize an action without changing repository-wide policy. The latest actual instruction, including revocation, controls that task; quoted text and worker interpretations are not grants. Each thread reads current policy before every turn. `thread-control policy-get owner/repo` is a public read. Only the resident endpoint accepts updates, for example:
 
 ```bash
 thread-control policy-set mm:<channel>:<human-post> owner/repo '{"merge":true}' --repo-wide
@@ -42,6 +42,8 @@ thread-control policy-set mm:<channel>:<human-post> owner/repo '{"merge":true}' 
 The resident must verify an explicit **repository-wide** human grant; a worker's interpretation/request is insufficient. Widening a policy requires `--repo-wide` in addition to the resident capability and authorized receipt. The flag declares scope, not proof of consent: the resident still reads the actual source. Revocations do not require the flag. Atomic `FOREMAN_NOTES_DIR/policy/autonomy.json` contains repo policies and old/new/source-message audit. It lives in the foreman-state notes checkout and participates in normal persistence; this command does not run notes-sync or push. Changes reach active agents at their next turn. Policy is agent guidance, not a git/API enforcement proxy.
 
 ## Approval and agent-owned review/merge for one PR
+
+Normal pipelines, including their preview and release jobs, are part of authorized work. Agents must not skip CI or introduce a checks-only mode to work around default deployment permissions. An explicit request to run the full pipeline or deploy already authorizes that task; the merge/undraft approval helper is not a prerequisite for other authorized actions. Foreman's own runtime updates still use the resident's guarded activation procedure. Agents never edit repository policy or `keeper.sh`.
 
 When a bound human says “merge it”, the worker requests verification using the original receipt, exact PR/MR URL, starting head and requested actions:
 
