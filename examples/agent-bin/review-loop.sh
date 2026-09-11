@@ -1300,9 +1300,9 @@ run_codex() {
   fi
   if [ -n "${REVIEW_CONTEXT_DIR:-}" ]; then
     # Numeric usage only; cached input/reasoning remain subsets. No transcripts in telemetry.
-    (umask 077; jq -sc --arg phase "${contract:-simplify}" --arg head "$head_before" \
+    (umask 077; jq -nc --arg phase "${contract:-simplify}" --arg head "$head_before" \
       --arg model "$codex_model" --argjson exit "$rc" '
-      last(.[] | select(.type == "turn.completed") | .usage) // {} |
+      last(inputs | select(.type == "turn.completed") | .usage) // {} |
       {phase:$phase, head:$head, model:$model, exit:$exit,
        input_tokens:.input_tokens, cached_input_tokens:.cached_input_tokens,
        output_tokens:.output_tokens, reasoning_output_tokens:.reasoning_output_tokens}
