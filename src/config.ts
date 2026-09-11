@@ -17,6 +17,8 @@ export interface Config {
   // Empty disables quota warnings; otherwise an existing bound mm:channel:root destination.
   codexQuotaThread: string;
   codexQuotaPollMs: number;
+  // Show main Codex quota in the Mattermost bot's custom status every five minutes.
+  codexQuotaStatus: boolean;
   // Which CLI's auth failure the supervisor detects and recovers. Kept independently selectable so
   // the recovery flow can still be rehearsed against a mock without changing the session engine.
   reloginEngine: "claude" | "codex";
@@ -102,6 +104,7 @@ export function loadConfig(): Config {
     codexBin: str("FOREMAN_CODEX_BIN", "codex"),
     codexQuotaThread: parseQuotaThread(str("FOREMAN_CODEX_QUOTA_THREAD", "")),
     codexQuotaPollMs: parseQuotaPollMs(str("FOREMAN_CODEX_QUOTA_POLL_MS", "60000")),
+    codexQuotaStatus: str("FOREMAN_CODEX_QUOTA_STATUS", "1") !== "0",
     codexExtraArgs: str(
       "FOREMAN_CODEX_EXTRA_ARGS",
       "--model gpt-6-astra -c model_reasoning_effort=xhigh",

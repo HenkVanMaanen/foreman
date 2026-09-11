@@ -1,5 +1,9 @@
 # Codex 5% quota heads-up (opt-in)
 
+The separate [bot quota status](codex-quota-status.md) defaults to enabled and
+refreshes every five minutes even without an alert binding. This document's
+opt-in and pause instructions apply to thread warnings.
+
 When any main Codex allowance window reaches **5% remaining or less**, the existing
 supervisor queues a short Mattermost reply in the configured bound thread. The
 message includes each newly low window's remaining percentage and UTC reset time
@@ -77,7 +81,8 @@ After content approval and the required verified grants:
 3. Verify the existing registry binding for that channel/root is retained. The
    monitor does not create a binding, synthesize a receipt or launch a thread agent.
    With no matching binding, thread agents disabled, or Telegram emergency mode,
-   it does not query quota.
+   it does not query quota for alerts. The independently enabled bot status may
+   still query every five minutes when Mattermost thread agents are active.
 4. Have the resident perform the authorized replacement/restart of the **sole**
    supervisor through the existing lifecycle procedure. No process signalling or
    service changes are authorized by this document alone.

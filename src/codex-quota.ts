@@ -151,10 +151,33 @@ function describe(window: QuotaWindow): string {
   return `${label}: ${Number(window.remaining.toFixed(2))}% left (${reset})`;
 }
 
+export type SetQuotaStatus = (text: string, expiresAt: string) => Promise<unknown>;
+const STATUS_INTERVAL_MS = 5 * 60_000;
+
+export function quotaStatusText(windows: QuotaWindow[]): string {
+  if (!windows.length) return "Codex ?";
+  const parts = [...windows]
+    .sort((a, b) => (a.durationMins ?? Infinity) - (b.durationMins ?? Infinity))
+    .map((window) => {
+      const mins = window.durationMins;
+      const label =
+        mins === null
+          ? window.slot
+          : mins % 1440 === 0
+            ? `${mins / 1440}d`
+            : mins % 60 === 0
+              ? `${mins / 60}h`
+              : `${mins}m`;
+      return `${label} ${Math.floor(window.remaining)}%`;
+    });
+  return `Codex ${parts.join(" · ")} left`;
+}
+
 /** tick() is called by the sole thread router timer; overlapping/too-frequent reads are skipped. */
 export class CodexQuotaMonitor {
   private busy: Promise<void> | undefined;
   private nextCheck = 0;
+  private nextStatusCheck = 0;
   private stopped = false;
   private path: string;
 
@@ -165,21 +188,45 @@ export class CodexQuotaMonitor {
     private publish = (key: string, text: string, id: string) =>
       enqueueOutbox(stateDir, key, text, id, true),
     private now = Date.now,
+    private setStatus?: SetQuotaStatus,
   ) {
     this.path = join(stateDir, "codex-quota/monitor.json");
   }
 
   tick(key: string | undefined): Promise<void> {
-    if (this.stopped || !key || this.busy || this.now() < this.nextCheck)
-      return this.busy ?? Promise.resolve();
-    this.nextCheck = this.now() + this.intervalMs;
-    this.busy = this.check(key).finally(() => {
+    if (this.stopped || this.busy) return this.busy ?? Promise.resolve();
+    const now = this.now();
+    const alertKey = key && now >= this.nextCheck ? key : undefined;
+    const updateStatus = this.setStatus !== undefined && now >= this.nextStatusCheck;
+    if (!alertKey && !updateStatus) return Promise.resolve();
+    if (alertKey) this.nextCheck = now + this.intervalMs;
+    if (updateStatus) this.nextStatusCheck = now + STATUS_INTERVAL_MS;
+    this.busy = this.check(alertKey, updateStatus).finally(() => {
       this.busy = undefined;
     });
     return this.busy;
   }
 
-  private async check(key: string): Promise<void> {
+  private async check(key: string | undefined, updateStatus: boolean): Promise<void> {
+    let windows: QuotaWindow[] = [];
+    try {
+      windows = await this.read();
+    } catch {
+      // Auth/network/protocol failures are unknown quota, never zero or a reason to wake a model.
+    }
+    if (this.stopped) return;
+    if (updateStatus && this.setStatus) {
+      try {
+        // One minute of grace covers the next query/HTTP deadlines; downtime cannot leave stale %.
+        await this.setStatus(
+          quotaStatusText(windows),
+          new Date(this.now() + STATUS_INTERVAL_MS + 60_000).toISOString(),
+        );
+      } catch {
+        console.error("[quota] status update failed; retry in five minutes");
+      }
+    }
+    if (!key || this.stopped) return;
     const state = readJson<QuotaState>(this.path, { version: 1, episodes: {} });
     if (state.version !== 1 || !object(state.episodes)) throw new Error("Invalid quota state");
     const publishPending = () => {
@@ -189,13 +236,6 @@ export class CodexQuotaMonitor {
       writeJson(this.path, state);
     };
     publishPending(); // Replay the same immutable delivery ID if publication/checkpoint crashed.
-    let windows: QuotaWindow[] = [];
-    try {
-      windows = await this.read();
-    } catch {
-      // Auth/network/protocol failures are unknown quota, never zero or a reason to wake a model.
-    }
-    if (this.stopped) return;
     state.windowNames ??= Object.fromEntries(
       (state.observed ?? []).map((window) => [
         window.slot,

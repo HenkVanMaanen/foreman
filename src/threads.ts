@@ -4,7 +4,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { EFFICIENCY_GUIDANCE } from "./agent-context.ts";
-import { CodexQuotaMonitor, type QuotaWindow, readCodexQuota } from "./codex-quota.ts";
+import {
+  CodexQuotaMonitor,
+  type QuotaWindow,
+  readCodexQuota,
+  type SetQuotaStatus,
+} from "./codex-quota.ts";
 import { CodexSession } from "./codex-session.ts";
 import type { Config } from "./config.ts";
 import { type HumanPost, Mattermost, postLine, receiptPath } from "./mattermost.ts";
@@ -118,6 +123,7 @@ export class ThreadRouter {
     run?: RunTurn,
     send?: SendReply,
     readQuota?: () => Promise<QuotaWindow[]>,
+    setQuotaStatus?: SetQuotaStatus,
   ) {
     this.path = join(cfg.stateDir, "threads/registry.json");
     this.socket = join(resolve(cfg.stateDir), `thread-router-${this.token.slice(0, 8)}.sock`);
@@ -129,9 +135,14 @@ export class ThreadRouter {
     }
     this.save();
     this.runTurn = run ?? ((thread, prompt, session) => this.codexTurn(thread, prompt, session));
-    const mm = new Mattermost({ ...process.env, ...env });
+    const mmEnv = { ...process.env, ...env };
+    const mm = new Mattermost(mmEnv);
     this.sendReply = send ?? ((t, text) => mm.reply(t.channel, t.root, text));
-    if (cfg.codexQuotaThread && cfg.threadAgents && cfg.channelMode !== "telegram") {
+    const status =
+      cfg.codexQuotaStatus && mmEnv["MATTERMOST_BASE_URL"] && mmEnv["MATTERMOST_BOT_TOKEN"]
+        ? (setQuotaStatus ?? ((text, expiresAt) => mm.setCustomStatus(text, expiresAt)))
+        : undefined;
+    if ((cfg.codexQuotaThread || status) && cfg.threadAgents && cfg.channelMode !== "telegram") {
       this.quota = new CodexQuotaMonitor(
         cfg.stateDir,
         cfg.codexQuotaPollMs,
@@ -141,6 +152,9 @@ export class ThreadRouter {
               cfg.codexBin,
               agentEnv({ ...process.env, ...env, FOREMAN_THREAD_AGENTS: "1" }, false),
             )),
+        undefined,
+        undefined,
+        status,
       );
     }
   }
