@@ -26,19 +26,24 @@ try {
     let code = 1;
     try {
       const child = Bun.spawn(args.slice(1), { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
-      await Promise.all(
-        [child.stdout, child.stderr].map(async (stream) => {
-          for await (const chunk of stream) {
-            bytes += chunk.length;
-            binary ||= chunk.includes(0);
-            if (first.length < 10_000)
-              first = Buffer.concat([first, chunk.subarray(0, 10_000 - first.length)]);
-            tail = Buffer.concat([tail, chunk.subarray(-10_000)]).subarray(-10_000);
-            writeFileSync(fd, chunk);
-          }
-        }),
-      );
-      code = await child.exited;
+      const captures = [child.stdout, child.stderr].map(async (stream) => {
+        for await (const chunk of stream) {
+          bytes += chunk.length;
+          binary ||= chunk.includes(0);
+          if (first.length < 10_000)
+            first = Buffer.concat([first, chunk.subarray(0, 10_000 - first.length)]);
+          tail = Buffer.concat([tail, chunk.subarray(-10_000)]).subarray(-10_000);
+          writeFileSync(fd, chunk);
+        }
+      });
+      try {
+        await Promise.all(captures);
+        code = await child.exited;
+      } catch (error) {
+        child.kill("SIGKILL");
+        await Promise.allSettled([...captures, child.exited]);
+        throw error;
+      }
     } finally {
       closeSync(fd);
     }

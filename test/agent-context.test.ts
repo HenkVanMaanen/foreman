@@ -70,6 +70,77 @@ test("bounded-run preserves the full artifact and failing command status with bo
   expect(stat.mode & 0o777).toBe(0o600);
 });
 
+test.each([
+  "stdout",
+  "stderr",
+])("bounded-run reaps the child and settles both readers when capturing %s fails", async (stream) => {
+  const root = fixture();
+  const cli = resolve("src/agent-context-cli.ts");
+  const script = `
+      import { mock } from "bun:test";
+      import * as fs from "node:fs";
+      const spawn = Bun.spawn;
+      const close = fs.closeSync;
+      let command;
+      let reaped = false;
+      let timedOut = false;
+      let atClose;
+      Bun.spawn = (...args) => {
+        command = spawn(...args);
+        command.exited.then(() => { reaped = true; });
+        return command;
+      };
+      mock.module("node:fs", () => ({
+        ...fs,
+        writeFileSync() { throw new Error("ENOSPC: no space left on device"); },
+        closeSync(fd) {
+          atClose = {
+            reaped,
+            stdoutLocked: command.stdout.locked,
+            stderrLocked: command.stderr.locked,
+          };
+          close(fd);
+        },
+      }));
+      process.argv = ["bun", ${JSON.stringify(cli)}, "bounded-run", "--", process.execPath,
+        "--no-env-file", "-e", ${JSON.stringify(
+          `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000); process.${stream}.write("capture this");`,
+        )}];
+      const watchdog = setTimeout(() => {
+        timedOut = true;
+        command?.kill("SIGKILL");
+      }, 2000);
+      try {
+        await import(${JSON.stringify(cli)});
+        console.log(JSON.stringify({ ...atClose, timedOut }));
+      } finally {
+        clearTimeout(watchdog);
+        if (command) {
+          command.kill("SIGKILL");
+          await command.exited;
+        }
+      }
+    `;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
+    env: { ...process.env, FOREMAN_STATE_DIR: root },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect(code).toBe(1);
+  expect(stderr).toBe("agent-context: ENOSPC: no space left on device\n");
+  expect(JSON.parse(stdout)).toEqual({
+    reaped: true,
+    stdoutLocked: false,
+    stderrLocked: false,
+    timedOut: false,
+  });
+});
+
 test("review evidence reuses unchanged content and invalidates on tracked, untracked, and head changes", () => {
   const root = fixture();
   const repo = join(root, "repo");
