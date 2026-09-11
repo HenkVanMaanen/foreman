@@ -647,12 +647,12 @@ export class ThreadRouter {
         readJson<HumanPost | null>(receiptPath(this.cfg.stateDir, thread.channel, id), null),
       );
       // Replay keeps its original batch, but newer durable receipts can revoke its authority.
+      const excludedPostIds = new Set([...batch, ...thread.done]);
       const authorizationContext = this.receipts().filter(
         (post) =>
           post.channel === thread.channel &&
           post.root === thread.root &&
-          !batch.includes(post.id) &&
-          !thread.done.includes(post.id),
+          !excludedPostIds.has(post.id),
       );
       const prompt =
         `[foreman thread agent] Work only in ${thread.cwd}. Repo: ${thread.repo}.\n` +
