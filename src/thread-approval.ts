@@ -6,6 +6,7 @@ import {
   linkSync,
   openSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   unlinkSync,
   writeFileSync,
@@ -142,6 +143,23 @@ export function cleanApprovalReview(
   );
 }
 
+function reviewGroupRunning(group: number): boolean {
+  // Orphans can remain as zombies until init reaps them; they cannot edit or hold pipes open.
+  for (const pid of readdirSync("/proc")) {
+    if (!/^\d+$/.test(pid)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch (error) {
+      if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+      throw error;
+    }
+    const [state, , pgrp] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(pgrp) === group && state !== "Z" && state !== "X") return true;
+  }
+  return false;
+}
+
 export async function reviewApproval(
   state: string,
   key: string,
@@ -182,6 +200,7 @@ export async function reviewApproval(
         stdin: "ignore",
         stdout: "pipe",
         stderr: "inherit",
+        detached: true, // Keep the shell and reviewers in a group owned by this gate.
       },
     );
   } catch (error) {
@@ -201,13 +220,21 @@ export async function reviewApproval(
       tail = (tail + decoder.decode(chunk, { stream: true })).slice(-8192);
     }
   } catch (error) {
-    child.kill("SIGTERM");
-    const killTimer = setTimeout(() => child.kill("SIGKILL"), 500);
-    try {
-      await child.exited;
-    } finally {
-      clearTimeout(killTimer);
+    const signalGroup = (signal: NodeJS.Signals) => {
+      try {
+        process.kill(-child.pid, signal);
+      } catch (killError) {
+        if ((killError as NodeJS.ErrnoException).code !== "ESRCH") throw killError;
+      }
+    };
+    signalGroup("SIGTERM");
+    const deadline = performance.now() + 500;
+    // The shell exiting does not mean its reviewers stopped. Await every live group member.
+    while (reviewGroupRunning(child.pid)) {
+      if (performance.now() >= deadline) signalGroup("SIGKILL");
+      await Bun.sleep(10);
     }
+    await child.exited;
     throw error;
   } finally {
     closeSync(logFd);

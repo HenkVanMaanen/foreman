@@ -25,7 +25,12 @@ try {
     let binary = false;
     let code = 1;
     try {
-      const child = Bun.spawn(args.slice(1), { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
+      const child = Bun.spawn(args.slice(1), {
+        stdin: "inherit",
+        stdout: "pipe",
+        stderr: "pipe",
+        detached: true, // Own the command's process group, including inherited output pipes.
+      });
       const captures = [child.stdout, child.stderr].map(async (stream) => {
         for await (const chunk of stream) {
           bytes += chunk.length;
@@ -40,7 +45,11 @@ try {
         await Promise.all(captures);
         code = await child.exited;
       } catch (error) {
-        child.kill("SIGKILL");
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch (killError) {
+          if ((killError as NodeJS.ErrnoException).code !== "ESRCH") throw killError;
+        }
         await Promise.allSettled([...captures, child.exited]);
         throw error;
       }

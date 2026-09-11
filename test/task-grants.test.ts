@@ -209,18 +209,29 @@ test("large gate output is saved completely while the returned view remains boun
 });
 
 test.each([
-  false,
-  true,
-])("capture failure reaps the review child and keeps the gate closed (ignores SIGTERM=%s)", async (ignoreTerm) => {
+  { ignoreTerm: false, shell: false },
+  { ignoreTerm: true, shell: false },
+  { ignoreTerm: false, shell: true },
+  { ignoreTerm: true, shell: true },
+])("capture failure stops the review group and keeps the gate closed (%j)", async ({
+  ignoreTerm,
+  shell,
+}) => {
   const f = await fixture();
   f.r.command(f.r.token, grantCommand(f.r, f.id, f.ref));
-  writeFileSync(
-    join(f.dir, "review-loop"),
-    `#!${process.execPath}
+  const reviewerPid = join(f.dir, "reviewer.pid");
+  const reviewer = `import { writeFileSync } from "node:fs";
 process.on("SIGTERM", () => { ${ignoreTerm ? "" : "process.exit(0);"} });
 setInterval(() => {}, 1000);
+writeFileSync(${JSON.stringify(reviewerPid)}, String(process.pid));
 process.stdout.write("capture this");
-`,
+`;
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  writeFileSync(
+    join(f.dir, "review-loop"),
+    shell
+      ? `#!/bin/sh\n${quote(process.execPath)} --no-env-file -e ${quote(reviewer)} &\nwait\n`
+      : `#!${process.execPath}\n${reviewer}`,
   );
   const script = `
     import { mock } from "bun:test";
@@ -228,6 +239,7 @@ process.stdout.write("capture this");
     const spawn = Bun.spawn;
     const write = fs.writeFileSync;
     const close = fs.closeSync;
+    const kill = process.kill.bind(process);
     const captureError = new Error("ENOSPC: no space left on device");
     let command;
     let reaped = false;
@@ -235,11 +247,29 @@ process.stdout.write("capture this");
     let closed = false;
     let timedOut = false;
     let originalError = false;
+    let reviewerRunningAtClose = true;
+    let reviewerRunningAtFailure = true;
     const signals = [];
+    const reviewerRunning = () => {
+      const pid = fs.readFileSync(${JSON.stringify(reviewerPid)}, "utf8");
+      const stat = Bun.spawnSync(["/usr/bin/ps", "-p", pid, "-o", "stat="]).stdout.toString().trim();
+      return stat !== "" && !/^[ZX]/.test(stat);
+    };
+    const stop = () => {
+      if (command) {
+        try { kill(-command.pid, "SIGKILL"); } catch {}
+        command.kill("SIGKILL");
+      }
+      if (fs.existsSync(${JSON.stringify(reviewerPid)})) {
+        try { kill(Number(fs.readFileSync(${JSON.stringify(reviewerPid)}, "utf8")), "SIGKILL"); } catch {}
+      }
+    };
+    process.kill = (pid, signal) => {
+      if (pid === -command?.pid) signals.push(signal);
+      return kill(pid, signal);
+    };
     Bun.spawn = (...args) => {
       command = spawn(...args);
-      const kill = command.kill.bind(command);
-      command.kill = (signal = "SIGTERM") => { signals.push(signal); kill(signal); };
       command.exited.then(() => { reaped = true; });
       return command;
     };
@@ -251,27 +281,29 @@ process.stdout.write("capture this");
       },
       closeSync(fd) {
         reapedAtClose = reaped;
+        reviewerRunningAtClose = reviewerRunning();
         close(fd);
         closed = true;
       },
     }));
     const watchdog = setTimeout(() => {
       timedOut = true;
-      command?.kill("SIGKILL");
+      stop();
     }, 2000);
     try {
       const { reviewApproval } = await import(${JSON.stringify(resolve(import.meta.dir, "../src/thread-approval.ts"))});
       await reviewApproval(...${JSON.stringify([f.cfg.stateDir, f.key, f.id, f.cwd])});
     } catch (error) {
       originalError = error === captureError;
+      reviewerRunningAtFailure = reviewerRunning();
     } finally {
       clearTimeout(watchdog);
-      if (command && !reaped) {
-        command.kill("SIGKILL");
+      stop();
+      if (command) {
         await command.exited;
       }
     }
-    console.log(JSON.stringify({ signals, reapedAtClose, closed, timedOut, originalError }));
+    console.log(JSON.stringify({ signals, reapedAtClose, reviewerRunningAtClose, reviewerRunningAtFailure, closed, timedOut, originalError }));
   `;
   const child = Bun.spawn([process.execPath, "--no-env-file", "-e", script], {
     cwd: f.cwd,
@@ -294,6 +326,8 @@ process.stdout.write("capture this");
   expect(JSON.parse(stdout)).toEqual({
     signals: ignoreTerm ? ["SIGTERM", "SIGKILL"] : ["SIGTERM"],
     reapedAtClose: true,
+    reviewerRunningAtClose: false,
+    reviewerRunningAtFailure: false,
     closed: true,
     timedOut: false,
     originalError: true,

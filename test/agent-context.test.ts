@@ -71,11 +71,27 @@ test("bounded-run preserves the full artifact and failing command status with bo
 });
 
 test.each([
-  "stdout",
-  "stderr",
-])("bounded-run reaps the child and settles both readers when capturing %s fails", async (stream) => {
+  { stream: "stdout", shell: false },
+  { stream: "stderr", shell: false },
+  { stream: "stdout", shell: true },
+  { stream: "stderr", shell: true },
+])("bounded-run reaps the command group and settles both readers on capture failure (%j)", async ({
+  stream,
+  shell,
+}) => {
   const root = fixture();
   const cli = resolve("src/agent-context-cli.ts");
+  const writerPid = join(root, "writer.pid");
+  const command = [
+    process.execPath,
+    "--no-env-file",
+    "-e",
+    `import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => {});
+setInterval(() => {}, 1000);
+writeFileSync(${JSON.stringify(writerPid)}, String(process.pid));
+process.${stream}.write("capture this");`,
+  ];
   const script = `
       import { mock } from "bun:test";
       import * as fs from "node:fs";
@@ -85,6 +101,20 @@ test.each([
       let reaped = false;
       let timedOut = false;
       let atClose;
+      const writerRunning = () => {
+        const pid = fs.readFileSync(${JSON.stringify(writerPid)}, "utf8");
+        const stat = Bun.spawnSync(["/usr/bin/ps", "-p", pid, "-o", "stat="]).stdout.toString().trim();
+        return stat !== "" && !/^[ZX]/.test(stat);
+      };
+      const stop = () => {
+        if (command) {
+          try { process.kill(-command.pid, "SIGKILL"); } catch {}
+          command.kill("SIGKILL");
+        }
+        if (fs.existsSync(${JSON.stringify(writerPid)})) {
+          try { process.kill(Number(fs.readFileSync(${JSON.stringify(writerPid)}, "utf8")), "SIGKILL"); } catch {}
+        }
+      };
       Bun.spawn = (...args) => {
         command = spawn(...args);
         command.exited.then(() => { reaped = true; });
@@ -98,25 +128,29 @@ test.each([
             reaped,
             stdoutLocked: command.stdout.locked,
             stderrLocked: command.stderr.locked,
+            writerRunning: writerRunning(),
           };
           close(fd);
         },
       }));
-      process.argv = ["bun", ${JSON.stringify(cli)}, "bounded-run", "--", process.execPath,
-        "--no-env-file", "-e", ${JSON.stringify(
-          `process.on("SIGTERM", () => {}); setInterval(() => {}, 1000); process.${stream}.write("capture this");`,
-        )}];
+      process.argv = ${JSON.stringify([
+        "bun",
+        cli,
+        "bounded-run",
+        "--",
+        ...(shell ? ["/bin/sh", "-c", '"$@" & wait', "bounded-test", ...command] : command),
+      ])};
       const watchdog = setTimeout(() => {
         timedOut = true;
-        command?.kill("SIGKILL");
+        stop();
       }, 2000);
       try {
         await import(${JSON.stringify(cli)});
         console.log(JSON.stringify({ ...atClose, timedOut }));
       } finally {
         clearTimeout(watchdog);
+        stop();
         if (command) {
-          command.kill("SIGKILL");
           await command.exited;
         }
       }
@@ -137,6 +171,7 @@ test.each([
     reaped: true,
     stdoutLocked: false,
     stderrLocked: false,
+    writerRunning: false,
     timedOut: false,
   });
 });
