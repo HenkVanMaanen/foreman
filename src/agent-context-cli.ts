@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { boundedText, notesContext, reviewContext } from "./agent-context.ts";
 
@@ -34,8 +34,7 @@ try {
             if (first.length < 10_000)
               first = Buffer.concat([first, chunk.subarray(0, 10_000 - first.length)]);
             tail = Buffer.concat([tail, chunk.subarray(-10_000)]).subarray(-10_000);
-            let written = 0;
-            while (written < chunk.length) written += writeSync(fd, chunk, written);
+            writeFileSync(fd, chunk);
           }
         }),
       );

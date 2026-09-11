@@ -8,7 +8,7 @@ import {
   readdirSync,
   realpathSync,
   unlinkSync,
-  writeSync,
+  writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 import type { Subprocess } from "bun";
@@ -194,8 +194,7 @@ export async function reviewApproval(
   const decoder = new TextDecoder();
   try {
     for await (const chunk of child.stdout) {
-      let offset = 0;
-      while (offset < chunk.length) offset += writeSync(logFd, chunk, offset);
+      writeFileSync(logFd, chunk);
       totalBytes += chunk.length;
       if (first.length < 10_000)
         first = Buffer.concat([first, chunk.subarray(0, 10_000 - first.length)]);
