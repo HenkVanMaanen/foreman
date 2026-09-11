@@ -295,15 +295,13 @@ test.each([
   expect((await f.cli(["approval-check", f.id, f.target, f.head, "merge"])).error).toContain(
     "current resident-verified task grant required",
   );
-  expect([f.r.command(f.r.token, ["approval-read", f.id])]).toMatchObject([
-    {
-      receipts: ["revoked", "root"],
-      grantCurrent: false,
-      messages: expect.arrayContaining([
-        expect.objectContaining({ id: "revoked", text: "Do not merge; I revoke approval." }),
-      ]),
-    },
-  ]);
+  expect(f.r.command(f.r.token, ["approval-read", f.id])).toMatchObject({
+    receipts: ["revoked", "root"],
+    grantCurrent: false,
+    messages: expect.arrayContaining([
+      expect.objectContaining({ id: "revoked", text: "Do not merge; I revoke approval." }),
+    ]),
+  });
   f.r.command(f.r.token, ["approval-resolve", f.id, "declined", "Human revoked approval."]);
 });
 

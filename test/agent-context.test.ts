@@ -65,8 +65,9 @@ test("bounded-run preserves the full artifact and failing command status with bo
   expect(text).toContain("exit=7");
   const file = join(root, "tool-results", readdirSync(join(root, "tool-results"))[0] ?? "");
   expect(readFileSync(file, "utf8")).toContain("final failure");
-  expect(statSync(file).size).toBeGreaterThan(200_000);
-  expect(statSync(file).mode & 0o777).toBe(0o600);
+  const stat = statSync(file);
+  expect(stat.size).toBeGreaterThan(200_000);
+  expect(stat.mode & 0o777).toBe(0o600);
 });
 
 test("review evidence reuses unchanged content and invalidates on tracked, untracked, and head changes", () => {

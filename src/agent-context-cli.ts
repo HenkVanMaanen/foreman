@@ -33,7 +33,7 @@ try {
             binary ||= chunk.includes(0);
             if (first.length < 10_000)
               first = Buffer.concat([first, chunk.subarray(0, 10_000 - first.length)]);
-            tail = Buffer.concat([tail, chunk]).subarray(-10_000);
+            tail = Buffer.concat([tail, chunk.subarray(-10_000)]).subarray(-10_000);
             let written = 0;
             while (written < chunk.length) written += writeSync(fd, chunk, written);
           }
