@@ -48,13 +48,14 @@ function git(cwd: string, args: string[]): string {
 export function reviewContext(cwd: string, base: string, directory: string): string {
   const baseHead = git(cwd, ["rev-parse", "--verify", `${base}^{commit}`]).trim();
   const head = git(cwd, ["rev-parse", "HEAD"]).trim();
-  const diff = git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--binary", baseHead, "--"]);
+  const mergeBase = git(cwd, ["merge-base", baseHead, head]).trim();
+  const diff = git(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--binary", mergeBase, "--"]);
   const files = git(cwd, [
     "diff",
     "--no-ext-diff",
     "--no-textconv",
     "--name-status",
-    baseHead,
+    mergeBase,
     "--",
   ]);
   const untracked = git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
@@ -77,13 +78,16 @@ export function reviewContext(cwd: string, base: string, directory: string): str
       };
     });
   const key = createHash("sha256")
-    .update(JSON.stringify([resolve(cwd), baseHead, head, diff, untracked]))
+    .update(JSON.stringify([resolve(cwd), baseHead, mergeBase, head, diff, untracked]))
     .digest("hex");
   const bundle = join(resolve(directory), key);
   mkdirSync(bundle, { recursive: true, mode: 0o700 });
   for (const [name, text] of [
     ["changes.diff", diff],
-    ["manifest.json", JSON.stringify({ base: baseHead, head, files, untracked }, null, 2)],
+    [
+      "manifest.json",
+      JSON.stringify({ base: baseHead, mergeBase, head, files, untracked }, null, 2),
+    ],
   ] as const) {
     try {
       writeFileSync(join(bundle, name), text, { flag: "wx", mode: 0o600 });
@@ -95,7 +99,7 @@ export function reviewContext(cwd: string, base: string, directory: string): str
     }
   }
   return (
-    `Review evidence: base=${baseHead}, head=${head}.\n` +
+    `Review evidence: base=${baseHead}, merge-base=${mergeBase}, head=${head}.\n` +
     `Manifest: ${join(bundle, "manifest.json")}\nDiff: ${join(bundle, "changes.diff")}\n` +
     "This bundle covers tracked changes plus an untracked-file manifest; inspect relevant untracked files separately. " +
     "Start with the manifest and read relevant diff ranges, not the entire repository. Reuse unchanged evidence. " +

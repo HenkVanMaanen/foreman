@@ -106,3 +106,60 @@ test("review evidence reuses unchanged content and invalidates on tracked, untra
   writeFileSync(artifact ?? "", "altered evidence");
   expect(() => reviewContext(repo, base, cache)).toThrow("artifact changed");
 });
+
+test("review evidence uses the merge base on diverged branches and preserves uncommitted changes", () => {
+  const root = fixture();
+  const repo = join(root, "repo");
+  const cache = join(root, "cache");
+  mkdirSync(repo);
+  git(repo, "init", "-b", "target");
+  git(repo, "config", "user.name", "Test");
+  git(repo, "config", "user.email", "test@example.invalid");
+  writeFileSync(join(repo, "source.ts"), "base\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "base");
+  const mergeBase = git(repo, "rev-parse", "HEAD");
+  git(repo, "branch", "task");
+  writeFileSync(join(repo, "source.ts"), "target change\n");
+  writeFileSync(join(repo, "target-only.ts"), "target only\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "advance target");
+  const base = git(repo, "rev-parse", "HEAD");
+  git(repo, "checkout", "task");
+  writeFileSync(join(repo, "committed.ts"), "task commit\n");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "advance task");
+  writeFileSync(join(repo, "staged.ts"), "staged change\n");
+  git(repo, "add", "staged.ts");
+  writeFileSync(join(repo, "source.ts"), "unstaged change\n");
+  writeFileSync(join(repo, "untracked.ts"), "untracked change\n");
+  const status = git(repo, "status", "--porcelain");
+  const staged = git(repo, "diff", "--cached");
+  const unstaged = git(repo, "diff");
+
+  reviewContext(repo, "target", cache);
+
+  const bundle = join(cache, readdirSync(cache)[0] ?? "");
+  const diff = readFileSync(join(bundle, "changes.diff"), "utf8");
+  const manifest = JSON.parse(readFileSync(join(bundle, "manifest.json"), "utf8"));
+  expect(diff).toContain("-base\n+unstaged change");
+  expect(diff).toContain("+task commit");
+  expect(diff).toContain("+staged change");
+  expect(diff).not.toContain("target-only.ts");
+  expect(diff).not.toContain("target change");
+  expect(manifest.base).toBe(base);
+  expect(manifest.mergeBase).toBe(mergeBase);
+  expect(manifest.head).toBe(git(repo, "rev-parse", "HEAD"));
+  expect(manifest.files.trim().split("\n")).toEqual([
+    "A\tcommitted.ts",
+    "M\tsource.ts",
+    "A\tstaged.ts",
+  ]);
+  expect(manifest.untracked).toEqual([
+    { path: "untracked.ts", kind: "file", digest: git(repo, "hash-object", "untracked.ts") },
+  ]);
+  expect(git(repo, "status", "--porcelain")).toBe(status);
+  expect(git(repo, "diff", "--cached")).toBe(staged);
+  expect(git(repo, "diff")).toBe(unstaged);
+  expect(readFileSync(join(repo, "untracked.ts"), "utf8")).toBe("untracked change\n");
+});
