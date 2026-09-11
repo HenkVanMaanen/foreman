@@ -1127,16 +1127,16 @@ _indent_tee() {
   fi
 }
 
+review_context_prompt() {
+  bun run "$FOREMAN_HOME/src/agent-context-cli.ts" review-context "$dir" "$base" "$REVIEW_CONTEXT_DIR"
+}
+
 # Run a slash command (or a full headless prompt) in DIR, streaming its output indented. Returns
 # claude's exit code (not sed's/tee's). Never aborts the caller — the caller captures the code with
 # `|| rc=$?`. `</dev/null` mirrors run_codex: the prompt is passed as an argv arg, so claude needs no
 # stdin, and closing it stops a piped invocation (e.g. `data | review-loop`) from feeding leftover
 # stdin into the first review round as extra prompt input.
 # shellcheck disable=SC2329  # invoked indirectly via run_fix_phase's $runner (default run_claude)
-review_context_prompt() {
-  bun run "$FOREMAN_HOME/src/agent-context-cli.ts" review-context "$dir" "$base" "$REVIEW_CONTEXT_DIR"
-}
-
 run_claude() {
   local slash="$1"
   if [ -n "${REVIEW_CONTEXT_DIR:-}" ]; then
@@ -1302,7 +1302,7 @@ run_codex() {
     # Numeric usage only; cached input/reasoning remain subsets. No transcripts in telemetry.
     (umask 077; jq -sc --arg phase "${contract:-simplify}" --arg head "$head_before" \
       --arg model "$codex_model" --argjson exit "$rc" '
-      [.[] | select(.type == "turn.completed") | .usage] | last // {} |
+      last(.[] | select(.type == "turn.completed") | .usage) // {} |
       {phase:$phase, head:$head, model:$model, exit:$exit,
        input_tokens:.input_tokens, cached_input_tokens:.cached_input_tokens,
        output_tokens:.output_tokens, reasoning_output_tokens:.reasoning_output_tokens}

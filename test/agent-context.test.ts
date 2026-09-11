@@ -168,8 +168,9 @@ test("review evidence reuses unchanged content and invalidates on tracked, untra
   git(repo, "commit", "-m", "new head");
   const d = reviewContext(repo, base, cache);
   expect(d).not.toBe(c);
-  expect(readdirSync(cache)).toHaveLength(4);
-  for (const directory of readdirSync(cache)) {
+  const directories = readdirSync(cache);
+  expect(directories).toHaveLength(4);
+  for (const directory of directories) {
     expect(statSync(join(cache, directory, "manifest.json")).mode & 0o777).toBe(0o600);
     expect(readFileSync(join(cache, directory, "changes.diff"), "utf8")).toContain("+changed");
   }

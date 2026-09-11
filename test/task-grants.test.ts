@@ -176,8 +176,9 @@ test("approval summaries omit receipt bodies and resolved history; explicit read
   const before = f.r.command(f.r.token, ["approval-list"]) as { receiptVersion: string }[];
   f.post("later", `Hold off. ${"private receipt body ".repeat(3000)}`);
   const summaries = f.r.command(f.r.token, ["approval-list"]) as { receiptVersion: string }[];
-  expect(JSON.stringify(summaries).length).toBeLessThan(2000);
-  expect(JSON.stringify(summaries)).not.toContain("private receipt body");
+  const serialized = JSON.stringify(summaries);
+  expect(serialized.length).toBeLessThan(2000);
+  expect(serialized).not.toContain("private receipt body");
   expect(summaries[0]?.receiptVersion).not.toBe(before[0]?.receiptVersion);
   const full = f.r.command(f.r.token, ["approval-read", f.id]) as {
     receipts: string[];
