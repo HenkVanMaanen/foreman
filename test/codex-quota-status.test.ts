@@ -194,7 +194,7 @@ test("overlapping status ticks share one read and shutdown suppresses late write
   expect(writes).toBe(0);
 });
 
-test("Mattermost uses the bot's custom status endpoint with PUT and expiring JSON", async () => {
+test("Mattermost sends an expiring text-only custom status with an explicitly empty emoji", async () => {
   const requests: { url: string; method: string | undefined; body: unknown }[] = [];
   let fails = false;
   const mm = new Mattermost(
@@ -219,7 +219,7 @@ test("Mattermost uses the bot's custom status endpoint with PUT and expiring JSO
       url: "https://mock.invalid/api/v4/users/me/status/custom",
       method: "PUT",
       body: {
-        emoji: "battery",
+        emoji: "",
         text: "Codex 5h 82% · 7d 64% left",
         duration: "date_and_time",
         expires_at: expiresAt,
