@@ -1,6 +1,9 @@
 # Codex quota in the Mattermost bot status
 
-The bot's custom status shows `Codex 5h 82% · 7d 64% left` with a battery emoji.
+The bot's custom status contains the plain text `Codex 5h 82% · 7d 64% left`.
+The emoji field is explicitly empty, so refreshing also removes an older battery
+icon. Mattermost displays the text in the bot's profile; its chat-header custom
+status slot shows only an emoji and stays empty with this setting.
 Percentages are remaining main Codex quota, rounded down. Spark is excluded.
 Window labels follow the returned durations; missing windows are omitted and an
 unavailable reading displays `Codex ?`.
@@ -26,7 +29,8 @@ guarded runtime rollout, retaining existing Codex authentication, Mattermost
 credentials, `FOREMAN_THREAD_AGENTS=1`, and the durable state directory. Keep
 `FOREMAN_CODEX_QUOTA_STATUS=1` (the default). Verify the bot's `props.customStatus`
 on `/api/v4/users/me`: main quota appears after the first tick and `expires_at`
-advances again about five minutes later. No worker-side runtime launch is needed.
+advances again about five minutes later. Confirm `emoji` is empty and the profile
+shows the quota text. No worker-side runtime launch is needed.
 
 Local checks: `bun test test/codex-quota-status.test.ts test/codex-quota.test.ts`,
 `bun run check`, and the normal `bun run test` pipeline. Quota and Mattermost

@@ -96,7 +96,7 @@ export class Mattermost {
   async setCustomStatus(text: string, expiresAt: string): Promise<void> {
     await this.api(
       "/users/me/status/custom",
-      { emoji: "battery", text, duration: "date_and_time", expires_at: expiresAt },
+      { emoji: "", text, duration: "date_and_time", expires_at: expiresAt },
       "PUT",
     );
   }
